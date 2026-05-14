@@ -1,0 +1,22 @@
+220 (vsFTPd 3.0.3)
+USER bblp
+331 Please specify the password.
+PASS ABCD1234
+230 Login successful.
+PBSZ 0
+200 PBSZ=0
+PROT P
+200 PROT now Private.
+TYPE I
+200 Type set to I.
+PWD
+257 "/" is the current directory
+CWD /model
+250 Directory successfully changed.
+PASV
+227 Entering Passive Mode (192,168,1,209,234,17).
+LIST
+150 Here comes the directory listing.
+226 Directory send OK.
+QUIT
+221 Goodbye.

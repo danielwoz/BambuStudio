@@ -6,8 +6,14 @@ include(PrecompiledHeader)
 set(SLIC3R_GUI_SOURCES
     pchheader.cpp
     pchheader.hpp
+    GUI/Printer/BridgeStorageBackend.cpp
+    GUI/Printer/BridgeStorageBackend.hpp
+    GUI/Printer/MediaUrlBuilder.cpp
+    GUI/Printer/MediaUrlBuilder.hpp
     GUI/Printer/PrinterFileSystem.cpp
     GUI/Printer/PrinterFileSystem.h
+    GUI/Printer/VirtualBambuTunnel.cpp
+    GUI/Printer/VirtualBambuTunnel.hpp
     GUI/Widgets/AnimaController.hpp
     GUI/Widgets/AnimaController.cpp
     GUI/Widgets/AxisCtrlButton.cpp
@@ -210,6 +216,9 @@ set(SLIC3R_GUI_SOURCES
     GUI/GUI_Preview.hpp
     GUI/GUI_App.cpp
     GUI/GUI_App.hpp
+    GUI/BridgeOnlyFlag.hpp
+    GUI/BridgeOnlyConsoleApp.cpp
+    GUI/BridgeOnlyConsoleApp.hpp
     GUI/GUI_Utils.cpp
     GUI/GUI_Utils.hpp
     GUI/I18N.cpp
@@ -606,6 +615,14 @@ set(SLIC3R_GUI_SOURCES
     Utils/PrintHost.cpp
     Utils/NetworkAgent.cpp
     Utils/NetworkAgent.hpp
+    Utils/NetworkAgentPluginAdapter.cpp
+    Utils/NetworkAgentPluginAdapter.hpp
+    Utils/VirtualLanPrinterStore.cpp
+    Utils/VirtualLanPrinterStore.hpp
+    Utils/VirtualMqttClient.cpp
+    Utils/VirtualMqttClient.hpp
+    Utils/VirtualFtpsClient.cpp
+    Utils/VirtualFtpsClient.hpp
     Utils/MKS.hpp
     Utils/MKS.cpp
     Utils/CpuMemory.cpp

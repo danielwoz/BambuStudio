@@ -18,6 +18,7 @@
 #include "slic3r/GUI/MainFrame.hpp"
 #include "slic3r/GUI/DeviceWeb/DeviceWebPage.hpp"
 #include "slic3r/Utils/BBLUtil.hpp"
+#include "slic3r/Utils/NetworkAgent.hpp"
 
 #include "libslic3r/Time.hpp"
 
@@ -58,7 +59,6 @@ namespace Slic3r
         userMachineList.clear();
     }
 
-
     void DeviceManager::EnableMultiMachine(bool enable)
     {
         m_agent->enable_multi_machine(enable);
@@ -67,7 +67,6 @@ namespace Slic3r
 
     void DeviceManager::start_refresher() { m_refresher->Start(); }
     void DeviceManager::stop_refresher() { m_refresher->Stop(); }
-
 
     void DeviceManager::keep_alive()
     {
@@ -309,7 +308,6 @@ namespace Slic3r
         obj->set_access_code(access_code, false);
         obj->set_user_access_code(access_code, false);
 
-
         auto it = localMachineList.find(dev_id);
         if (it != localMachineList.end()) {
             localMachineList[dev_id] = obj;
@@ -448,7 +446,21 @@ namespace Slic3r
         {
             if (last_selected->second->connection_type() == "lan")
             {
-                m_agent->disconnect_printer();
+                // Virtual printers: don't tear down the VirtualMqttClient
+                // session when the user merely switches to another printer.
+                // It costs a TCP+TLS+MQTT handshake to bring it back, and
+                // keeping it alive lets the bridge keep its cloud-uplink
+                // subscription warm. The session is cheap (one socket per
+                // virtual dev_id) and auto-reconnects on its own if it
+                // drops, so leaving it open is the better trade.
+                if (Slic3r::NetworkAgent::is_virtual_dev_id(selected_machine)) {
+                    BOOST_LOG_TRIVIAL(info)
+                        << "set_selected_machine: leaving virtual session "
+                        << "open for prev dev_id="
+                        << BBLCrossTalk::Crosstalk_DevId(selected_machine);
+                } else {
+                    m_agent->disconnect_printer();
+                }
             }
             else if (last_selected->second->connection_type() == "cloud") {
                 m_agent->set_user_selected_machine("");
@@ -477,6 +489,22 @@ namespace Slic3r
                 // same dev_id, lan => disconnect and reconnect
                 else
                 {
+                    // Virtual printers maintain their TLS+MQTT session via
+                    // VirtualMqttClient outside the plugin; thrashing it on
+                    // re-selection has caused the periodic drop the user
+                    // observed when switching tabs / changing filament. Take
+                    // the gentle cloud path: just refresh the update timer
+                    // and re-subscribe.
+                    if (Slic3r::NetworkAgent::is_virtual_dev_id(dev_id))
+                    {
+                        BOOST_LOG_TRIVIAL(info) << "set_selected_machine: same virtual lan machine, dev_id ="
+                            << BBLCrossTalk::Crosstalk_DevId(dev_id)
+                            << ", reset update time only (skip disconnect/reconnect)";
+                        it->second->reset_update_time();
+                        Slic3r::GUI::wxGetApp().on_start_subscribe_again(dev_id);
+                        return true;
+                    }
+
                     BOOST_LOG_TRIVIAL(info) << "set_selected_machine: same lan machine, dev_id =" << BBLCrossTalk::Crosstalk_DevId(dev_id)
                         << ", disconnect and reconnect";
 
@@ -560,7 +588,6 @@ namespace Slic3r
         }
         m_agent->add_subscribe(dev_list);
     }
-
 
     void DeviceManager::del_user_subscribe()
     {

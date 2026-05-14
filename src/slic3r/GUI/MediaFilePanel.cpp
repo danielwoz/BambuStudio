@@ -8,12 +8,15 @@
 #include "Widgets/TabCtrl.hpp"
 #include "Widgets/Label.hpp"
 #include "Printer/PrinterFileSystem.h"
+#include "Printer/MediaUrlBuilder.hpp"
+#include "DeviceCore/DevManager.h"
 #include "MsgDialog.hpp"
 #include "Widgets/ProgressDialog.hpp"
 #include <boost/lexical_cast.hpp>
 #include <libslic3r/Model.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
 #include "DeviceCore/DevStorage.h"
+#include "../Utils/NetworkAgent.hpp"
 
 #ifdef __WXMSW__
 #include <shellapi.h>
@@ -561,81 +564,83 @@ void MediaFilePanel::fetchUrl(boost::weak_ptr<PrinterFileSystem> wfs)
         return;
     }
     m_waiting_enable = false;
-    if (!m_local_proto && !m_remote_proto) {
-        m_waiting_support = true;
-        m_image_grid->SetStatus(m_bmp_failed, _L("Browsing file in storage is not supported in current firmware. Please update the printer firmware."));
-        fs->SetUrl("0");
-        return;
-    }
-    if (m_device_busy) {
-        m_image_grid->SetStatus(m_bmp_failed, _L("The printer is currently busy downloading. Please try again after it finishes."));
-        fs->SetUrl("0");
-        return;
-    }
-    BOOST_LOG_TRIVIAL(info) << "MediaFilePanel::fetchUrl: " << m_local_proto << m_remote_proto;
-    m_waiting_support = false;
-    NetworkAgent *agent = wxGetApp().getAgent();
-    std::string  agent_version = agent ? agent->get_version() : "";
-    if ((m_lan_mode || !m_remote_proto) && m_local_proto && !m_lan_ip.empty()) {
-        std::string url = "bambu:///local/" + m_lan_ip + ".?port=6000&user=" + m_lan_user + "&passwd=" + m_lan_passwd;
-        url += "&device=" + m_machine;
-        url += "&net_ver=" + agent_version;
-        url += "&dev_ver=" + m_dev_ver;
-        url += "&cli_id=" + wxGetApp().app_config->get("slicer_uuid");
-        url += "&cli_ver=" + std::string(SLIC3R_VERSION);
+
+    // Virtual printers: bypass the usual file_local/file_remote gating
+    // entirely and route through the bridge's VirtualTunnelServer. The
+    // bridge listens on a fixed vtun port per device (default
+    // m_lan_ip:39998 for the first virtual device). The real printer's
+    // file_local/file_remote bitmasks aren't reliable for our virtuals
+    // because we never publish those fields in push_status.
+    if (Slic3r::NetworkAgent::is_virtual_dev_id(m_machine)) {
+        const uint16_t kVtunPortBase = 39998;
+        const std::string url =
+            "bambu:///virtual/" + m_lan_ip + ":" +
+            std::to_string(kVtunPortBase) +
+            "?dev_id=" + m_machine +
+            "&access_code=" + m_lan_passwd;
+        BOOST_LOG_TRIVIAL(info)
+            << "MediaFilePanel::fetchUrl: virtual url=" << url;
         fs->SetUrl(url);
         return;
     }
-    if (!m_remote_proto && m_local_proto) { // not support tutk
-        m_image_grid->SetStatus(m_bmp_failed, _L("Please enter the IP of printer to connect."));
+
+    // Delegate the actual URL ladder to the shared helper so the bridge
+    // and the GUI never drift. We translate the helper's error codes
+    // back into the same UI-status side effects MediaFilePanel had
+    // when fetchUrl was a single-purpose method.
+    MachineObject* obj = nullptr;
+    if (DeviceManager* dev = wxGetApp().getDeviceManager())
+        obj = dev->get_my_machine(m_machine);
+    if (!obj) {
+        m_waiting_enable = true;
+        m_image_grid->SetStatus(m_bmp_failed, _L("Please confirm if the printer is connected."));
         fs->SetUrl("0");
-        fs.reset();
-        if (wxGetApp().show_modal_ip_address_enter_dialog(false, _L("LAN Connection Failed (Failed to view sdcard)"))) {
-            if (auto fs = wfs.lock())
-                fs->Retry();
-        }
         return;
     }
-    if (m_lan_mode) {
-        m_image_grid->SetStatus(m_bmp_failed, _L("Browsing file in storage is not supported in LAN Only Mode."));
-        fs->SetUrl("0");
-        return;
-    }
-    if (agent) {
-        std::string protocols[] = {"", "\"tutk\"", "\"agora\"", "\"tutk\",\"agora\""};
-        agent->get_camera_url(m_machine + "|" + m_dev_ver + "|" + protocols[m_remote_proto],
-            [this, wfs, m = m_machine, v = agent->get_version(), dv = m_dev_ver](std::string url) {
-            if (boost::algorithm::starts_with(url, "bambu:///")) {
-                url += "&device=" + m;
-                url += "&net_ver=" + v;
-                url += "&dev_ver=" + dv;
-                url += "&refresh_url=" + boost::lexical_cast<std::string>(&refresh_agora_url);
-                url += "&cli_id=" + wxGetApp().app_config->get("slicer_uuid");
-                url += "&cli_ver=" + std::string(SLIC3R_VERSION);
-            }
 
-#if !BBL_RELEASE_TO_PUBLIC
-            BOOST_LOG_TRIVIAL(info) << "MediaFilePanel::fetchUrl: camera_url: " << hide_passwd(url, {"?uid=", "authkey=", "passwd="});
-#endif
-
-            CallAfter([=] {
+    build_media_storage_url(obj,
+        [this, wfs](std::string url, MediaUrlError err) {
+            CallAfter([this, wfs, url = std::move(url), err]() mutable {
                 boost::shared_ptr fs(wfs.lock());
                 if (!fs || fs != m_image_grid->GetFileSystem()) return;
-                if (boost::algorithm::starts_with(url, "bambu:///")) {
+                switch (err) {
+                case MediaUrlError::Ok:
+#if !BBL_RELEASE_TO_PUBLIC
+                    BOOST_LOG_TRIVIAL(info) << "MediaFilePanel::fetchUrl: camera_url: "
+                        << hide_passwd(url, {"?uid=", "authkey=", "passwd="});
+#endif
                     fs->SetUrl(url);
-                } else {
-                    m_image_grid->SetStatus(m_bmp_failed, _L("Connection Failed. Please check the network and try again"));
-                    std::string res = "3";
-                    if (boost::ends_with(url, "]")) {
-                        size_t n = url.find_last_of('[');
-                        if (n != std::string::npos)
-                            res = url.substr(n + 1, url.length() - n - 2);
+                    break;
+                case MediaUrlError::NoProtocols:
+                    m_waiting_support = true;
+                    m_image_grid->SetStatus(m_bmp_failed, _L("Browsing file in storage is not supported in current firmware. Please update the printer firmware."));
+                    fs->SetUrl("0");
+                    break;
+                case MediaUrlError::DeviceBusy:
+                    m_image_grid->SetStatus(m_bmp_failed, _L("The printer is currently busy downloading. Please try again after it finishes."));
+                    fs->SetUrl("0");
+                    break;
+                case MediaUrlError::LanOnlyNoRemote:
+                    m_image_grid->SetStatus(m_bmp_failed, _L("Please enter the IP of printer to connect."));
+                    fs->SetUrl("0");
+                    fs.reset();
+                    if (wxGetApp().show_modal_ip_address_enter_dialog(false, _L("LAN Connection Failed (Failed to view sdcard)"))) {
+                        if (auto fs2 = wfs.lock()) fs2->Retry();
                     }
-                    fs->SetUrl(res);
+                    break;
+                case MediaUrlError::LanModeNoRemote:
+                    m_image_grid->SetStatus(m_bmp_failed, _L("Browsing file in storage is not supported in LAN Only Mode."));
+                    fs->SetUrl("0");
+                    break;
+                case MediaUrlError::AgentMissing:
+                case MediaUrlError::NotReady:
+                default:
+                    m_image_grid->SetStatus(m_bmp_failed, _L("Connection Failed. Please check the network and try again"));
+                    fs->SetUrl("3");
+                    break;
                 }
             });
         });
-    }
 }
 
 struct MediaProgressDialog : ProgressDialog

@@ -1,4 +1,5 @@
 #include "PrinterFileSystem.h"
+#include "VirtualBambuTunnel.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Model.hpp"
@@ -18,6 +19,26 @@
 #include "nlohmann/json.hpp"
 
 #include <cstring>
+
+#if defined(BAMBU_BRIDGE_HARNESS_ENABLE)
+// Harness ShimRecorder hooks. Each StaticBambuLib trampoline gets a
+// ShimRecorder::record() call so a slicer run can capture a golden
+// libBambuSource trace for the comparator. The recorder is OFF unless
+// BAMBU_BRIDGE_SHIM env var is set.
+//
+// Variadic so call sites can pass an in-place `nlohmann::json{{...}}`
+// for the args_json without the preprocessor splitting on the inner
+// comma.
+#include "harness/ShimRecorder.hpp"
+#define BB_HARNESS_REC(...)                                                    \
+    do {                                                                       \
+        ::Slic3r::bridge::harness::ShimRecorder::instance().record(            \
+            ::Slic3r::bridge::harness::TraceLib::BambuSource,                  \
+            __VA_ARGS__);                                                      \
+    } while (0)
+#else
+#define BB_HARNESS_REC(...) do {} while (0)
+#endif
 
 #ifndef NDEBUG
 //#define PRINTER_FILE_SYSTEM_TEST
@@ -279,7 +300,6 @@ struct PrinterFileSystem::Upload : Progress
     boost::filesystem::ifstream ifs;
 };
 
-
 void PrinterFileSystem::GetPickImages(const std::vector<std::string> &local_paths, const std::vector<std::string> &targetpaths)
 {
     m_download_states.clear();
@@ -304,7 +324,6 @@ void PrinterFileSystem::GetPickImage(int id, const std::string &local_path, cons
 
     DownloadRamFile(16, local_path, param);
 }
-
 
 void PrinterFileSystem::DownloadRamFile(int index, const std::string &local_path, const std::string & param)
 {
@@ -419,7 +438,6 @@ void PrinterFileSystem::SendConnectFail(){
     SendChangedEvent(EVT_RAMDOWNLOAD, ERROR_PIPE);
 }
 
-
 void PrinterFileSystem::DownloadFiles(size_t index, std::string const &path)
 {
     if (index == (size_t) -1) {
@@ -452,10 +470,6 @@ void PrinterFileSystem::DownloadFiles(size_t index, std::string const &path)
     if ((m_task_flags & FF_DOWNLOAD) == 0)
         DownloadNextFile();
 }
-
-
-
-
 
 void PrinterFileSystem::DownloadCheckFiles(std::string const &path)
 {
@@ -1527,6 +1541,12 @@ void PrinterFileSystem::RecvMessageThread()
     boost::unique_lock l(m_mutex);
     Reconnect(l, 0);
     while (true) {
+        {
+            static thread_local int loop_tick = 0;
+            if (loop_tick < 10 || (loop_tick % 100) == 0) {
+            }
+            ++loop_tick;
+        }
         if (m_stopped && (m_session.owner == nullptr || (m_messages.empty() && m_callbacks.empty()))) {
             Reconnect(l, 0); // Close and wait start again
             if (m_session.owner == nullptr) {
@@ -1710,7 +1730,6 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
     if (result)
         m_cond.timed_wait(l, boost::posix_time::seconds(10));
 
-
     while (true) {
         while (m_stopped) {
             if (m_session.owner == nullptr)
@@ -1724,9 +1743,12 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
         m_last_error = 0;
         SendChangedEvent(EVT_STATUS_CHANGED, m_status);
         // wait for url
-        while (!m_stopped && m_messages.empty())
+        while (!m_stopped && m_messages.empty()) {
             m_cond.wait(l);
-        if (m_stopped || m_messages.empty()) continue;
+        }
+        if (m_stopped || m_messages.empty()) {
+            continue;
+        }
         std::string url = m_messages.front();
         m_messages.clear();
         if (url.size() < 2) {
@@ -1800,7 +1822,6 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
 #endif
 }
 
-
 #include <stdlib.h>
 #if defined(_MSC_VER) || defined(_WIN32)
 #include <Windows.h>
@@ -1872,6 +1893,124 @@ StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
         if (copy)
             lib.copies_.push_back(copy);
     }
+
+    // Wrap every Bambu_* entrypoint with a dispatcher that sniffs the
+    // tunnel pointer's magic header. Virtual tunnels (minted by our own
+    // Bambu_Create for `bambu:///virtual/...` URLs) route to
+    // `virtual_tunnel::*`; real tunnels fall through to libBambuSource.
+    // Storage state for the originals lives in function-local statics so
+    // we don't expand the StaticBambuLib struct definition.
+    static auto real_Bambu_Create         = lib.Bambu_Create;
+    static auto real_Bambu_Open           = lib.Bambu_Open;
+    static auto real_Bambu_StartStream    = lib.Bambu_StartStream;
+    static auto real_Bambu_StartStreamEx  = lib.Bambu_StartStreamEx;
+    static auto real_Bambu_GetStreamCount = lib.Bambu_GetStreamCount;
+    static auto real_Bambu_GetStreamInfo  = lib.Bambu_GetStreamInfo;
+    static auto real_Bambu_SendMessage    = lib.Bambu_SendMessage;
+    static auto real_Bambu_ReadSample     = lib.Bambu_ReadSample;
+    static auto real_Bambu_Close          = lib.Bambu_Close;
+    static auto real_Bambu_Destroy        = lib.Bambu_Destroy;
+    static auto real_Bambu_SetLogger      = lib.Bambu_SetLogger;
+
+    lib.Bambu_Create = [](Bambu_Tunnel* out, char const* url) -> int {
+        const int rc = Slic3r::virtual_tunnel::url_is_virtual(url)
+            ? Slic3r::virtual_tunnel::Bambu_Create_virtual(out, url)
+            : (real_Bambu_Create
+                ? real_Bambu_Create(out, url)
+                : Fake_Bambu_Create(out, url));
+        BB_HARNESS_REC("Bambu_Create",
+            nlohmann::json{{"url", url ? std::string(url) : std::string()}},
+            rc);
+        return rc;
+    };
+    lib.Bambu_Open = [](Bambu_Tunnel t) -> int {
+        const bool is_v = Slic3r::virtual_tunnel::is_virtual_tunnel(t);
+        const int rc = is_v
+            ? Slic3r::virtual_tunnel::Bambu_Open_virtual(t)
+            : (real_Bambu_Open ? real_Bambu_Open(t) : -1);
+        BB_HARNESS_REC("Bambu_Open",
+            nlohmann::json{{"tunnel", reinterpret_cast<std::uintptr_t>(t)}},
+            rc);
+        return rc;
+    };
+    lib.Bambu_StartStream = [](Bambu_Tunnel t, bool video) -> int {
+        const int rc = Slic3r::virtual_tunnel::is_virtual_tunnel(t)
+            ? Slic3r::virtual_tunnel::Bambu_StartStream_virtual(t, video)
+            : (real_Bambu_StartStream ? real_Bambu_StartStream(t, video) : -1);
+        BB_HARNESS_REC("Bambu_StartStream",
+            nlohmann::json{
+                {"tunnel", reinterpret_cast<std::uintptr_t>(t)},
+                {"video", video}},
+            rc);
+        return rc;
+    };
+    lib.Bambu_StartStreamEx = [](Bambu_Tunnel t, int type) -> int {
+        const bool is_v = Slic3r::virtual_tunnel::is_virtual_tunnel(t);
+        const int rc = is_v
+            ? Slic3r::virtual_tunnel::Bambu_StartStreamEx_virtual(t, type)
+            : (real_Bambu_StartStreamEx ? real_Bambu_StartStreamEx(t, type) : -1);
+        return rc;
+    };
+    lib.Bambu_SendMessage = [](Bambu_Tunnel t, int ctrl,
+                               char const* data, int len) -> int {
+        const bool is_v = Slic3r::virtual_tunnel::is_virtual_tunnel(t);
+        if (is_v)
+            return Slic3r::virtual_tunnel::Bambu_SendMessage_virtual(t, ctrl, data, len);
+        return real_Bambu_SendMessage
+            ? real_Bambu_SendMessage(t, ctrl, data, len)
+            : -1;
+    };
+    lib.Bambu_ReadSample = [](Bambu_Tunnel t, Bambu_Sample* s) -> int {
+        const bool is_v = Slic3r::virtual_tunnel::is_virtual_tunnel(t);
+        const int rc = is_v
+            ? Slic3r::virtual_tunnel::Bambu_ReadSample_virtual(t, s)
+            : (real_Bambu_ReadSample ? real_Bambu_ReadSample(t, s) : Bambu_stream_end);
+        // Log every call (throttled to first 10 + every 100th after) so
+        // we can see whether the worker loop is iterating.
+        {
+            static thread_local int tick = 0;
+            if (tick < 10 || (tick % 100) == 0) {
+            }
+            ++tick;
+        }
+        // Don't dump the buffer — single-frame stream traces are
+        // already O(MB). The size + rc is enough for replay diffing.
+        BB_HARNESS_REC("Bambu_ReadSample",
+            nlohmann::json{
+                {"tunnel", reinterpret_cast<std::uintptr_t>(t)},
+                {"size", (s ? static_cast<int>(s->size) : 0)}},
+            rc);
+        return rc;
+    };
+    lib.Bambu_Close = [](Bambu_Tunnel t) {
+        if (Slic3r::virtual_tunnel::is_virtual_tunnel(t)) {
+            Slic3r::virtual_tunnel::Bambu_Close_virtual(t);
+        } else if (real_Bambu_Close) {
+            real_Bambu_Close(t);
+        }
+        BB_HARNESS_REC("Bambu_Close",
+            nlohmann::json{{"tunnel", reinterpret_cast<std::uintptr_t>(t)}},
+            nlohmann::json());
+    };
+    lib.Bambu_Destroy = [](Bambu_Tunnel t) {
+        if (Slic3r::virtual_tunnel::is_virtual_tunnel(t)) {
+            Slic3r::virtual_tunnel::Bambu_Destroy_virtual(t);
+        } else if (real_Bambu_Destroy) {
+            real_Bambu_Destroy(t);
+        }
+        BB_HARNESS_REC("Bambu_Destroy",
+            nlohmann::json{{"tunnel", reinterpret_cast<std::uintptr_t>(t)}},
+            nlohmann::json());
+    };
+    lib.Bambu_SetLogger = [](Bambu_Tunnel t, Logger logger, void* ctx) {
+        const bool is_v = Slic3r::virtual_tunnel::is_virtual_tunnel(t);
+        if (is_v) {
+            Slic3r::virtual_tunnel::Bambu_SetLogger_virtual(t, logger, ctx);
+            return;
+        }
+        if (real_Bambu_SetLogger) real_Bambu_SetLogger(t, logger, ctx);
+    };
+
     return lib;
 }
 
