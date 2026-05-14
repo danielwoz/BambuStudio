@@ -39,3 +39,8 @@ compile_commands.json
 .worktrees/
 **/dist/
 
+
+# bridge dev/debug artifacts
+log_iotc.txt
+result.json
+tools/no_debugger.so

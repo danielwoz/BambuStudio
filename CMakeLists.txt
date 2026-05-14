@@ -80,6 +80,10 @@ endif ()
 option(SLIC3R_BUILD_SANDBOXES   "Build development sandboxes" OFF)
 option(SLIC3R_BUILD_TESTS       "Build unit tests" OFF)
 
+# Bambu Bridge — mirrors cloud-bound printers as virtual LAN printers.
+# Off by default during the phased rollout (see docs/bambu_bridge_plan.md).
+option(BAMBU_BRIDGE             "Build the Bambu Bridge module (src/bambu_bridge)" ON)
+
 if (IS_CROSS_COMPILE)
     message("Detected cross compilation setup. Tests and encoding checks will be forcedly disabled!")
     set(SLIC3R_PERL_XS OFF CACHE BOOL "" FORCE)
@@ -788,6 +792,15 @@ endif()
 if(SLIC3R_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
+
+# Bambu Bridge module — built when BAMBU_BRIDGE is ON.
+# The smoke test under tests/bridge/ runs unconditionally with the module so
+# the build wiring doesn't bit-rot; the heavier SLIC3R_BUILD_TESTS suite stays
+# independent.
+if (BAMBU_BRIDGE)
+    add_subdirectory(src/bambu_bridge)
+    add_subdirectory(tests/bridge)
+endif ()
 
 if (NOT WIN32 AND NOT APPLE)
     set(SLIC3R_APP_CMD "bambu-studio")

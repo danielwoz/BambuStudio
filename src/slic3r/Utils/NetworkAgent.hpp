@@ -4,6 +4,10 @@
 #include "bambu_networking.hpp"
 #include "libslic3r/ProjectTask.hpp"
 
+#include <functional>
+#include <mutex>
+#include <string>
+
 using namespace BBL;
 
 namespace Slic3r {
@@ -245,9 +249,62 @@ public:
     int get_hms_snapshot(std::string dev_id, std::string file_name, std::function<void(std::string, int)> callback);
     void *get_network_agent() { return network_agent; }
 
+public:
+    // Virtual-printer interception. Any dev_id starting with this
+    // prefix is treated as "this connection lives in the Bambu Bridge,
+    // not on a real printer or via Bambu's cloud" — and is routed
+    // through an open-source MQTT-over-TLS client (`VirtualMqttClient`)
+    // rather than the proprietary `bambu_networking` plugin.
+    //
+    // The plugin verifies server TLS certs against Bambu's CA
+    // (`slicer_base64.cer`); the bridge's self-signed certs fail that
+    // chain check (`unknown_ca`). The virtual client uses verify=false
+    // so the bridge's self-signed cert is accepted. The wire-level
+    // MQTT protocol is unchanged — same Bambu topic / message format.
+    //
+    // The bridge advertises virtual SNs as
+    //   FFFF + real_sn.substr(4)   (15-char hex string)
+    // The slicer side just checks the prefix; no registry needed.
+    static constexpr const char* kVirtualDevIdPrefix = "FFFF";
+    static bool is_virtual_dev_id(const std::string& dev_id) {
+        return dev_id.size() >= 4 &&
+               dev_id.compare(0, 4, kVirtualDevIdPrefix) == 0;
+    }
+
+    // Fanout for the in-GUI bridge. The proprietary plugin only stores
+    // ONE OnMessageFn / OnLocalMessageFn per process; NetworkAgent owns
+    // that slot. Setting a tap here causes NetworkAgent to invoke it
+    // (with non-virtual dev_ids only) AFTER it has dispatched the
+    // payload to the slicer's own handler — so the bridge's
+    // BambuNetworkingPluginHandle subclass can route incoming printer
+    // reports to its per-dev_id receivers without contending for the
+    // plugin's single callback slot.
+    using BridgeMessageTap =
+        std::function<void(const std::string& dev_id,
+                           const std::string& payload,
+                           bool               is_local)>;
+    void set_bridge_message_tap(BridgeMessageTap tap);
+
 private:
     bool enable_track = false;
     void*                   network_agent { nullptr };
+
+    // Track which dev_id is currently the LAN-session target — set on
+    // every connect_printer and cleared on disconnect_printer. The
+    // plugin only holds one LAN session at a time; we mirror the same
+    // single-session model on the virtual side, and the field tells
+    // disconnect_printer which path to dispatch.
+    std::string                              m_current_local_dev_id;
+    // Most-recent set_on_local_*_fn captured here so the virtual
+    // client can fire them on virtual-dev_id traffic. The plugin
+    // also has its own copy via the original setter.
+    OnMessageFn                              m_local_message_cb;
+    OnLocalConnectedFn                       m_local_connect_cb;
+
+    // Bridge fanout. Set under m_bridge_tap_mu so set_on_*_fn wrappers
+    // can sample atomically. Empty when no in-GUI bridge is attached.
+    mutable std::mutex                       m_bridge_tap_mu;
+    BridgeMessageTap                         m_bridge_tap;
 
     static func_check_debug_consistent         check_debug_consistent_ptr;
     static func_get_version                    get_version_ptr;

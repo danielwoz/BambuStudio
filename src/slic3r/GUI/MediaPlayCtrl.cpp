@@ -9,6 +9,7 @@
 #include "DownloadProgressDialog.hpp"
 
 #include "slic3r/Utils/BBLUtil.hpp"
+#include "slic3r/Utils/NetworkAgent.hpp"
 #include "slic3r/Utils/FileTransferObject.hpp"
 
 #include <boost/lexical_cast.hpp>
@@ -313,6 +314,38 @@ void MediaPlayCtrl::Play()
 
     NetworkAgent *agent = wxGetApp().getAgent();
     std::string  agent_version = agent ? agent->get_version() : "";
+
+    // Virtual printers: bypass agent->get_camera_url entirely (the
+    // proprietary plugin doesn't know FFFF dev_ids and returns an
+    // error, which surfaces as "re-enter access code") and build a
+    // direct RTSPS URL pointing at the bridge's RTSP server. The
+    // bridge's LanCameraSource proxies the stream from the real
+    // printer's camera. Port follows the same per-device convention
+    // as the storage tunnel: kRtspPortBase + device_index. We have no
+    // visibility into the device index from this side, so for now we
+    // assume the FIRST virtual device (index 0). Multi-printer
+    // support would need a slicer→bridge port lookup.
+    if (Slic3r::NetworkAgent::is_virtual_dev_id(m_machine) &&
+        !m_lan_ip.empty()) {
+        constexpr uint16_t kBridgeRtspPortBase = 38322;
+        std::string url =
+            "bambu:///rtsps___" + m_lan_user + ":" + m_lan_passwd +
+            "@" + m_lan_ip + ":" + std::to_string(kBridgeRtspPortBase) +
+            "/streaming/live/1?proto=rtsps";
+        url += "&device=" + m_machine;
+        url += "&net_ver=" + agent_version;
+        url += "&dev_ver=" + m_dev_ver;
+        url += "&cli_id=" + wxGetApp().app_config->get("slicer_uuid");
+        url += "&cli_ver=" + std::string(SLIC3R_VERSION);
+        BOOST_LOG_TRIVIAL(info)
+            << "MediaPlayCtrl: virtual rtsps via bridge: "
+            << hide_passwd(url, {m_lan_passwd});
+        m_url = url;
+        load();
+        m_button_play->SetIcon("media_stop");
+        return;
+    }
+
     if (m_lan_proto > MachineObject::LVL_Disable && (m_lan_mode || !m_remote_proto) && !m_disable_lan && !m_lan_ip.empty()) {
         m_disable_lan = m_remote_proto && !m_lan_mode; // try remote next time
         std::string url;
