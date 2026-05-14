@@ -152,6 +152,8 @@ std::unique_ptr<MqttBroker> try_start_broker(
         broker->add_device(dev);
         broker->start();
     } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[srint] broker bind %s:%u failed: %s\n",
+                     bind_ip.c_str(), port, ex.what());
         return nullptr;
     }
     bound_out = broker->bound_port(dev_id);
@@ -222,6 +224,8 @@ int main() {
         cloud->remove_device(dev_id);
         return kCtestSkip;
     }
+    std::fprintf(stderr, "[srint] slicer-facing broker at 127.0.0.1:%u\n",
+                 slicer_bound);
 
     // ---- 6. Test client connects to the slicer-facing broker ----
     MqttTestClient client;
@@ -229,6 +233,7 @@ int main() {
                                          std::chrono::seconds(5));
     check(tls_ok, "slicer client TLS-connected to bridge broker");
     if (!tls_ok) {
+        std::fprintf(stderr, "[srint] %s\n", client.last_error().c_str());
         slicer_broker->stop();
         lan->remove_device(dev_id);
         return 1;

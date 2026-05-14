@@ -187,6 +187,9 @@ void VirtualMqttClient::init_ssl_ctx() {
 
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) {
+        std::fprintf(stderr,
+            "[virtual-mqtt] SSL_CTX_new failed: %s\n",
+            ERR_error_string(ERR_get_error(), nullptr));
         return;
     }
     // verify = false. The bridge presents a self-signed cert; we
@@ -229,6 +232,9 @@ int VirtualMqttClient::connect_printer(std::string dev_id,
     }
 
     if (!m_ssl_ctx) {
+        std::fprintf(stderr,
+            "[virtual-mqtt] no SSL_CTX; refusing connect for dev_id=%s\n",
+            dev_id.c_str());
         return -1;
     }
 
@@ -252,6 +258,11 @@ int VirtualMqttClient::connect_printer(std::string dev_id,
     int  fd  = tcp_connect(host, port);
     SSL* ssl = nullptr;
     if (fd < 0) {
+        std::fprintf(stderr,
+            "[virtual-mqtt] tcp_connect %s:%u failed for dev_id=%s "
+            "(errno=%d %s) — deferring to io_thread reconnect\n",
+            host.c_str(), unsigned(port), dev_id.c_str(),
+            errno, std::strerror(errno));
     } else {
         ssl = SSL_new(static_cast<SSL_CTX*>(m_ssl_ctx));
         if (!ssl) {
@@ -263,6 +274,13 @@ int VirtualMqttClient::connect_printer(std::string dev_id,
             if (rc != 1) {
                 const int  ssl_err = SSL_get_error(ssl, rc);
                 const auto err_q   = ERR_get_error();
+                std::fprintf(stderr,
+                    "[virtual-mqtt] SSL_connect failed for dev_id=%s rc=%d "
+                    "ssl_err=%d errno=%d (%s) queue=%s — deferring to "
+                    "io_thread reconnect\n",
+                    dev_id.c_str(), rc, ssl_err, errno,
+                    std::strerror(errno),
+                    err_q ? ERR_error_string(err_q, nullptr) : "(empty)");
                 SSL_free(ssl);
                 ssl = nullptr;
                 ::close(fd);
@@ -336,6 +354,9 @@ int VirtualMqttClient::send_message(std::string dev_id,
         std::lock_guard<std::mutex> lk(m_mu);
         auto it = m_sessions.find(dev_id);
         if (it == m_sessions.end()) {
+            std::fprintf(stderr,
+                "[virtual-mqtt] send_message: no session for dev_id=%s\n",
+                dev_id.c_str());
             return -1;
         }
         sess = it->second.get();
@@ -356,10 +377,17 @@ int VirtualMqttClient::send_message(std::string dev_id,
         // momentarily null. Drop the message rather than crashing. The
         // slicer's state machine retries push_status frequently — the
         // next attempt after CONNACK will go through.
+        std::fprintf(stderr,
+            "[virtual-mqtt] send_message: session reconnecting for "
+            "dev_id=%s — dropping payload (%zu bytes)\n",
+            dev_id.c_str(), pkt.size());
         return -1;
     }
     int n = SSL_write(sess->ssl, pkt.data(), static_cast<int>(pkt.size()));
     if (n != static_cast<int>(pkt.size())) {
+        std::fprintf(stderr,
+            "[virtual-mqtt] SSL_write short for dev_id=%s n=%d want=%zu\n",
+            dev_id.c_str(), n, pkt.size());
         return -1;
     }
     return 0;
@@ -447,19 +475,32 @@ void VirtualMqttClient::session_loop(VirtualMqttClient* self,
         // FIRST attempt. On subsequent iterations (reconnects after
         // session death), we re-open here.
         if (!first_attempt) {
+            std::fprintf(stderr,
+                "[virtual-mqtt] reconnecting dev_id=%s in %ds…\n",
+                sess->dev_id.c_str(), backoff_s);
             for (int i = 0; i < backoff_s * 10; ++i) {
                 if (sess->stopped.load()) return;
                 ::usleep(100 * 1000); // 100 ms slices for prompt stop
             }
             if (sess->stopped.load()) return;
             if (!reopen_tls()) {
+                std::fprintf(stderr,
+                    "[virtual-mqtt] reconnect TLS handshake failed "
+                    "dev_id=%s — backing off\n",
+                    sess->dev_id.c_str());
                 backoff_s = std::min(backoff_s * 2, 30);
                 continue;
             }
+            std::fprintf(stderr,
+                "[virtual-mqtt] reconnected dev_id=%s — sending CONNECT\n",
+                sess->dev_id.c_str());
         }
         first_attempt = false;
 
         if (!send_connect()) {
+            std::fprintf(stderr,
+                "[virtual-mqtt] CONNECT write failed for dev_id=%s\n",
+                sess->dev_id.c_str());
             // fall through to read loop; it'll exit immediately on
             // SSL_read error, then we backoff.
         }
@@ -488,6 +529,9 @@ void VirtualMqttClient::session_loop(VirtualMqttClient* self,
                 auto pk = mqtt::decode_packet(rbuf.data(), rbuf.size());
                 if (!pk) break;
                 if (pk->error != mqtt::DecodeError::Ok) {
+                    std::fprintf(stderr,
+                        "[virtual-mqtt] decode error %d for dev_id=%s\n",
+                        static_cast<int>(pk->error), sess->dev_id.c_str());
                     rbuf.clear();
                     // Drop the read loop; outer loop will reconnect.
                     goto read_loop_exit;
@@ -496,6 +540,9 @@ void VirtualMqttClient::session_loop(VirtualMqttClient* self,
                 case mqtt::PacketType::Connack: {
                     connack_seen = true;
                     backoff_s    = 1; // reset on a healthy CONNACK
+                    std::fprintf(stderr,
+                        "[virtual-mqtt] CONNACK for dev_id=%s — subscribing\n",
+                        sess->dev_id.c_str());
                     fire_on_connect(/*rc=*/0);
                     send_subscribe();
                     break;
@@ -505,6 +552,12 @@ void VirtualMqttClient::session_loop(VirtualMqttClient* self,
                     std::string preview(pl.begin(),
                                         pl.begin() + std::min<size_t>(pl.size(),
                                                                       220));
+                    std::fprintf(stderr,
+                        "[virtual-mqtt] PUBLISH dev_id=%s topic=%s "
+                        "payload_len=%zu preview=%s%s\n",
+                        sess->dev_id.c_str(), pk->publish.topic.c_str(),
+                        pl.size(), preview.c_str(),
+                        pl.size() > 220 ? " …" : "");
                     fire_on_message(pk->publish.topic,
                                     std::move(pk->publish.payload));
                     break;
@@ -514,6 +567,9 @@ void VirtualMqttClient::session_loop(VirtualMqttClient* self,
                 case mqtt::PacketType::Puback:
                     break;
                 default:
+                    std::fprintf(stderr,
+                        "[virtual-mqtt] unexpected packet type %d for dev_id=%s\n",
+                        static_cast<int>(pk->type), sess->dev_id.c_str());
                     break;
                 }
                 rbuf.erase(rbuf.begin(),
@@ -528,6 +584,10 @@ read_loop_exit:
         // also takes write_mu so a concurrent send_message either sees
         // the old ssl about to be freed, or the new ssl). Then loop to
         // reconnect.
+        std::fprintf(stderr,
+            "[virtual-mqtt] session for dev_id=%s lost — will reconnect%s\n",
+            sess->dev_id.c_str(),
+            connack_seen ? "" : " (CONNACK never arrived)");
         // Deliberately NOT firing on_connect(Lost) here. The slicer's
         // GUI_App.cpp:2183 handler reacts to Lost by clearing the active
         // selection (set_selected_machine("")), which would then call

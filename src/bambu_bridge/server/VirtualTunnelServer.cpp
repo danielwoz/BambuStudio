@@ -62,6 +62,8 @@ void log_ssl_err(const char* tag) {
     const unsigned long e = ERR_get_error();
     char buf[256] = {};
     if (e) ERR_error_string_n(e, buf, sizeof(buf));
+    std::fprintf(stderr, "[virtual-tunnel] %s: %s\n", tag,
+                 e ? buf : "(no error in queue)");
 }
 
 SSL_CTX* make_device_ctx(const tls::CertMaterial& cert) {
@@ -152,6 +154,9 @@ bool ssl_read_exact(SSL* ssl, uint8_t* buf, size_t n) {
         return (long long)(ts.tv_sec * 1000) + ts.tv_nsec / 1000000;
     };
     long long t_enter = now_ms();
+    std::fprintf(stderr,
+        "[virtual-tunnel] ssl_read_exact ENTER seq=%d fd=%d want=%zu t=%lld\n",
+        my_seq, fd0, n, t_enter);
     while (got < n) {
         int r = SSL_read(ssl, buf + got, static_cast<int>(n - got));
         if (r <= 0) {
@@ -171,6 +176,13 @@ bool ssl_read_exact(SSL* ssl, uint8_t* buf, size_t n) {
                 peek_n = ::recv(fd, peek, sizeof(peek), MSG_DONTWAIT|MSG_PEEK);
                 peek_errno = errno;
             }
+            std::fprintf(stderr,
+                "[virtual-tunnel] ssl_read_exact failed seq=%d r=%d ssl_err=%d "
+                "errno=%d got=%zu/%zu fd=%d FIONREAD=%d "
+                "peek_recv=%zd peek_errno=%d ssl_err_q=0x%lx (%s) "
+                "dt=%lldms\n",
+                my_seq, r, err, errno, got, n, fd, avail, peek_n, peek_errno,
+                ssl_err_q, ssl_err_buf, now_ms() - t_enter);
             return false;
         }
         got += static_cast<size_t>(r);
@@ -239,6 +251,9 @@ void VirtualTunnelServer::add_device(VirtualTunnelVirtualDevice dev) {
     d->spec = std::move(dev);
     d->ssl_ctx = make_device_ctx(d->spec.cert);
     if (!d->ssl_ctx) {
+        std::fprintf(stderr,
+            "[virtual-tunnel] add_device dev_id=%s: SSL_CTX init failed\n",
+            dev_id.c_str());
         return;
     }
     {
@@ -255,6 +270,9 @@ void VirtualTunnelServer::add_device(VirtualTunnelVirtualDevice dev) {
 void VirtualTunnelServer::attach_storage_delegate(StorageDelegate delegate) {
     std::lock_guard<std::mutex> lk(m_mu);
     m_storage_delegate = std::move(delegate);
+    std::fprintf(stderr,
+        "[virtual-tunnel] attach_storage_delegate set=%d\n",
+        m_storage_delegate ? 1 : 0);
 }
 
 void VirtualTunnelServer::update_printer_lan_ip(
@@ -264,6 +282,11 @@ void VirtualTunnelServer::update_printer_lan_ip(
     Device* d = find_locked(dev_id);
     if (!d) return;
     if (d->spec.printer_lan_ip == printer_lan_ip) return;
+    std::fprintf(stderr,
+        "[virtual-tunnel] dev_id=%s printer_lan_ip %s -> %s\n",
+        dev_id.c_str(),
+        d->spec.printer_lan_ip.empty() ? "(none)" : d->spec.printer_lan_ip.c_str(),
+        printer_lan_ip.empty()         ? "(none)" : printer_lan_ip.c_str());
     d->spec.printer_lan_ip = printer_lan_ip;
 }
 
@@ -274,6 +297,11 @@ void VirtualTunnelServer::update_printer_firmware_ver(
     Device* d = find_locked(dev_id);
     if (!d) return;
     if (d->spec.printer_firmware_ver == firmware_ver) return;
+    std::fprintf(stderr,
+        "[virtual-tunnel] dev_id=%s printer_firmware_ver %s -> %s\n",
+        dev_id.c_str(),
+        d->spec.printer_firmware_ver.empty() ? "(none)" : d->spec.printer_firmware_ver.c_str(),
+        firmware_ver.empty()                 ? "(none)" : firmware_ver.c_str());
     d->spec.printer_firmware_ver = firmware_ver;
 }
 
@@ -326,6 +354,7 @@ VirtualTunnelServer::Device* VirtualTunnelServer::find_locked(
     return (it == m_devices.end()) ? nullptr : it->second.get();
 }
 
+
 // Storage-delegate session loop. Reads length-prefixed JSON frames from
 // the virtual slicer, parses cmdtype/sequence/req, hands the request
 // to the delegate (PrinterFileSystem-via-BridgeStorageBackend in the
@@ -338,6 +367,9 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
                                  const std::string& slicer_cli_id,
                                  const std::string& slicer_cli_ver) {
     const std::string& dev_id = spec.dev_id;
+    std::fprintf(stderr,
+        "[virtual-tunnel] session_loop_backend enter dev_id=%s fd=%d\n",
+        dev_id.c_str(), client_fd);
     SSL* slicer_ssl = SSL_new(server_ctx);
     if (!slicer_ssl) { ::close(client_fd); return; }
     SSL_set_fd(slicer_ssl, client_fd);
@@ -353,6 +385,14 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
         ::ioctl(client_fd, FIONREAD, &avail_after_accept);
         int sock_err = 0; socklen_t se_len = sizeof(sock_err);
         ::getsockopt(client_fd, SOL_SOCKET, SO_ERROR, &sock_err, &se_len);
+        std::fprintf(stderr,
+            "[virtual-tunnel] session up dev_id=%s — backend delegation mode "
+            "tls=%s cipher=%s SSL_pending=%d SSL_has_pending=%d "
+            "FIONREAD=%d SO_ERROR=%d fd=%d\n",
+            dev_id.c_str(),
+            SSL_get_version(slicer_ssl), SSL_get_cipher(slicer_ssl),
+            SSL_pending(slicer_ssl), SSL_has_pending(slicer_ssl),
+            avail_after_accept, sock_err, client_fd);
     }
 
     // Shared write-side state. The backend's reply callback can fire on
@@ -370,6 +410,9 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
                            (static_cast<uint32_t>(lenbuf[2]) <<  8) |
                             static_cast<uint32_t>(lenbuf[3]);
         if (n == 0 || n > 4u * 1024u * 1024u) {
+            std::fprintf(stderr,
+                "[virtual-tunnel] dev_id=%s: bad frame length %u — closing\n",
+                dev_id.c_str(), unsigned(n));
             break;
         }
         std::vector<uint8_t> payload(n);
@@ -380,12 +423,18 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
         try {
             env = nlohmann::json::parse(payload.begin(), payload.end());
         } catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                "[virtual-tunnel] dev_id=%s: malformed JSON frame: %s\n",
+                dev_id.c_str(), ex.what());
             break;
         }
         const int  cmdtype  = env.value("cmdtype",  -1);
         const int  sequence = env.value("sequence",  0);
         nlohmann::json req_body = env.value("req", nlohmann::json::object());
         if (cmdtype < 0) {
+            std::fprintf(stderr,
+                "[virtual-tunnel] dev_id=%s: frame without cmdtype, dropping\n",
+                dev_id.c_str());
             continue;
         }
 
@@ -413,6 +462,10 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
                     ? nlohmann::json::object()
                     : nlohmann::json::parse(reply_json);
             } catch (const std::exception& ex) {
+                std::fprintf(stderr,
+                    "[virtual-tunnel] dev_id=%s: malformed reply JSON "
+                    "from delegate: %s — substituting {}\n",
+                    dev_id_copy.c_str(), ex.what());
                 reply = nlohmann::json::object();
             }
             nlohmann::json envelope = {
@@ -431,11 +484,17 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
             std::lock_guard<std::mutex> lk(*mu);
             if (!alive->load()) return;
             if (!ssl_write_all(ssl_capture, hdr, 4)) {
+                std::fprintf(stderr,
+                    "[virtual-tunnel] dev_id=%s: write header failed in cb\n",
+                    dev_id_copy.c_str());
                 return;
             }
             if (!ssl_write_all(ssl_capture,
                                reinterpret_cast<const uint8_t*>(body.data()),
                                body.size())) {
+                std::fprintf(stderr,
+                    "[virtual-tunnel] dev_id=%s: write body failed in cb\n",
+                    dev_id_copy.c_str());
                 return;
             }
         };
@@ -452,6 +511,10 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
             std::move(req_body_json),
             std::move(cb));
     }
+
+    std::fprintf(stderr,
+        "[virtual-tunnel] session down (backend mode) dev_id=%s\n",
+        dev_id.c_str());
 
     // Disarm any in-flight callbacks BEFORE freeing the SSL.
     session_alive->store(false);
@@ -477,6 +540,10 @@ static void session_loop(SSL_CTX* server_ctx, int client_fd,
                          const std::string& slicer_cli_id,
                          const std::string& slicer_cli_ver) {
     if (!delegate) {
+        std::fprintf(stderr,
+            "[virtual-tunnel] dev_id=%s: no storage delegate attached — "
+            "refusing connection\n",
+            spec.dev_id.c_str());
         ::close(client_fd);
         return;
     }
@@ -496,8 +563,15 @@ static void accept_loop(VirtualTunnelServer::Device* d, int io_timeout_s) {
         if (sel <= 0) continue;
         int cfd = ::accept(d->listen_fd,
                            reinterpret_cast<sockaddr*>(&caddr), &clen);
+        std::fprintf(stderr,
+            "[virtual-tunnel] accept_loop accept -> cfd=%d errno=%d "
+            "dev_id=%s ssl_ctx=%p\n",
+            cfd, errno, d->spec.dev_id.c_str(), (void*)d->ssl_ctx);
         if (cfd < 0) {
             if (errno == EINTR) continue;
+            std::fprintf(stderr,
+                "[virtual-tunnel] accept failed dev_id=%s errno=%d (%s)\n",
+                d->spec.dev_id.c_str(), errno, std::strerror(errno));
             break;
         }
         SSL_CTX*                                  ctx    = d->ssl_ctx;
@@ -522,9 +596,17 @@ void VirtualTunnelServer::start_device(Device& d) {
     d.listen_fd = open_listener(d.spec.lan_ip, d.spec.port,
                                 m_cfg.accept_backlog);
     if (d.listen_fd < 0) {
+        std::fprintf(stderr,
+            "[virtual-tunnel] listen failed dev_id=%s ip=%s port=%u\n",
+            d.spec.dev_id.c_str(), d.spec.lan_ip.c_str(),
+            unsigned(d.spec.port));
         return;
     }
     d.bound_port = bound_port_of(d.listen_fd);
+    std::fprintf(stderr,
+        "[virtual-tunnel] dev_id=%s listening on %s:%u\n",
+        d.spec.dev_id.c_str(), d.spec.lan_ip.c_str(),
+        unsigned(d.bound_port));
     d.accepting.store(true);
     Device* dp = &d;
     int io_to = m_cfg.io_timeout_seconds;

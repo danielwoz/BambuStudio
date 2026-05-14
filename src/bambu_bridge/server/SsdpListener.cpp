@@ -78,9 +78,15 @@ bool SsdpListener::start() {
     if (m_running.exchange(true)) return true;
     m_fd = open_udp_listener(m_cfg.bind_address, m_cfg.port);
     if (m_fd < 0) {
+        std::fprintf(stderr,
+            "[ssdp-listener] bind %s:%u failed: %s\n",
+            m_cfg.bind_address.c_str(), m_cfg.port, std::strerror(errno));
         m_running.store(false);
         return false;
     }
+    std::fprintf(stderr,
+        "[ssdp-listener] listening on udp/%s:%u for Bambu NOTIFYs\n",
+        m_cfg.bind_address.c_str(), m_cfg.port);
     m_thread = std::thread(&SsdpListener::recv_loop, this);
     return true;
 }
@@ -140,11 +146,18 @@ void SsdpListener::recv_loop() {
             (std::getenv("BAMBU_BRIDGE_VERBOSE") &&
              std::strcmp(std::getenv("BAMBU_BRIDGE_VERBOSE"), "0") != 0)) {
             m_dumped.insert(dev.dev_id);
+            std::fprintf(stderr,
+                "[ssdp-listener] raw NOTIFY from %s dev_id=%s "
+                "(first-occurrence dump, %zu bytes):\n%s\n",
+                dev.lan_ip.c_str(), dev.dev_id.c_str(), payload.size(),
+                payload.c_str());
         }
 
         if (m_cb) {
             try { m_cb(dev); }
             catch (const std::exception& ex) {
+                std::fprintf(stderr,
+                    "[ssdp-listener] callback threw: %s\n", ex.what());
             }
         }
     }

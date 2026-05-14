@@ -106,6 +106,9 @@ static bool bridge_init_app_config_and_paths(AppConfig*& out_app_config)
         // Match the GUI: cd into the log dir so any path-relative log
         // sink ends up under data_dir/log/.
         if (chdir((d + "/log").c_str()) != 0) {
+            std::fprintf(stderr,
+                "[bambu-bridge] warning: chdir to log folder failed: %s/log\n",
+                d.c_str());
         }
     }
 
@@ -120,6 +123,8 @@ static bool bridge_init_app_config_and_paths(AppConfig*& out_app_config)
     if (out_app_config->exists()) {
         std::string error = out_app_config->load();
         if (!error.empty()) {
+            std::fprintf(stderr,
+                "[bambu-bridge] AppConfig parse failed: %s\n", error.c_str());
             BOOST_LOG_TRIVIAL(error)
                 << "BridgeOnlyConsoleApp: AppConfig parse failed: " << error;
             // Continue anyway — bridge can run with a default config; it
@@ -131,6 +136,8 @@ static bool bridge_init_app_config_and_paths(AppConfig*& out_app_config)
             out_app_config->set_defaults();
             out_app_config->save();
         } catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                "[bambu-bridge] AppConfig save failed: %s\n", ex.what());
         }
     }
     return true;
@@ -147,6 +154,10 @@ bool BridgeOnlyConsoleApp::bring_up_network_agent()
         false,
         !m_app_config->get_bool("ignore_module_cert"));
     if (load_agent_dll != 0) {
+        std::fprintf(stderr,
+            "[bambu-bridge] NetworkAgent: plugin not loaded (rc=%d) — "
+            "bridge will come up with zero devices\n",
+            load_agent_dll);
         return false;
     }
 
@@ -222,8 +233,12 @@ bool BridgeOnlyConsoleApp::OnInit()
 
     BOOST_LOG_TRIVIAL(info)
         << "BridgeOnlyConsoleApp::OnInit: wxAppConsole bridge bootstrap";
+    std::fprintf(stderr,
+        "[bambu-bridge] BridgeOnlyConsoleApp: entered (no GTK)\n");
 
     if (!bridge_init_app_config_and_paths(m_app_config)) {
+        std::fprintf(stderr,
+            "[bambu-bridge] failed to init AppConfig\n");
         return false;
     }
 
@@ -310,9 +325,13 @@ bool BridgeOnlyConsoleApp::OnInit()
                 const int rc = m_bridge_app->run();
                 BOOST_LOG_TRIVIAL(info)
                     << "Bambu Bridge worker exited rc=" << rc;
+                std::fprintf(stderr,
+                    "[bambu-bridge] worker exited rc=%d\n", rc);
             } catch (const std::exception& e) {
                 BOOST_LOG_TRIVIAL(error)
                     << "Bambu Bridge worker crashed: " << e.what();
+                std::fprintf(stderr,
+                    "[bambu-bridge] worker crashed: %s\n", e.what());
             }
         });
 
@@ -330,12 +349,19 @@ bool BridgeOnlyConsoleApp::OnInit()
         // Both calls are safe to repeat; the agent dedups internally.
         m_bridge_push_timer = std::make_unique<wxTimer>(this);
         Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+            std::fprintf(stderr,
+                "[bambu-bridge] TICK app=%p dm=%p agent=%p login=%d ml=%zu\n",
+                m_bridge_app.get(), m_device_manager.get(), m_agent,
+                (m_agent && m_agent->is_user_login()) ? 1 : 0,
+                m_device_manager ? m_device_manager->get_user_machinelist().size() : 0);
             if (!m_bridge_app)     return;
             if (!m_device_manager) return;
             if (!m_agent || !m_agent->is_user_login()) return;
             if (!m_mqtt_started) {
                 m_agent->start_subscribe("app");
                 m_mqtt_started = true;
+                std::fprintf(stderr,
+                    "[bambu-bridge] MQTT app subscribe started\n");
             }
             // Seed DeviceManager::userMachineList the same way the GUI
             // does when the printer-selection dropdown opens: fetch the
@@ -353,11 +379,26 @@ bool BridgeOnlyConsoleApp::OnInit()
                     int rc = m_agent->get_user_print_info(&http_code, &body);
                     CallAfter([this, rc, http_code, body = std::move(body)]() mutable {
                         m_user_print_info_inflight = false;
+                        std::fprintf(stderr,
+                            "[bambu-bridge] get_user_print_info rc=%d http=%u "
+                            "body_len=%zu\n",
+                            rc, http_code, body.size());
                         if (rc == 0 && !body.empty() && m_device_manager) {
+                            std::fprintf(stderr,
+                                "[bambu-bridge] parse_user_print_info begin\n");
                             try {
                                 m_device_manager->parse_user_print_info(body);
+                                std::fprintf(stderr,
+                                    "[bambu-bridge] parse_user_print_info end "
+                                    "ml=%zu\n",
+                                    m_device_manager->get_user_machinelist().size());
                             } catch (const std::exception& ex) {
+                                std::fprintf(stderr,
+                                    "[bambu-bridge] parse_user_print_info threw: %s\n",
+                                    ex.what());
                             } catch (...) {
+                                std::fprintf(stderr,
+                                    "[bambu-bridge] parse_user_print_info threw (unknown)\n");
                             }
                         }
                     });
@@ -371,6 +412,13 @@ bool BridgeOnlyConsoleApp::OnInit()
                 std::string id = mo->get_dev_id();
                 if (id.empty()) continue;
                 const std::string fw = mo->get_ota_version();
+                std::fprintf(stderr,
+                    "[bambu-bridge] tick dev_id=%s name=%s ip=%s "
+                    "model=%s firmware='%s' module_vers=%zu connected=%d\n",
+                    id.c_str(), mo->get_dev_name().c_str(),
+                    mo->get_dev_ip().c_str(), mo->printer_type.c_str(),
+                    fw.c_str(), mo->module_vers.size(),
+                    mo->is_connected() ? 1 : 0);
                 Slic3r::bridge::headless::VirtualPrinter p;
                 p.dev_id      = std::move(id);
                 p.dev_name    = mo->get_dev_name();
@@ -389,9 +437,15 @@ bool BridgeOnlyConsoleApp::OnInit()
             << "Bambu Bridge --bridge-only started (wxAppConsole); "
             << "DeviceManager push every 5s, NetworkAgent "
             << (m_agent ? "attached" : "missing");
+        std::fprintf(stderr,
+            "[bambu-bridge] bridge worker started (wxAppConsole); "
+            "push pump 5s, agent=%s\n",
+            m_agent ? "yes" : "no");
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(error)
             << "Failed to start --bridge-only bridge: " << e.what();
+        std::fprintf(stderr,
+            "[bambu-bridge] failed to start: %s\n", e.what());
         return false;
     }
 
@@ -401,6 +455,8 @@ bool BridgeOnlyConsoleApp::OnInit()
             CallAfter([this] {
                 BOOST_LOG_TRIVIAL(info)
                     << "BridgeOnlyConsoleApp: signal received, exiting loop";
+                std::fprintf(stderr,
+                    "[bambu-bridge] signal received, exiting wx loop\n");
                 ExitMainLoop();
             });
         });

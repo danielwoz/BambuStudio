@@ -99,10 +99,16 @@ server::UploadResult UploadSinkRouter::deliver(server::UploadJob job) {
         server::UploadResult r;
         r.ok            = false;
         r.error_message = "UploadSinkRouter: no healthy sink available for " + job.dev_id;
+        std::fprintf(stderr,
+            "[upload-router] FAIL dev=%s no healthy sink (lan_ok=%d cloud_ok=%d)\n",
+            job.dev_id.c_str(), static_cast<int>(lan_ok), static_cast<int>(cloud_ok));
         return r;
     }
 
     // Try primary.
+    std::fprintf(stderr,
+        "[upload-router] dev=%s file=%s -> %s\n",
+        job.dev_id.c_str(), job.filename.c_str(), primary_name);
     server::UploadJob job_copy = job; // sub-sinks consume by value
     auto result = primary->deliver(std::move(job_copy));
     if (result.ok) return result;
@@ -110,6 +116,9 @@ server::UploadResult UploadSinkRouter::deliver(server::UploadJob job) {
     // Primary failed. Aggregate the error and try secondary if allowed.
     std::string primary_err = result.error_message;
     if (secondary && policy.fallback_to_cloud) {
+        std::fprintf(stderr,
+            "[upload-router] dev=%s primary (%s) failed: %s — falling back to %s\n",
+            job.dev_id.c_str(), primary_name, primary_err.c_str(), secondary_name);
         auto fb = secondary->deliver(std::move(job));
         if (fb.ok) {
             fb.error_message.clear();

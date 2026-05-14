@@ -185,6 +185,9 @@ size_t PrinterFileSystem::EnterSubGroup(size_t index)
 
 void PrinterFileSystem::ListAllFiles()
 {
+    std::fprintf(stderr,
+        "[pfs] ListAllFiles called type=%d storage='%s'\n",
+        m_file_type, m_file_storage.c_str());
     json req;
     char const * types[] {"timelapse","video", "model" };
     req["type"] = types[m_file_type];
@@ -300,6 +303,7 @@ struct PrinterFileSystem::Upload : Progress
     boost::filesystem::ifstream ifs;
 };
 
+
 void PrinterFileSystem::GetPickImages(const std::vector<std::string> &local_paths, const std::vector<std::string> &targetpaths)
 {
     m_download_states.clear();
@@ -324,6 +328,7 @@ void PrinterFileSystem::GetPickImage(int id, const std::string &local_path, cons
 
     DownloadRamFile(16, local_path, param);
 }
+
 
 void PrinterFileSystem::DownloadRamFile(int index, const std::string &local_path, const std::string & param)
 {
@@ -438,6 +443,7 @@ void PrinterFileSystem::SendConnectFail(){
     SendChangedEvent(EVT_RAMDOWNLOAD, ERROR_PIPE);
 }
 
+
 void PrinterFileSystem::DownloadFiles(size_t index, std::string const &path)
 {
     if (index == (size_t) -1) {
@@ -470,6 +476,10 @@ void PrinterFileSystem::DownloadFiles(size_t index, std::string const &path)
     if ((m_task_flags & FF_DOWNLOAD) == 0)
         DownloadNextFile();
 }
+
+
+
+
 
 void PrinterFileSystem::DownloadCheckFiles(std::string const &path)
 {
@@ -1452,6 +1462,10 @@ void PrinterFileSystem::CancelUploadTask(bool send_cancel_req)
 
 boost::uint32_t PrinterFileSystem::SendRequest(int type, json const &req, callback_t2 const &callback,const std::string& param)
 {
+    std::fprintf(stderr,
+        "[pfs] SendRequest type=0x%04x tunnel=%p (null=%d)\n",
+        type, (void*)m_session.tunnel,
+        int(m_session.tunnel == nullptr));
     if (m_session.tunnel == nullptr) {
         Retry();
         callback(ERROR_PIPE, json(), nullptr);
@@ -1540,14 +1554,27 @@ void PrinterFileSystem::RecvMessageThread()
     Bambu_Sample sample;
     boost::unique_lock l(m_mutex);
     Reconnect(l, 0);
+    std::fprintf(stderr,
+        "[pfs] RecvMessageThread: after initial Reconnect, "
+        "m_stopped=%d tunnel=%p msgs=%zu cbs=%zu\n",
+        int(m_stopped), (void*)m_session.tunnel,
+        m_messages.size(), m_callbacks.size());
     while (true) {
         {
             static thread_local int loop_tick = 0;
             if (loop_tick < 10 || (loop_tick % 100) == 0) {
+                std::fprintf(stderr,
+                    "[pfs] loop tick=%d stopped=%d tunnel=%p msgs=%zu cbs=%zu\n",
+                    loop_tick, int(m_stopped),
+                    (void*)m_session.tunnel,
+                    m_messages.size(), m_callbacks.size());
             }
             ++loop_tick;
         }
         if (m_stopped && (m_session.owner == nullptr || (m_messages.empty() && m_callbacks.empty()))) {
+            std::fprintf(stderr,
+                "[pfs] RecvMessageThread: m_stopped=true and idle — "
+                "re-entering Reconnect\n");
             Reconnect(l, 0); // Close and wait start again
             if (m_session.owner == nullptr) {
                 // clear callbacks first
@@ -1602,9 +1629,12 @@ void PrinterFileSystem::RecvMessageThread()
 #if !BBL_RELEASE_TO_PUBLIC
             BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::SendRequest >>>:" << wxString::FromUTF8(msg);
 #endif
+            std::fprintf(stderr,
+                "[pfs] about to Bambu_SendMessage len=%zu\n", msg.length());
             l.unlock();
             int n = Bambu_SendMessage(m_session.tunnel, CTRL_TYPE, msg.c_str(), msg.length());
             l.lock();
+            std::fprintf(stderr, "[pfs] Bambu_SendMessage returned n=%d\n", n);
             if (n == 0)
                 m_messages.pop_front();
             else if (n != Bambu_would_block) {
@@ -1612,9 +1642,17 @@ void PrinterFileSystem::RecvMessageThread()
                 continue;
             }
         }
+        std::fprintf(stderr,
+            "[pfs] pre-ReadSample stopped=%d tunnel=%p msgs=%zu "
+            "produce_map=%zu cbs=%zu\n",
+            int(m_stopped), (void*)m_session.tunnel,
+            m_messages.size(), m_produce_message_cb_map.size(),
+            m_callbacks.size());
         l.unlock();
         int n = Bambu_ReadSample(m_session.tunnel, &sample);
         l.lock();
+        std::fprintf(stderr,
+            "[pfs] post-ReadSample n=%d\n", n);
         if (n == 0) {
             HandleResponse(l, sample);
         } else if (n == Bambu_stream_end) {
@@ -1708,6 +1746,10 @@ void PrinterFileSystem::HandleResponse(boost::unique_lock<boost::mutex> &l, Bamb
 
 void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int result)
 {
+    std::fprintf(stderr,
+        "[pfs] Reconnect ENTER result=%d tunnel=%p owner=%p stopped=%d msgs=%zu\n",
+        result, (void*)m_session.tunnel, (void*)m_session.owner,
+        int(m_stopped), m_messages.size());
     if (m_session.tunnel) {
         auto tunnel = m_session.tunnel;
         m_session.tunnel = nullptr;
@@ -1730,27 +1772,48 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
     if (result)
         m_cond.timed_wait(l, boost::posix_time::seconds(10));
 
+
     while (true) {
         while (m_stopped) {
             if (m_session.owner == nullptr)
                 return;
+           std::fprintf(stderr,
+               "[pfs] Reconnect: stopped, emitting Reconnecting and waiting\n");
            m_status = Status::Reconnecting;
            SendChangedEvent(EVT_STATUS_CHANGED, m_status);
            m_cond.wait(l);
+           std::fprintf(stderr,
+               "[pfs] Reconnect: woke from wait stopped=%d msgs=%zu\n",
+               int(m_stopped), m_messages.size());
         }
         BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect Initializing";
+        std::fprintf(stderr,
+            "[pfs] Reconnect: emitting Initializing, msgs=%zu\n",
+            m_messages.size());
         m_status = Status::Initializing;
         m_last_error = 0;
         SendChangedEvent(EVT_STATUS_CHANGED, m_status);
         // wait for url
         while (!m_stopped && m_messages.empty()) {
+            std::fprintf(stderr,
+                "[pfs] Reconnect: waiting for URL stopped=%d msgs=%zu\n",
+                int(m_stopped), m_messages.size());
             m_cond.wait(l);
+            std::fprintf(stderr,
+                "[pfs] Reconnect: woke for URL stopped=%d msgs=%zu\n",
+                int(m_stopped), m_messages.size());
         }
         if (m_stopped || m_messages.empty()) {
+            std::fprintf(stderr,
+                "[pfs] Reconnect: continue stopped=%d msgs=%zu\n",
+                int(m_stopped), m_messages.size());
             continue;
         }
         std::string url = m_messages.front();
         m_messages.clear();
+        std::fprintf(stderr,
+            "[pfs] Reconnect: got URL len=%zu first40=%.40s\n",
+            url.size(), url.c_str());
         if (url.size() < 2) {
             BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect Initialize failed:";
             m_last_error = atoi(url.c_str());
@@ -1791,6 +1854,9 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
             if (ret == 0) {
                 m_session.tunnel = tunnel;
                 BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect Connected";
+                std::fprintf(stderr,
+                    "[pfs] Reconnect connected tunnel=%p — queuing ListSyncing\n",
+                    (void*)tunnel);
                 break;
             } else if (ret == 1) {
                 m_stopped = true;
@@ -1814,13 +1880,18 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
 #ifdef PRINTER_FILE_SYSTEM_TEST
     PostCallback([this] { SendChangedEvent(EVT_FILE_CHANGED); });
 #else
+    std::fprintf(stderr,
+        "[pfs] Reconnect: posting ListSyncing event to main thread\n");
     PostCallback([this] {
+        std::fprintf(stderr,
+            "[pfs] main-thread cb: setting m_status=ListSyncing and firing EVT_STATUS_CHANGED\n");
         m_task_flags = 0;
         m_status     = Status::ListSyncing;
         SendChangedEvent(EVT_STATUS_CHANGED, m_status);
         });
 #endif
 }
+
 
 #include <stdlib.h>
 #if defined(_MSC_VER) || defined(_WIN32)
@@ -1925,9 +1996,14 @@ StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
     };
     lib.Bambu_Open = [](Bambu_Tunnel t) -> int {
         const bool is_v = Slic3r::virtual_tunnel::is_virtual_tunnel(t);
+        std::fprintf(stderr,
+            "[trampoline] Bambu_Open enter tunnel=%p is_virtual=%d real=%p\n",
+            (void*)t, int(is_v), reinterpret_cast<void*>(real_Bambu_Open));
         const int rc = is_v
             ? Slic3r::virtual_tunnel::Bambu_Open_virtual(t)
             : (real_Bambu_Open ? real_Bambu_Open(t) : -1);
+        std::fprintf(stderr,
+            "[trampoline] Bambu_Open exit  tunnel=%p rc=%d\n", (void*)t, rc);
         BB_HARNESS_REC("Bambu_Open",
             nlohmann::json{{"tunnel", reinterpret_cast<std::uintptr_t>(t)}},
             rc);
@@ -1949,11 +2025,17 @@ StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
         const int rc = is_v
             ? Slic3r::virtual_tunnel::Bambu_StartStreamEx_virtual(t, type)
             : (real_Bambu_StartStreamEx ? real_Bambu_StartStreamEx(t, type) : -1);
+        std::fprintf(stderr,
+            "[trampoline] Bambu_StartStreamEx tunnel=%p is_virtual=%d type=%d rc=%d\n",
+            (void*)t, int(is_v), type, rc);
         return rc;
     };
     lib.Bambu_SendMessage = [](Bambu_Tunnel t, int ctrl,
                                char const* data, int len) -> int {
         const bool is_v = Slic3r::virtual_tunnel::is_virtual_tunnel(t);
+        std::fprintf(stderr,
+            "[trampoline] Bambu_SendMessage tunnel=%p is_virtual=%d ctrl=%d len=%d\n",
+            (void*)t, int(is_v), ctrl, len);
         if (is_v)
             return Slic3r::virtual_tunnel::Bambu_SendMessage_virtual(t, ctrl, data, len);
         return real_Bambu_SendMessage
@@ -1970,6 +2052,9 @@ StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
         {
             static thread_local int tick = 0;
             if (tick < 10 || (tick % 100) == 0) {
+                std::fprintf(stderr,
+                    "[trampoline] Bambu_ReadSample tunnel=%p is_virtual=%d tick=%d rc=%d\n",
+                    (void*)t, int(is_v), tick, rc);
             }
             ++tick;
         }
@@ -2004,6 +2089,9 @@ StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
     };
     lib.Bambu_SetLogger = [](Bambu_Tunnel t, Logger logger, void* ctx) {
         const bool is_v = Slic3r::virtual_tunnel::is_virtual_tunnel(t);
+        std::fprintf(stderr,
+            "[trampoline] Bambu_SetLogger tunnel=%p is_virtual=%d\n",
+            (void*)t, int(is_v));
         if (is_v) {
             Slic3r::virtual_tunnel::Bambu_SetLogger_virtual(t, logger, ctx);
             return;

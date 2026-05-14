@@ -137,6 +137,11 @@ void CloudUplink::add_device(CloudUplinkConfig cfg) {
                 auto it = impl->downstreams.find(dev_id);
                 if (it != impl->downstreams.end()) cb = it->second;
             }
+            std::fprintf(stderr,
+                "[cloud-uplink] inbound dev_id=%s topic=%s payload_len=%zu "
+                "qos=%u downstream=%s\n",
+                dev_id.c_str(), topic.c_str(), payload.size(),
+                static_cast<unsigned>(qos), cb ? "yes" : "no");
             if (cb) cb(std::move(topic), std::move(payload), qos);
         });
     }

@@ -160,8 +160,10 @@ int main(int argc, char** argv) {
         const int rc = Slic3r::virtual_ftps::upload(
             up,
             [](int pct, std::string s) {
+                std::fprintf(stderr, "[upload] %d%% %s\n", pct, s.c_str());
             },
             nullptr);
+        std::fprintf(stderr, "[cli] upload rc=%d\n", rc);
         return rc == 0 ? 0 : 1;
     }
 
@@ -190,6 +192,7 @@ int main(int argc, char** argv) {
             connect_rc   = state;
             is_connected = (state == 0);
             connected_cv.notify_all();
+            std::fprintf(stderr, "[cli] on_connect state=%d\n", state);
         });
     vc.set_on_message(
         [&](std::string dev_id, std::string msg) {
@@ -198,8 +201,12 @@ int main(int argc, char** argv) {
                           static_cast<std::size_t>(max_print));
         });
 
+    std::fprintf(stderr,
+        "[cli] connecting host=%s sn=%s\n", host.c_str(), sn.c_str());
     int rc = vc.connect_printer(sn, host, access);
     if (rc != 0) {
+        std::fprintf(stderr,
+            "[cli] connect_printer returned rc=%d — bailing\n", rc);
         return 1;
     }
 
@@ -210,16 +217,26 @@ int main(int argc, char** argv) {
                               [&] { return is_connected || g_stop.load(); });
     }
     if (!is_connected) {
+        std::fprintf(stderr,
+            "[cli] no CONNACK within 5s (rc=%d) — bailing\n", connect_rc);
         return 1;
     }
+    std::fprintf(stderr, "[cli] connected; subscribed to device/%s/report\n",
+                 sn.c_str());
 
     // Optionally fire an outbound message.
     if (cmd == "pushall") {
         const std::string body =
             R"({"pushing":{"sequence_id":"0","command":"pushall"}})";
+        std::fprintf(stderr, "[cli] sending pushall (%zu bytes)\n",
+                     body.size());
         int srv = vc.send_message(sn, body, /*qos=*/0);
+        std::fprintf(stderr, "[cli] pushall send rc=%d\n", srv);
     } else if (cmd == "send") {
+        std::fprintf(stderr, "[cli] sending %zu bytes\n",
+                     user_payload.size());
         int srv = vc.send_message(sn, user_payload, /*qos=*/0);
+        std::fprintf(stderr, "[cli] send rc=%d\n", srv);
     }
 
     // Main wait loop.
@@ -231,11 +248,14 @@ int main(int argc, char** argv) {
             const auto silent = std::chrono::duration_cast<
                 std::chrono::seconds>(now - g_last_inbound).count();
             if (silent >= idle) {
+                std::fprintf(stderr,
+                    "[cli] %lds idle — exiting\n", (long) silent);
                 break;
             }
         }
     }
 
+    std::fprintf(stderr, "[cli] disconnecting\n");
     vc.disconnect_printer(sn);
     return 0;
 }

@@ -95,6 +95,8 @@ int NetworkAgentPluginAdapter::upload_gcode_to_sdcard(
     // virtual storage tunnel goes through VirtualTunnelServer, not this
     // path. Stub returns the same code the base uses for missing
     // exports so CloudUploadSink falls back gracefully.
+    std::fprintf(stderr,
+        "[adapter] upload_gcode_to_sdcard not yet implemented\n");
     return -2;
 }
 
@@ -123,6 +125,8 @@ int NetworkAgentPluginAdapter::send_message_to_printer(
 
 int NetworkAgentPluginAdapter::start_local_print_with_record(
         const LocalPrintParams& /*params*/) {
+    std::fprintf(stderr,
+        "[adapter] start_local_print_with_record not yet implemented\n");
     return -2;
 }
 

@@ -103,12 +103,19 @@ SessionRouter::Route SessionRouter::pick_route(const std::string& dev_id) const 
         std::lock_guard<std::mutex> lk(m_mu);
         auto& slot = m_cache[dev_id];
         if (slot.route != chosen) {
+            std::fprintf(stderr,
+                "[session-router] dev=%s route %s -> %s (lan=%d cloud=%d)\n",
+                dev_id.c_str(), route_name(slot.route), route_name(chosen),
+                static_cast<int>(lan_ok), static_cast<int>(cloud_ok));
         }
         slot.route = chosen;
         slot.at    = std::chrono::steady_clock::now();
     }
 
     if (chosen == Route::None) {
+        std::fprintf(stderr,
+            "[session-router] dev=%s no healthy uplink — dropping traffic\n",
+            dev_id.c_str());
     }
     return chosen;
 }

@@ -108,23 +108,38 @@ bool LanCameraSource::open() {
     }
 
     if (!handle) {
+        std::fprintf(stderr,
+            "[lan-camera-source] open(dev=%s) failed: no BambuSourceHandle attached\n",
+            m_cfg.dev_id.c_str());
         return false;
     }
     // Idempotent init() — BambuSourceHandle guards with a once_flag.
     if (!handle->library_ready()) handle->init();
     if (!handle->library_ready()) {
+        std::fprintf(stderr,
+            "[lan-camera-source] open(dev=%s) failed: BambuSource library not loaded\n",
+            m_cfg.dev_id.c_str());
         return false;
     }
 
     const std::string u = build_url();
+    std::fprintf(stderr,
+        "[lan-camera-source] open(dev=%s) url=bambu:///rtsps___%s:***@%s/streaming/live/1?proto=rtsps\n",
+        m_cfg.dev_id.c_str(), m_cfg.username.c_str(), m_cfg.printer_ip.c_str());
 
     void* tunnel = nullptr;
     int rc = handle->bambu_create(&tunnel, u);
     if (rc != 0 || !tunnel) {
+        std::fprintf(stderr,
+            "[lan-camera-source] dev=%s Bambu_Create rc=%d\n",
+            m_cfg.dev_id.c_str(), rc);
         return false;
     }
     rc = handle->bambu_open(tunnel);
     if (rc != 0) {
+        std::fprintf(stderr,
+            "[lan-camera-source] dev=%s Bambu_Open rc=%d\n",
+            m_cfg.dev_id.c_str(), rc);
         handle->bambu_destroy(tunnel);
         return false;
     }
@@ -145,9 +160,17 @@ bool LanCameraSource::open() {
             ++loops;
         } while (std::chrono::steady_clock::now() - start < timeout);
         if (loops > 0) {
+            std::fprintf(stderr,
+                "[lan-camera-source] dev=%s StartStream settled after "
+                "%d retries (final rc=%d)\n",
+                m_cfg.dev_id.c_str(), loops, rc);
         }
     }
     if (rc != 0) {
+        std::fprintf(stderr,
+            "[lan-camera-source] dev=%s Bambu_StartStream rc=%d (gave up "
+            "after retry loop)\n",
+            m_cfg.dev_id.c_str(), rc);
         handle->bambu_close(tunnel);
         handle->bambu_destroy(tunnel);
         return false;

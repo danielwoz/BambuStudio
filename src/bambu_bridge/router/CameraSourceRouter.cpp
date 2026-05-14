@@ -124,19 +124,31 @@ bool CameraSourceRouter::open() {
         default: break;
         }
         if (!src) continue;
+        std::fprintf(stderr,
+            "[camera-router] dev=%s trying source=%s\n",
+            dev_id.c_str(), choice_name(order[i]));
         if (src->open()) {
             std::lock_guard<std::mutex> lk(m_mu);
             m_choice = order[i];
             m_chosen = src;
             m_open   = true;
+            std::fprintf(stderr,
+                "[camera-router] dev=%s opened source=%s\n",
+                dev_id.c_str(), choice_name(order[i]));
             return true;
         }
+        std::fprintf(stderr,
+            "[camera-router] dev=%s source=%s open() failed; trying next\n",
+            dev_id.c_str(), choice_name(order[i]));
     }
 
     std::lock_guard<std::mutex> lk(m_mu);
     m_choice = Choice::None;
     m_chosen.reset();
     m_open   = false;
+    std::fprintf(stderr,
+        "[camera-router] dev=%s open failed — no source could be brought up\n",
+        dev_id.c_str());
     return false;
 }
 

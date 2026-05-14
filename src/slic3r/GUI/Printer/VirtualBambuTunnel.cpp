@@ -263,30 +263,63 @@ int Bambu_Create_virtual(Bambu_Tunnel* out, char const* url) {
     if (!out) return -1;
     auto t = new VirtualTunnel();
     if (!parse_virtual_url(url, t)) {
+        std::fprintf(stderr,
+            "[virtual-tunnel] bad URL %s\n", url ? url : "(null)");
         delete t;
         return -1;
     }
+    std::fprintf(stderr,
+        "[virtual-tunnel] create host=%s port=%u dev_id=%s\n",
+        t->host.c_str(), unsigned(t->port), t->dev_id.c_str());
     *out = static_cast<Bambu_Tunnel>(t);
     return 0;
 }
 
 int Bambu_Open_virtual(Bambu_Tunnel tunnel) {
     auto* t = static_cast<VirtualTunnel*>(tunnel);
+    std::fprintf(stderr, "[virtual-tunnel] open enter t=%p\n", (void*)t);
     if (!t) return -1;
+    std::fprintf(stderr,
+        "[virtual-tunnel] open host=%s port=%u dev_id=%s ssl=%p\n",
+        t->host.c_str(), unsigned(t->port), t->dev_id.c_str(),
+        (void*)t->ssl);
     if (t->ssl) return 0;
 
+    std::fprintf(stderr, "[virtual-tunnel] open: client_ctx() ...\n");
     SSL_CTX* ctx = client_ctx();
+    std::fprintf(stderr, "[virtual-tunnel] open: client_ctx() -> %p\n",
+                 (void*)ctx);
     if (!ctx) return -1;
 
+    std::fprintf(stderr,
+        "[virtual-tunnel] open: tcp_connect %s:%u ...\n",
+        t->host.c_str(), unsigned(t->port));
     int fd = tcp_connect(t->host, t->port);
+    std::fprintf(stderr,
+        "[virtual-tunnel] open: tcp_connect -> fd=%d errno=%d\n",
+        fd, errno);
     if (fd < 0) {
+        std::fprintf(stderr,
+            "[virtual-tunnel] tcp_connect %s:%u failed errno=%d (%s)\n",
+            t->host.c_str(), unsigned(t->port), errno, std::strerror(errno));
         return -1;
     }
+    std::fprintf(stderr, "[virtual-tunnel] open: SSL_new ...\n");
     SSL* ssl = SSL_new(ctx);
+    std::fprintf(stderr, "[virtual-tunnel] open: SSL_new -> %p\n",
+                 (void*)ssl);
     if (!ssl) { ::close(fd); return -1; }
+    std::fprintf(stderr, "[virtual-tunnel] open: SSL_set_fd(fd=%d) ...\n", fd);
     SSL_set_fd(ssl, fd);
+    std::fprintf(stderr, "[virtual-tunnel] open: SSL_connect ...\n");
     const int conn_rc = SSL_connect(ssl);
+    std::fprintf(stderr,
+        "[virtual-tunnel] open: SSL_connect -> %d (ssl_err=%d)\n",
+        conn_rc, SSL_get_error(ssl, conn_rc));
     if (conn_rc != 1) {
+        std::fprintf(stderr,
+            "[virtual-tunnel] SSL_connect failed for %s:%u\n",
+            t->host.c_str(), unsigned(t->port));
         SSL_free(ssl);
         ::close(fd);
         return -1;
@@ -295,6 +328,8 @@ int Bambu_Open_virtual(Bambu_Tunnel tunnel) {
     t->fd  = fd;
     t->ssl = ssl;
     vlog(t, 0, "[virtual-tunnel] open ok");
+    std::fprintf(stderr, "[virtual-tunnel] open ok dev_id=%s\n",
+                 t->dev_id.c_str());
     return 0;
 }
 
@@ -316,8 +351,14 @@ int Bambu_SendMessage_virtual(Bambu_Tunnel tunnel, int /*ctrl*/,
     if (!send_frame(t->ssl,
                     reinterpret_cast<const uint8_t*>(data),
                     static_cast<size_t>(len))) {
+        std::fprintf(stderr,
+            "[virtual-tunnel] send_frame failed dev_id=%s len=%d\n",
+            t->dev_id.c_str(), len);
         return -1;
     }
+    std::fprintf(stderr,
+        "[virtual-tunnel] send_frame ok dev_id=%s len=%d\n",
+        t->dev_id.c_str(), len);
     return 0;
 }
 
@@ -356,6 +397,9 @@ int Bambu_ReadSample_virtual(Bambu_Tunnel tunnel, Bambu_Sample* sample) {
     {
         static thread_local int enter_tick = 0;
         if (enter_tick < 10 || (enter_tick % 100) == 0) {
+            std::fprintf(stderr,
+                "[virtual-tunnel] ReadSample_virtual ENTER tunnel=%p tick=%d\n",
+                tunnel, enter_tick);
         }
         ++enter_tick;
     }
@@ -400,6 +444,9 @@ int Bambu_ReadSample_virtual(Bambu_Tunnel tunnel, Bambu_Sample* sample) {
             (static_cast<uint32_t>(t->read_lenbuf[2]) <<  8) |
              static_cast<uint32_t>(t->read_lenbuf[3]);
         if (n == 0 || n > 4u * 1024u * 1024u) {
+            std::fprintf(stderr,
+                "[virtual-tunnel] bad frame length %u dev_id=%s\n",
+                unsigned(n), t->dev_id.c_str());
             return Bambu_stream_end;
         }
         t->read_payload_n   = n;

@@ -63,6 +63,8 @@ void log_ssl_err(const char* where) {
     unsigned long e = ERR_peek_last_error();
     char buf[256] = {0};
     if (e) ERR_error_string_n(e, buf, sizeof(buf));
+    std::fprintf(stderr, "[mqtt-broker] ssl-err at %s: %s\n",
+                 where, buf[0] ? buf : "no-error");
     ERR_clear_error();
 }
 
@@ -362,6 +364,9 @@ void MqttBroker::start() {
         try {
             start_device(*kv.second);
         } catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                "[mqtt-broker] failed to start device %s: %s\n",
+                kv.first.c_str(), ex.what());
         }
     }
 }
@@ -450,6 +455,10 @@ void MqttBroker::start_device(Device& d) {
                     }
                 }
                 if (static_cast<int>(d.sessions.size()) >= max_clients) {
+                    std::fprintf(stderr,
+                        "[mqtt-broker] rejecting connect for %s: "
+                        "max_clients_per_device=%d reached\n",
+                        d.spec.dev_id.c_str(), max_clients);
                     ::close(cfd);
                     continue;
                 }
@@ -635,9 +644,13 @@ void session_io_loop(MqttBroker::Device* dev,
         if (!read_more_blocking()) return;
     }
     if (!first || first->type != PacketType::Connect) {
+        std::fprintf(stderr, "[mqtt-broker] first packet was not CONNECT (type=%d)\n",
+                     first ? static_cast<int>(first->type) : -1);
         return;
     }
     if (first->error != DecodeError::Ok) {
+        std::fprintf(stderr, "[mqtt-broker] CONNECT decode error=%d\n",
+                     static_cast<int>(first->error));
         // Best-effort: send CONNACK BadCredentials/UnacceptableProtocol so the
         // client gets a defined response, then close.
         ConnackReturnCode rc_send = ConnackReturnCode::UnacceptableProtocol;
@@ -662,6 +675,11 @@ void session_io_loop(MqttBroker::Device* dev,
         (dev->spec.access_code.empty() ||
          secure_streq(supplied_pass, dev->spec.access_code));
     if (!auth_ok) {
+        std::fprintf(stderr,
+            "[mqtt-broker] CONNECT auth fail dev=%s user=%s pw_len=%zu\n",
+            dev->spec.dev_id.c_str(),
+            con.has_username ? con.username.c_str() : "(none)",
+            con.password.size());
         auto pkt = encode_connack(ConnackReturnCode::NotAuthorized);
         SSL_write(sess->ssl, pkt.data(), static_cast<int>(pkt.size()));
         return;
@@ -729,6 +747,10 @@ void session_io_loop(MqttBroker::Device* dev,
             continue;
         }
         if (pk->error != DecodeError::Ok) {
+            std::fprintf(stderr,
+                "[mqtt-broker] decode error=%d type=%d on dev=%s\n",
+                static_cast<int>(pk->error), static_cast<int>(pk->type),
+                dev->spec.dev_id.c_str());
             break;
         }
 
@@ -800,6 +822,9 @@ void session_io_loop(MqttBroker::Device* dev,
             return;
         }
         default:
+            std::fprintf(stderr,
+                "[mqtt-broker] unexpected packet type %d on dev=%s — dropping session\n",
+                static_cast<int>(pk->type), dev->spec.dev_id.c_str());
             return;
         }
 
@@ -821,6 +846,8 @@ void MqttBroker::set_uplink(std::shared_ptr<IUplink> uplink) {
     // Refuse mid-run swaps; the accept thread captured the raw IUplink*
     // and changing it under it is a data race.
     if (m_running.load()) {
+        std::fprintf(stderr,
+            "[mqtt-broker] set_uplink ignored: broker already running\n");
         return;
     }
     m_cfg.uplink = std::move(uplink);

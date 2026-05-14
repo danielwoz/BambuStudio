@@ -77,6 +77,9 @@ struct TlsConn {
     bool connect(const std::string& host, uint16_t port) {
         fd = tcp_connect(host, port);
         if (fd < 0) {
+            std::fprintf(stderr,
+                "[virtual-ftps] tcp_connect %s:%u failed: %s\n",
+                host.c_str(), port, std::strerror(errno));
             return false;
         }
         SSL_CTX* ctx = ensure_ctx();
@@ -88,6 +91,11 @@ struct TlsConn {
         if (rc != 1) {
             int e = SSL_get_error(ssl, rc);
             unsigned long q = ERR_get_error();
+            std::fprintf(stderr,
+                "[virtual-ftps] SSL_connect %s:%u failed ssl_err=%d "
+                "errno=%d (%s) queue=%s\n",
+                host.c_str(), port, e, errno, std::strerror(errno),
+                q ? ERR_error_string(q, nullptr) : "(empty)");
             return false;
         }
         return true;
@@ -178,6 +186,8 @@ int upload(const UploadParams& p,
 
     std::string r = ctl.read_reply();
     if (reply_code(r) != 220) {
+        std::fprintf(stderr,
+            "[virtual-ftps] unexpected welcome: %s\n", r.c_str());
         return -2;
     }
 
@@ -192,9 +202,13 @@ int upload(const UploadParams& p,
         if (!ctl.write_line("PASS " + p.pass)) return -3;
         r = ctl.read_reply();
         if (reply_code(r) != 230) {
+            std::fprintf(stderr,
+                "[virtual-ftps] PASS rejected: %s\n", r.c_str());
             return -4;
         }
     } else {
+        std::fprintf(stderr,
+            "[virtual-ftps] USER unexpected: %s\n", r.c_str());
         return -4;
     }
 
@@ -202,6 +216,8 @@ int upload(const UploadParams& p,
     if (!ctl.write_line("TYPE I")) return -3;
     r = ctl.read_reply();
     if (reply_code(r) != 200) {
+        std::fprintf(stderr,
+            "[virtual-ftps] TYPE I rejected: %s\n", r.c_str());
         return -5;
     }
 
@@ -209,11 +225,15 @@ int upload(const UploadParams& p,
     if (!ctl.write_line("PASV")) return -3;
     r = ctl.read_reply();
     if (reply_code(r) != 227) {
+        std::fprintf(stderr,
+            "[virtual-ftps] PASV rejected: %s\n", r.c_str());
         return -6;
     }
     std::string  data_ip;
     uint16_t     data_port = 0;
     if (!parse_pasv(r, data_ip, data_port)) {
+        std::fprintf(stderr,
+            "[virtual-ftps] PASV parse failed: %s\n", r.c_str());
         return -7;
     }
     // Many servers return a useless private IP — fall back to the
@@ -232,12 +252,17 @@ int upload(const UploadParams& p,
     r = ctl.read_reply();
     int c = reply_code(r);
     if (c != 150 && c != 125) {
+        std::fprintf(stderr,
+            "[virtual-ftps] STOR rejected: %s\n", r.c_str());
         return -10;
     }
 
     // --- 4. Stream the file ---------------------------------------------
     std::ifstream f(p.local_path, std::ios::binary);
     if (!f) {
+        std::fprintf(stderr,
+            "[virtual-ftps] cannot open %s: %s\n",
+            p.local_path.c_str(), std::strerror(errno));
         return -11;
     }
     f.seekg(0, std::ios::end);
@@ -256,6 +281,9 @@ int upload(const UploadParams& p,
             int n = SSL_write(data.ssl, chunk.data() + off,
                               static_cast<int>(got - off));
             if (n <= 0) {
+                std::fprintf(stderr,
+                    "[virtual-ftps] data SSL_write failed at %zu/%zu\n",
+                    sent + off, total);
                 data.close();
                 return -12;
             }
@@ -274,6 +302,9 @@ int upload(const UploadParams& p,
     r = ctl.read_reply();
     c = reply_code(r);
     if (c != 226 && c != 250) {
+        std::fprintf(stderr,
+            "[virtual-ftps] STOR final reply unexpected: %s\n",
+            r.c_str());
         return -13;
     }
 

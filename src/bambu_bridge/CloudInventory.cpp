@@ -11,6 +11,8 @@
 #include "CloudInventory.hpp"
 
 #include "BambuNetworkingPluginHandle.hpp"
+#include "Verbose.hpp"
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -59,6 +61,12 @@ bool CloudInventory::refresh() {
     unsigned int http_code = 0;
     std::string  body;
     const bool ok = m_handle->get_user_print_info(&http_code, &body);
+    if (Slic3r::bridge::verbose()) {
+        std::fprintf(stderr,
+            "[cloud-inv] get_user_print_info ok=%d http_code=%u body_len=%zu "
+            "body_preview='%.120s'\n",
+            ok ? 1 : 0, http_code, body.size(), body.c_str());
+    }
     if (!ok) return false;
     if (body.empty()) return false;
 

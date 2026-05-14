@@ -73,6 +73,10 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
         res.error_message =
             "LanUploadSink: no plugin handle attached "
             "(LAN uploads unavailable without bambu_networking plugin).";
+        std::fprintf(stderr,
+            "[lan-upload-sink] dev=%s file=%s bytes=%zu — %s\n",
+            job.dev_id.c_str(), job.filename.c_str(),
+            job.content.size(), res.error_message.c_str());
         return res;
     }
 
@@ -81,6 +85,10 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
         res.ok            = false;
         res.error_message =
             std::string("LanUploadSink: spool failed: ") + std::strerror(errno);
+        std::fprintf(stderr,
+            "[lan-upload-sink] dev=%s file=%s — spool failed: %s\n",
+            job.dev_id.c_str(), job.filename.c_str(),
+            std::strerror(errno));
         return res;
     }
 
@@ -104,10 +112,18 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
     res.ok = (rc == 0);
     if (res.ok) {
         res.remote_url = "bambu-lan:///model/" + job.filename;
+        std::fprintf(stderr,
+            "[lan-upload-sink] forwarded dev=%s file=%s bytes=%zu -> %s\n",
+            job.dev_id.c_str(), job.filename.c_str(),
+            job.content.size(), res.remote_url.c_str());
     } else {
         res.error_message =
             std::string("LanUploadSink: plugin upload rc=") +
             std::to_string(rc) + " — " + err_for_rc(rc);
+        std::fprintf(stderr,
+            "[lan-upload-sink] FAIL dev=%s file=%s bytes=%zu rc=%d (%s)\n",
+            job.dev_id.c_str(), job.filename.c_str(),
+            job.content.size(), rc, err_for_rc(rc));
     }
     return res;
 }

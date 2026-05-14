@@ -63,6 +63,10 @@ server::UploadResult CloudUploadSink::deliver(server::UploadJob job) {
         res.error_message =
             "CloudUploadSink: no plugin handle attached "
             "(cloud uploads unavailable without bambu_networking plugin).";
+        std::fprintf(stderr,
+            "[cloud-upload-sink] dev=%s file=%s bytes=%zu — %s\n",
+            job.dev_id.c_str(), job.filename.c_str(),
+            job.content.size(), res.error_message.c_str());
         return res;
     }
 
@@ -72,6 +76,10 @@ server::UploadResult CloudUploadSink::deliver(server::UploadJob job) {
         res.error_message =
             std::string("CloudUploadSink: spool failed: ") +
             std::strerror(errno);
+        std::fprintf(stderr,
+            "[cloud-upload-sink] dev=%s file=%s — spool failed: %s\n",
+            job.dev_id.c_str(), job.filename.c_str(),
+            std::strerror(errno));
         return res;
     }
 
@@ -113,6 +121,10 @@ server::UploadResult CloudUploadSink::deliver(server::UploadJob job) {
         res.error_message =
             std::string("CloudUploadSink: plugin upload rc=") +
             std::to_string(rc) + " — " + err_for_rc(rc);
+        std::fprintf(stderr,
+            "[cloud-upload-sink] dev=%s file=%s bytes=%zu rc=%d (%s)\n",
+            job.dev_id.c_str(), job.filename.c_str(),
+            job.content.size(), rc, err_for_rc(rc));
     }
     return res;
 }

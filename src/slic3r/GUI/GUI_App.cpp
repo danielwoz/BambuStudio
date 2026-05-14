@@ -129,12 +129,14 @@
 #include "slic3r/Utils/VirtualMqttClient.hpp"
 #include <cstring>
 #include <csignal>
+#include <execinfo.h>
 #include <unistd.h>
 #endif
 
 //#ifdef WIN32
 //#include "BaseException.h"
 //#endif
+
 
 #ifdef __WXMSW__
 #include <dbt.h>
@@ -457,6 +459,7 @@ public:
 #endif //__WXMSW__
     }
 
+
 private:
     wxStaticText* m_staticText_slicer_name;
     wxStaticText* m_staticText_slicer_version;
@@ -765,6 +768,7 @@ private:
         return GetTextExtent(longest_sub_string).GetX();
     }
 };
+
 
 #ifdef __linux__
 bool static check_old_linux_datadir(const wxString& app_name) {
@@ -1102,6 +1106,8 @@ void GUI_App::post_init()
     } else {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " sync_user_preset: false";
     }
+
+
 
     wxGetApp().report_consent_common(app_config->get("firstguide", "privacyuse") == "true"? true : false, "studio_improvement_policy_enable", "StudioImprovementPolicy");
 
@@ -1565,6 +1571,7 @@ void GUI_App::shutdown()
     BOOST_LOG_TRIVIAL(info) << "GUI_App::shutdown exit";
 }
 
+
 std::string GUI_App::get_http_url(std::string country_code, std::string path)
 {
     std::string url;
@@ -1639,6 +1646,7 @@ std::string GUI_App::get_model_http_url(std::string country_code)
 
     return url;
 }
+
 
 std::string GUI_App::get_plugin_url(std::string name, std::string country_code)
 {
@@ -1781,6 +1789,7 @@ int GUI_App::download_plugin(std::string name, std::string package_name, Install
         if (pro_fn) pro_fn(InstallStatusDownloadFailed, 0, cancel);
         return result;
     }
+
 
     if (download_url.empty()) {
         BOOST_LOG_TRIVIAL(info) << "[download_plugin 1]: no available plugin found for this app version: " << SLIC3R_VERSION;
@@ -2141,6 +2150,7 @@ void GUI_App::init_networking_callbacks()
             });
         });
 
+
         m_agent->set_on_server_connected_fn([this](int return_code, int reason_code) {
             if (is_closing()) {
             return;
@@ -2356,6 +2366,7 @@ void GUI_App::init_networking_callbacks()
         };
 
         m_agent->set_on_user_message_fn(user_message_arrive_fn);
+
 
         auto lan_message_arrive_fn = [this](std::string dev_id, std::string msg) {
             if (is_closing()) {
@@ -2820,6 +2831,7 @@ void GUI_App::init_single_instance_checker(const std::string &name, const std::s
     m_single_instance_checker = std::make_unique<wxSingleInstanceChecker>(boost::nowide::widen(name), boost::nowide::widen(path));
 }
 
+
 #ifdef __APPLE__
 void GUI_App::MacPowerCallBack(void* refcon, io_service_t service, natural_t messageType, void * messageArgument)
 {
@@ -2848,6 +2860,7 @@ void GUI_App::MacPowerCallBack(void* refcon, io_service_t service, natural_t mes
         }
     };
 }
+
 
 void GUI_App::RegisterMacPowerCallBack()
 {
@@ -2897,6 +2910,13 @@ int GUI_App::FilterEvent(wxEvent& event)
         wxPoint mp(-1, -1);
         if (auto* me = wxDynamicCast(&event, wxMouseEvent))
             mp = me->GetPosition();
+        std::fprintf(stderr,
+            "[click] LEFT_DOWN class=%s label=%s name=%s "
+            "widget_screen=(%d,%d %dx%d) mouse_in_widget=(%d,%d)\n",
+            (const char*)klass.utf8_str(),
+            (const char*)label.utf8_str(),
+            (const char*)name.utf8_str(),
+            pos.x, pos.y, sz.x, sz.y, mp.x, mp.y);
     }
     return -1; // continue normal dispatch
 }
@@ -3014,6 +3034,9 @@ int GUI_App::OnExit()
     // for; in the meantime _Exit(0) gives systemd/runit/etc. the
     // clean exit code they want without exposing the crash.
     if (g_bridge_only) {
+        std::fprintf(stderr,
+            "[bambu-bridge] --bridge-only: clean exit (skipping static "
+            "dtors — see GUI_App::OnExit for rationale)\n");
         std::fflush(stderr);
         std::fflush(stdout);
         std::_Exit(0);
@@ -3107,6 +3130,31 @@ bool GUI_App::init_bridge_only_headless()
 {
     BOOST_LOG_TRIVIAL(info)
         << "GUI_App::init_bridge_only_headless: starting headless --bridge-only";
+    std::fprintf(stderr,
+        "[bambu-bridge] --bridge-only: GUI_App entered headless mode "
+        "(no MainFrame); running bridge bootstrap on the wx event loop\n");
+
+    // Install a SIGABRT trampoline that dumps a backtrace to stderr.
+    // glibc raises SIGABRT from malloc() heap-corruption checks; without
+    // this trampoline we get the bare "malloc(): mismatching ..." line
+    // and no stack frames, which makes diagnosing static-dtor unwind
+    // crashes (or any heap bug) painful. SA_RESETHAND lets the kernel's
+    // default core-dump still run after our handler returns.
+    {
+        struct sigaction sa{};
+        sa.sa_flags = SA_RESETHAND | SA_NODEFER;
+        sa.sa_handler = +[](int sig) {
+            // Async-signal-safe write + backtrace_symbols_fd.
+            static const char* hdr =
+                "[bambu-bridge] SIGABRT — backtrace:\n";
+            (void) ::write(STDERR_FILENO, hdr, std::strlen(hdr));
+            void* frames[64];
+            int n = ::backtrace(frames, 64);
+            ::backtrace_symbols_fd(frames, n, STDERR_FILENO);
+            (void)sig;
+        };
+        ::sigaction(SIGABRT, &sa, nullptr);
+    }
 
     // Without a top-level frame, wxApp would normally exit the moment
     // OnInit returns. Suppress that — our SignalHandler controls the
@@ -3130,6 +3178,8 @@ bool GUI_App::init_bridge_only_headless()
     if (!on_init_network()) {
         BOOST_LOG_TRIVIAL(error)
             << "init_bridge_only_headless: on_init_network() failed";
+        std::fprintf(stderr,
+            "[bambu-bridge] --bridge-only: on_init_network failed\n");
         return false;
     }
 
@@ -3231,9 +3281,14 @@ bool GUI_App::init_bridge_only_headless()
                 const int rc = m_bridge_app->run();
                 BOOST_LOG_TRIVIAL(info)
                     << "Bambu Bridge worker exited rc=" << rc;
+                std::fprintf(stderr,
+                    "[bambu-bridge] --bridge-only worker exited rc=%d\n", rc);
             } catch (const std::exception& e) {
                 BOOST_LOG_TRIVIAL(error)
                     << "Bambu Bridge worker crashed: " << e.what();
+                std::fprintf(stderr,
+                    "[bambu-bridge] --bridge-only worker crashed: %s\n",
+                    e.what());
             }
         });
 
@@ -3280,9 +3335,14 @@ bool GUI_App::init_bridge_only_headless()
         BOOST_LOG_TRIVIAL(info)
             << "Bambu Bridge --bridge-only started; DeviceManager push "
                "every 5s, NetworkAgent " << (m_agent ? "attached" : "missing");
+        std::fprintf(stderr,
+            "[bambu-bridge] --bridge-only: bridge worker started; "
+            "DeviceManager push every 5s\n");
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(error)
             << "Failed to start --bridge-only bridge: " << e.what();
+        std::fprintf(stderr,
+            "[bambu-bridge] --bridge-only failed to start: %s\n", e.what());
         return false;
     }
 
@@ -3298,6 +3358,9 @@ bool GUI_App::init_bridge_only_headless()
             CallAfter([this] {
                 BOOST_LOG_TRIVIAL(info)
                     << "--bridge-only: signal received, exiting wx loop";
+                std::fprintf(stderr,
+                    "[bambu-bridge] --bridge-only: signal received, "
+                    "exiting wx loop\n");
                 ExitMainLoop();
             });
         });
@@ -3453,6 +3516,7 @@ bool GUI_App::on_init_inner()
     GUI::wxGetApp().app_config->save();
 #endif // __APPLE__
 
+
     bool init_dark_color_mode = dark_mode();
     bool init_sys_menu_enabled = app_config->get("sys_menu_enabled") == "1";
 #ifdef __WINDOWS__
@@ -3460,6 +3524,7 @@ bool GUI_App::on_init_inner()
 #endif // __WINDOWS__
 
 #endif
+
 
 #ifdef _MSW_DARK_MODE
     // app_config can be updated in check_older_app_config(), so check if dark_color_mode and sys_menu_enabled was changed
@@ -3548,6 +3613,7 @@ bool GUI_App::on_init_inner()
     // supplied as argument to --datadir; in that case we should still run the wizard
     preset_bundle->setup_directories();
 
+
     if (m_init_app_config_from_older)
         copy_older_config();
 
@@ -3576,6 +3642,7 @@ bool GUI_App::on_init_inner()
                     _L("New version of Bambu Studio"),
                     false,
                     wxCENTER | wxICON_INFORMATION);
+
 
                 dialog.SetExtendedMessage(extmsg);*/
                 std::string skip_version_str = this->app_config->get("app", "skip_version");
@@ -3670,6 +3737,7 @@ bool GUI_App::on_init_inner()
     Bind(EVT_CHECK_PRIVACY_SHOW, &GUI_App::show_check_privacy_dlg, this);
 
     Bind(EVT_SHOW_IP_DIALOG, &GUI_App::show_ip_address_enter_dialog_handler, this);
+
 
     std::map<std::string, std::string> extra_headers = get_extra_header();
     Slic3r::Http::set_extra_headers(extra_headers);
@@ -3805,6 +3873,7 @@ bool GUI_App::on_init_inner()
 
     Bind(EVT_HTTP_ERROR, &GUI_App::on_http_error, this);
 
+
     Bind(wxEVT_IDLE, [this](wxIdleEvent& event)
     {
         bool curr_studio_active = this->is_studio_active();
@@ -3826,6 +3895,7 @@ bool GUI_App::on_init_inner()
             }
             m_studio_active = curr_studio_active;
         }
+
 
         if (! plater_)
             return;
@@ -3888,6 +3958,8 @@ bool GUI_App::on_init_inner()
         disabled && *disabled && std::strcmp(disabled, "0") != 0) {
         BOOST_LOG_TRIVIAL(info)
             << "Bambu Bridge skipped (BAMBU_BRIDGE_GUI_DISABLED set).";
+        std::fprintf(stderr,
+            "[bambu-bridge] skipped (BAMBU_BRIDGE_GUI_DISABLED set)\n");
     } else {
         try {
             // host_drives_inventory defaults to TRUE — the bridge does
@@ -4014,9 +4086,13 @@ bool GUI_App::on_init_inner()
                     const int rc = m_bridge_app->run();
                     BOOST_LOG_TRIVIAL(info)
                         << "Bambu Bridge worker exited rc=" << rc;
+                    std::fprintf(stderr,
+                        "[bambu-bridge] worker exited rc=%d\n", rc);
                 } catch (const std::exception& e) {
                     BOOST_LOG_TRIVIAL(error)
                         << "Bambu Bridge worker crashed: " << e.what();
+                    std::fprintf(stderr,
+                        "[bambu-bridge] worker crashed: %s\n", e.what());
                 }
             });
 
@@ -4069,9 +4145,14 @@ bool GUI_App::on_init_inner()
                 << "Bambu Bridge started in GUI worker thread "
                    "(DeviceManager push every 5s); set "
                    "BAMBU_BRIDGE_GUI_DISABLED=1 to skip.";
+            std::fprintf(stderr,
+                "[bambu-bridge] started; pushing DeviceManager "
+                "user-machine list every 5s\n");
         } catch (const std::exception& e) {
             BOOST_LOG_TRIVIAL(error)
                 << "Failed to start Bambu Bridge: " << e.what();
+            std::fprintf(stderr,
+                "[bambu-bridge] failed to start: %s\n", e.what());
         }
     }
 #endif
@@ -4210,6 +4291,10 @@ __retry:
                     /*version=*/std::string(),
                     e.access_code, e.printer_type);
                 if (obj) obj->set_user_access_code(e.access_code);
+                std::fprintf(stderr,
+                    "[virtual-store] hydrated dev_id=%s name='%s' ip=%s\n",
+                    e.dev_id.c_str(), e.dev_name.c_str(),
+                    e.lan_ip.c_str());
             }
         }
 
@@ -4432,8 +4517,10 @@ void GUI_App::UpdateDarkUI(wxWindow* window, bool highlited/* = false*/, bool ju
             return;
     }
 
+
     /*if (m_is_dark_mode != dark_mode() )
         m_is_dark_mode = dark_mode();*/
+
 
     if (m_is_dark_mode) {
         auto original_col = window->GetBackgroundColour();
@@ -4629,6 +4716,7 @@ void GUI_App::link_to_network_check()
     std::string url;
     std::string country_code = app_config->get_country_code();
 
+
     if (country_code == "US") {
         url = "https://status.bambulab.com";
     }
@@ -4782,6 +4870,7 @@ void GUI_App::recreate_GUI(const wxString &msg_name)
 //         config_wizard_startup(true);
 //     });
 
+
     update_publish_status();
 
     m_is_recreating_gui = false;
@@ -4800,6 +4889,7 @@ void GUI_App::keyboard_shortcuts()
     KBShortcutsDialog dlg;
     dlg.ShowModal();
 }
+
 
 void GUI_App::ShowUserGuide() {
     // BBS:Show NewUser Guide
@@ -4856,6 +4946,7 @@ void GUI_App::ShowUserLogin(bool show)
     }
 }
 
+
 void GUI_App::ShowOnlyFilament() {
     // BBS:Show NewUser Guide
     try {
@@ -4873,6 +4964,8 @@ void GUI_App::ShowOnlyFilament() {
         // wxMessageBox(e.what(), "", MB_OK);
     }
 }
+
+
 
 // static method accepting a wxWindow object as first parameter
 bool GUI_App::catch_error(std::function<void()> cb,
@@ -4951,6 +5044,7 @@ static void update_scrolls(wxWindow* window)
 }
 #endif //_MSW_DARK_MODE
 
+
 #ifdef _MSW_DARK_MODE
 void GUI_App::force_menu_update()
 {
@@ -4967,6 +5061,7 @@ void GUI_App::force_colors_update()
     if (WXHWND wxHWND = wxToolTip::GetToolTipCtrl())
         NppDarkMode::SetDarkExplorerTheme((HWND)wxHWND);
     NppDarkMode::SetDarkTitleBar(mainframe->GetHWND());
+
 
     //NppDarkMode::SetDarkExplorerTheme((HWND)mainframe->m_settings_dialog.GetHWND());
     //NppDarkMode::SetDarkTitleBar(mainframe->m_settings_dialog.GetHWND());
@@ -5129,6 +5224,7 @@ bool GUI_App::is_user_login()
     }
     return false;
 }
+
 
 bool GUI_App::check_login()
 {
@@ -5854,6 +5950,7 @@ void GUI_App::on_user_login_handle(wxCommandEvent &evt)
         }
     }
 }
+
 
 void GUI_App::check_track_enable()
 {
@@ -7669,6 +7766,7 @@ bool GUI_App::check_and_keep_current_preset_changes(const wxString& caption, con
         bool is_called_from_configwizard = postponed_apply_of_keeped_changes != nullptr;
         UnsavedChangesDialog dlg(caption, header, "", action_buttons);
 
+
         auto reset_modifications = [this, is_called_from_configwizard]() {
             //if (is_called_from_configwizard)
             //    return; // no need to discared changes. It will be done fromConfigWizard closing
@@ -7870,6 +7968,7 @@ wxString GUI_App::filter_string(wxString str)
 {
     std::string result = str.utf8_string();
     std::string input = str.utf8_string();
+
 
     std::regex domainRegex(R"(([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?))");
     std::sregex_iterator it(input.begin(), input.end(), domainRegex);
@@ -8198,6 +8297,7 @@ void GUI_App::remove_ping_bind_dialog()
         m_ping_code_binding_dialog = nullptr;
     }
 }
+
 
 void GUI_App::remove_mall_system_dialog()
 {
@@ -8641,6 +8741,7 @@ const ColorRGB& GUI_App::get_picking_color() const
     return m_picking_color;
 }
 
+
 FilamentColorCodeQuery* GUI_App::get_filament_color_code_query()
 {
     if (!m_filament_color_code_query)
@@ -8713,6 +8814,7 @@ void GUI_App::report_consent_common(bool agree, std::string scene, std::string f
 //     //TODO use wxNotificationMessage ?
 // }
 
+
 #ifdef __WXMSW__
 static bool set_into_win_registry(HKEY hkeyHive, const wchar_t* pszVar, const wchar_t* pszValue)
 {
@@ -8775,6 +8877,7 @@ static bool del_win_registry(HKEY hkeyHive, const wchar_t *pszVar, const wchar_t
 
     return false;
 }
+
 
 void GUI_App::associate_files(std::wstring extend)
 {

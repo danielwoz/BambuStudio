@@ -7,6 +7,7 @@
 #include "../BambuNetworkingPluginHandle.hpp"
 #include "../BambuSourceHandle.hpp"
 #include "../CloudInventory.hpp"
+#include "../Verbose.hpp"
 #include "../tls/CertFactory.hpp"
 #include "../server/SsdpResponder.hpp"
 #include "../server/SsdpListener.hpp"
@@ -100,6 +101,7 @@ static std::string mangle_serial(const std::string& real_sn) {
            real_sn.substr(kPrefixLen);
 }
 
+
 BridgeApp::BridgeApp(BridgeAppConfig cfg) : m_cfg(std::move(cfg)) {}
 
 BridgeApp::~BridgeApp() {
@@ -130,6 +132,10 @@ void BridgeApp::attach_storage_delegate(
     if (m_vtun && m_storage_delegate) {
         m_vtun->attach_storage_delegate(m_storage_delegate);
     }
+    std::fprintf(stderr,
+        "[bridge-app] attach_storage_delegate set=%d (vtun=%p)\n",
+        m_storage_delegate ? 1 : 0,
+        static_cast<void*>(m_vtun.get()));
 }
 
 uint16_t BridgeApp::mqtt_port_for_dev_id(const std::string& dev_id) const {
@@ -217,11 +223,23 @@ bool BridgeApp::initialise() {
         hcfg.cert_file          = m_cfg.cert_file;
         m_plugin = std::make_shared<BambuNetworkingPluginHandle>(hcfg);
         if (!m_plugin->init()) {
+            std::fprintf(stderr,
+                "[bridge-app] plugin init failed (path='%s'). "
+                "Refusing to start.\n",
+                m_cfg.plugin_path.c_str());
             m_plugin.reset();
             return false;
         }
+        std::fprintf(stderr,
+            "[bridge-app] plugin loaded; user_login=%s server_conn=%s\n",
+            m_plugin->is_user_login()       ? "yes" : "no",
+            m_plugin->is_server_connected() ? "yes" : "no");
     } else if (m_plugin_injected) {
+        std::fprintf(stderr, "[bridge-app] using injected plugin handle\n");
     } else {
+        std::fprintf(stderr,
+            "[bridge-app] host-driven mode: no plugin handle in bridge "
+            "(slicer's NetworkAgent is the sole plugin consumer)\n");
     }
 
     // 1b) BambuSource handle for the camera path. Soft-failure: a missing
@@ -234,9 +252,16 @@ bool BridgeApp::initialise() {
         scfg.library_path = m_cfg.bambu_source_path;
         m_bambu_source = std::make_shared<BambuSourceHandle>(scfg);
         if (!m_bambu_source->init()) {
+            std::fprintf(stderr,
+                "[bridge-app] libBambuSource.so could not be loaded "
+                "(path='%s'). Camera re-serve will refuse open() for every "
+                "device; everything else still works.\n",
+                m_cfg.bambu_source_path.c_str());
         } else {
+            std::fprintf(stderr, "[bridge-app] BambuSource library loaded\n");
         }
     } else {
+        std::fprintf(stderr, "[bridge-app] using injected BambuSource handle\n");
     }
 
     // 2) CloudInventory — only when we own a plugin handle. In host-
@@ -251,6 +276,8 @@ bool BridgeApp::initialise() {
     try {
         m_cert_factory = std::make_unique<tls::CertFactory>(ccfg);
     } catch (const std::exception& ex) {
+        std::fprintf(stderr,
+            "[bridge-app] CertFactory construction failed: %s\n", ex.what());
         return false;
     }
 
@@ -340,10 +367,21 @@ bool BridgeApp::initialise() {
                     // inventory may catch up next tick. Useful log
                     // line for debugging "why isn't $printer in my
                     // virtual list?"
+                    std::fprintf(stderr,
+                        "[ssdp-listener] heard untracked dev_id=%s "
+                        "ip=%s name='%s' model='%s'\n",
+                        heard.dev_id.c_str(), heard.lan_ip.c_str(),
+                        heard.name.c_str(), heard.model.c_str());
                     return;
                 }
                 if (it->second.lan_ip == heard.lan_ip) return; // no-op
 
+                std::fprintf(stderr,
+                    "[ssdp-listener] dev_id=%s lan_ip: %s -> %s\n",
+                    heard.dev_id.c_str(),
+                    it->second.lan_ip.empty() ? "(none)"
+                                              : it->second.lan_ip.c_str(),
+                    heard.lan_ip.c_str());
                 // Wire LanUplink + LanUploadSink. update_lan_ip_locked
                 // calls LanUplink::add_device which fires the plugin's
                 // single-session connect_printer; with --only-dev-id
@@ -401,6 +439,14 @@ bool BridgeApp::initialise() {
     if (m_ftps)          m_ftps->start();
     if (m_rtsp)          m_rtsp->start();
     if (m_vtun)          m_vtun->start();
+
+    std::fprintf(stderr,
+        "[bridge-app] servers up: ssdp=%c mqtt=%c ftps=%c rtsp=%c vtun=%c "
+        "bind=%s poll=%llds\n",
+        m_ssdp ? '1':'0', m_mqtt ? '1':'0',
+        m_ftps ? '1':'0', m_rtsp ? '1':'0', m_vtun ? '1':'0',
+        m_cfg.lan_iface_bind.c_str(),
+        static_cast<long long>(m_cfg.inventory_poll.count()));
 
     m_initialised.store(true);
     return true;
@@ -483,6 +529,13 @@ void BridgeApp::reconcile_once() {
             if (s.lan_ip_last_seen.time_since_epoch().count() == 0) continue;
             if (now - s.lan_ip_last_seen <= m_cfg.lan_ip_stale_after)
                 continue;
+            std::fprintf(stderr,
+                "[bridge-app] dev_id=%s lan_ip=%s expired (no NOTIFY for "
+                "%llds); clearing\n",
+                s.dev_id.c_str(), s.lan_ip.c_str(),
+                static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        now - s.lan_ip_last_seen).count()));
             s.lan_ip.clear();
             s.lan_ip_last_seen = {};
         }
@@ -497,6 +550,9 @@ void BridgeApp::reconcile_once() {
         try {
             printers = m_cfg.printer_source();
         } catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                "[bridge-app] printer_source callback threw: %s — keeping "
+                "previous virtual-printer set\n", ex.what());
             return;
         }
         set_virtual_printers(std::move(printers));
@@ -507,12 +563,22 @@ void BridgeApp::reconcile_once() {
     // polls cloud inventory directly. Only runs when host_drives_inventory
     // was off, which is what gates m_inventory's construction.
     if (!m_inventory) {
+        std::fprintf(stderr, "[bridge-app] reconcile skipped: no inventory\n");
         return;
     }
 
     const bool ok = m_inventory->refresh();
     m_inventory->probe_lan_reachability();
     auto snap = m_inventory->snapshot();
+    if (Slic3r::bridge::verbose()) {
+        std::fprintf(stderr,
+            "[bridge-app] reconcile: refresh=%s snapshot=%zu devices "
+            "(login=%s server=%s)\n",
+            ok ? "ok" : "fail", snap.size(),
+            m_plugin && m_plugin->is_user_login()       ? "yes" : "no",
+            m_plugin && m_plugin->is_server_connected() ? "yes" : "no");
+    }
+
     // Lift CloudDevice -> VirtualPrinter and route through the common
     // host-driven path so we don't have two reconcile implementations.
     std::vector<VirtualPrinter> printers;
@@ -625,6 +691,9 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
     try {
         cert = m_cert_factory->get_or_create(dev_id);
     } catch (const std::exception& ex) {
+        std::fprintf(stderr,
+            "[bridge-app] cert mint failed for dev_id=%s: %s — skipping\n",
+            dev_id.c_str(), ex.what());
         return;
     }
 
@@ -645,6 +714,9 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
             std::string lan = detect_primary_lan_ip();
             if (!lan.empty()) m_ssdp_advertise_ip = lan;
         }
+        std::fprintf(stderr,
+            "[bridge-app] SSDP LOCATION host = %s\n",
+            m_ssdp_advertise_ip.c_str());
     }
 
     // SSDP: announce the virtual device with a MANGLED serial and a
@@ -697,6 +769,9 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         mdev.cert           = cert;
         try { m_mqtt->add_device(std::move(mdev)); }
         catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                "[bridge-app] mqtt add_device dev_id=%s failed: %s\n",
+                dev_id.c_str(), ex.what());
         }
     }
 
@@ -709,6 +784,9 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         fdev.cert        = cert;
         try { m_ftps->add_device(std::move(fdev)); }
         catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                "[bridge-app] ftps add_device dev_id=%s failed: %s\n",
+                dev_id.c_str(), ex.what());
         }
     }
 
@@ -723,6 +801,9 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         vdev.cert                 = cert;
         try { m_vtun->add_device(std::move(vdev)); }
         catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                "[bridge-app] vtun add_device dev_id=%s failed: %s\n",
+                dev_id.c_str(), ex.what());
         }
     }
 
@@ -760,6 +841,9 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
             rdev.source      = state.cam_router;
             try { m_rtsp->add_device(std::move(rdev)); }
             catch (const std::exception& ex) {
+                std::fprintf(stderr,
+                    "[bridge-app] rtsp add_device dev_id=%s failed: %s\n",
+                    dev_id.c_str(), ex.what());
             }
         }
 
@@ -801,11 +885,24 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         }
     }
 
+    std::fprintf(stderr,
+        "[bridge-app] add dev_id=%s name='%s' access_code='%s' lan_ip=%s "
+        "ports={mqtt=%u, ftps=%u, rtsp=%u, vtun=%u}\n",
+        dev_id.c_str(),
+        vp.dev_name.c_str(),
+        access_code.c_str(),
+        lan_ip.c_str(),
+        unsigned(state.mqtt_port), unsigned(state.ftps_port),
+        unsigned(state.rtsp_port), unsigned(state.vtun_port));
+
     m_devices.emplace(dev_id, std::move(state));
 }
 
 void BridgeApp::update_lan_ip_locked(DeviceState&       state,
                                      const std::string& lan_ip) {
+    std::fprintf(stderr,
+        "[bridge-app] dev_id=%s lan_ip flipped %s -> %s; reconfiguring LAN endpoints\n",
+        state.dev_id.c_str(), state.lan_ip.c_str(), lan_ip.c_str());
 
     state.lan_ip = lan_ip;
 
@@ -865,6 +962,8 @@ void BridgeApp::update_lan_ip_locked(DeviceState&       state,
 void BridgeApp::remove_device_locked(const std::string& dev_id) {
     auto it = m_devices.find(dev_id);
     if (it == m_devices.end()) return;
+
+    std::fprintf(stderr, "[bridge-app] remove dev_id=%s\n", dev_id.c_str());
 
     if (m_ssdp) m_ssdp->remove_device(dev_id);
     if (m_mqtt) m_mqtt->remove_device(dev_id);

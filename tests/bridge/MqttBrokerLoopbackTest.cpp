@@ -138,6 +138,8 @@ std::unique_ptr<MqttBroker> try_start_broker(
         broker->add_device(dev);
         broker->start();
     } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[loopback] start at %s:%u failed: %s\n",
+                     bind_ip.c_str(), port, ex.what());
         return nullptr;
     }
     bound_port_out = broker->bound_port(dev_id);
@@ -145,6 +147,8 @@ std::unique_ptr<MqttBroker> try_start_broker(
         broker->stop();
         return nullptr;
     }
+    std::fprintf(stderr, "[loopback] broker bound %s:%u\n",
+                 bind_ip.c_str(), bound_port_out);
     return broker;
 }
 

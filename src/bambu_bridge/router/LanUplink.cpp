@@ -153,7 +153,16 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
     // Establish the LAN connection. The plugin only holds one LAN
     // connection at a time — if a different dev_id was previously
     // connected the plugin's own re-entry semantics handle the swap.
+    std::fprintf(stderr,
+        "[lan-uplink] connect_printer dev_id=%s ip=%s access_code_len=%zu "
+        "use_ssl=%d\n",
+        dev_id.c_str(), dev_ip.c_str(), access.size(),
+        static_cast<int>(use_ssl));
     int rc = h->connect_printer(dev_id, dev_ip, "bblp", access, use_ssl);
+    std::fprintf(stderr,
+        "[lan-uplink] connect_printer dev_id=%s rc=%d local_connected=%d\n",
+        dev_id.c_str(), rc,
+        static_cast<int>(h->is_local_connected()));
     if (rc == 0) {
         std::lock_guard<std::mutex> lk(m_impl->mu);
         m_impl->current_connected_dev_id = dev_id;

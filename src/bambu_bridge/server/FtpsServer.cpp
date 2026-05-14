@@ -110,6 +110,8 @@ void log_ssl_err(const char* where) {
     unsigned long e = ERR_peek_last_error();
     char buf[256] = {0};
     if (e) ERR_error_string_n(e, buf, sizeof(buf));
+    std::fprintf(stderr, "[ftps-server] ssl-err at %s: %s\n",
+                 where, buf[0] ? buf : "no-error");
     ERR_clear_error();
 }
 
@@ -424,6 +426,8 @@ void session_io_loop(FtpsServer::Device* dev,
 
 void FtpsServer::set_sink(std::shared_ptr<IUploadSink> sink) {
     if (m_running.load()) {
+        std::fprintf(stderr,
+            "[ftps-server] set_sink ignored: server already running\n");
         return;
     }
     m_cfg.sink = std::move(sink);
@@ -435,6 +439,8 @@ void FtpsServer::start() {
     for (auto& kv : m_devices) {
         try { start_device(*kv.second); }
         catch (const std::exception& ex) {
+            std::fprintf(stderr, "[ftps-server] failed to start device %s: %s\n",
+                         kv.first.c_str(), ex.what());
         }
     }
 }
@@ -695,12 +701,18 @@ void session_io_loop(FtpsServer::Device* dev,
         else if (cmd == "PASS") {
             if (user != "bblp") {
                 reply(sess->ssl, 530, "Authentication failed.");
+                std::fprintf(stderr,
+                    "[ftps-server] auth fail dev=%s user=%s (not bblp)\n",
+                    dev->spec.dev_id.c_str(), user.c_str());
                 return;
             }
             const bool pw_ok = dev->spec.access_code.empty() ||
                                secure_streq(args, dev->spec.access_code);
             if (!pw_ok) {
                 reply(sess->ssl, 530, "Authentication failed.");
+                std::fprintf(stderr,
+                    "[ftps-server] auth fail dev=%s wrong access code\n",
+                    dev->spec.dev_id.c_str());
                 return;
             }
             authed_user = true;
@@ -881,6 +893,9 @@ void session_io_loop(FtpsServer::Device* dev,
             dc.close();
 
             if (overflow) {
+                std::fprintf(stderr,
+                    "[ftps-server] STOR %s rejected: > %zu bytes\n",
+                    fname.c_str(), cfg.max_upload_bytes);
                 reply(sess->ssl, 552,
                       "Exceeded storage allocation.");
                 continue;

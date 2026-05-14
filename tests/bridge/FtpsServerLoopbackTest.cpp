@@ -107,10 +107,14 @@ std::unique_ptr<FtpsServer> try_start(const std::string& bind_ip,
         srv->add_device(d);
         srv->start();
     } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[loopback] start at %s:%u failed: %s\n",
+                     bind_ip.c_str(), port, ex.what());
         return nullptr;
     }
     bound_port_out = srv->bound_port(d.dev_id);
     if (bound_port_out == 0) { srv->stop(); return nullptr; }
+    std::fprintf(stderr, "[loopback] ftps bound %s:%u\n",
+                 bind_ip.c_str(), bound_port_out);
     return srv;
 }
 

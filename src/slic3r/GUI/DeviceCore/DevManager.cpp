@@ -1,4 +1,5 @@
 #include <nlohmann/json.hpp>
+#include "../../Utils/BambuTrace.hpp"
 #include "DevInfo.h"
 #include "DevManager.h"
 #include "DevUtil.h"
@@ -59,8 +60,10 @@ namespace Slic3r
         userMachineList.clear();
     }
 
+
     void DeviceManager::EnableMultiMachine(bool enable)
     {
+    BS_TRACE_ENTER("EnableMultiMachine");
         m_agent->enable_multi_machine(enable);
         m_enable_mutil_machine = enable;
     }
@@ -68,8 +71,10 @@ namespace Slic3r
     void DeviceManager::start_refresher() { m_refresher->Start(); }
     void DeviceManager::stop_refresher() { m_refresher->Stop(); }
 
+
     void DeviceManager::keep_alive()
     {
+    BS_TRACE_ENTER("keep_alive");
         MachineObject* obj = this->get_selected_machine();
         if (obj)
         {
@@ -97,6 +102,7 @@ namespace Slic3r
 
     void DeviceManager::check_pushing()
     {
+    BS_TRACE_ENTER("check_pushing");
         keep_alive();
         MachineObject* obj = this->get_selected_machine();
 
@@ -115,6 +121,7 @@ namespace Slic3r
 
     void DeviceManager::on_machine_alive(std::string json_str)
     {
+    BS_TRACE_ENTER("on_machine_alive");
         try {
             json j = json::parse(json_str);
             std::string dev_name        = j["dev_name"].get<std::string>();
@@ -288,6 +295,7 @@ namespace Slic3r
         std::string dev_ip, std::string connection_type, std::string bind_state,
         std::string version, std::string access_code, std::string printer_type)
     {
+    BS_TRACE_ENTER("insert_local_device");
         MachineObject* obj;
         obj = new MachineObject(this, m_agent, dev_name, dev_id, dev_ip);
         if (printer_type.empty())
@@ -308,6 +316,7 @@ namespace Slic3r
         obj->set_access_code(access_code, false);
         obj->set_user_access_code(access_code, false);
 
+
         auto it = localMachineList.find(dev_id);
         if (it != localMachineList.end()) {
             localMachineList[dev_id] = obj;
@@ -320,6 +329,7 @@ namespace Slic3r
 
     int DeviceManager::query_bind_status(std::string& msg)
     {
+    BS_TRACE_ENTER("query_bind_status");
         if (!m_agent)
         {
             msg = "";
@@ -376,6 +386,7 @@ namespace Slic3r
 
     MachineObject* DeviceManager::get_user_machine(std::string dev_id)
     {
+    BS_TRACE_ENTER("get_user_machine");
         if (!m_agent || !m_agent->is_user_login())
         {
             return nullptr;
@@ -388,6 +399,7 @@ namespace Slic3r
 
     MachineObject* DeviceManager::get_my_machine(std::string dev_id)
     {
+    BS_TRACE_ENTER("get_my_machine");
         auto list = get_my_machine_list();
         auto it = list.find(dev_id);
         if (it != list.end())
@@ -399,6 +411,7 @@ namespace Slic3r
 
     void DeviceManager::clean_user_info()
     {
+    BS_TRACE_ENTER("clean_user_info");
         BOOST_LOG_TRIVIAL(trace) << "DeviceManager::clean_user_info";
         // reset selected_machine
         selected_machine = "";
@@ -421,6 +434,7 @@ namespace Slic3r
 
     bool DeviceManager::set_selected_machine(std::string dev_id)
     {
+    BS_TRACE_ENTER("set_selected_machine");
         BOOST_LOG_TRIVIAL(info) << "set_selected_machine=" << BBLCrossTalk::Crosstalk_DevId(dev_id)
             << " cur_selected=" << BBLCrossTalk::Crosstalk_DevId(selected_machine);
         auto my_machine_list = get_my_machine_list();
@@ -561,6 +575,7 @@ namespace Slic3r
 
     MachineObject* DeviceManager::get_selected_machine()
     {
+    BS_TRACE_ENTER("get_selected_machine");
         if (selected_machine.empty()) return nullptr;
 
         MachineObject* obj = get_user_machine(selected_machine);
@@ -579,6 +594,7 @@ namespace Slic3r
 
     void DeviceManager::add_user_subscribe()
     {
+    BS_TRACE_ENTER("add_user_subscribe");
         /* user machine */
         std::vector<std::string> dev_list;
         for (auto it = userMachineList.begin(); it != userMachineList.end(); it++)
@@ -589,8 +605,10 @@ namespace Slic3r
         m_agent->add_subscribe(dev_list);
     }
 
+
     void DeviceManager::del_user_subscribe()
     {
+    BS_TRACE_ENTER("del_user_subscribe");
         /* user machine */
         std::vector<std::string> dev_list;
         for (auto it = userMachineList.begin(); it != userMachineList.end(); it++)
@@ -603,6 +621,7 @@ namespace Slic3r
 
     void DeviceManager::subscribe_device_list(std::vector<std::string> dev_list)
     {
+    BS_TRACE_ENTER("subscribe_device_list");
         std::vector<std::string> unsub_list;
         subscribe_list_cache.clear();
         for (auto& it : subscribe_list_cache)
@@ -633,6 +652,7 @@ namespace Slic3r
 
     std::map<std::string, MachineObject*> DeviceManager::get_my_machine_list()
     {
+    BS_TRACE_ENTER("get_my_machine_list");
         std::map<std::string, MachineObject*> result;
 
         for (auto it = userMachineList.begin(); it != userMachineList.end(); it++)
@@ -659,6 +679,7 @@ namespace Slic3r
 
     std::map<std::string, MachineObject*> DeviceManager::get_my_cloud_machine_list()
     {
+    BS_TRACE_ENTER("get_my_cloud_machine_list");
         std::map<std::string, MachineObject*> result;
         for (auto it = userMachineList.begin(); it != userMachineList.end(); it++)
         {
@@ -669,6 +690,7 @@ namespace Slic3r
 
     std::string DeviceManager::get_first_online_user_machine() const
     {
+    BS_TRACE_ENTER("get_first_online_user_machine");
         for (auto it = userMachineList.begin(); it != userMachineList.end(); it++)
         {
             if (it->second && it->second->is_online())
@@ -681,6 +703,7 @@ namespace Slic3r
 
     void DeviceManager::modify_device_name(std::string dev_id, std::string dev_name)
     {
+    BS_TRACE_ENTER("modify_device_name");
         BOOST_LOG_TRIVIAL(trace) << "modify_device_name";
         if (m_agent)
         {
@@ -694,6 +717,7 @@ namespace Slic3r
 
     void DeviceManager::parse_user_print_info(std::string body)
     {
+    BS_TRACE_ENTER("parse_user_print_info");
         if (device_subseries.size() <= 0) {
             device_subseries = DevPrinterConfigUtil::get_all_subseries();
             if (device_subseries.size() <= 0) {
@@ -801,6 +825,7 @@ namespace Slic3r
 
     void DeviceManager::update_user_machine_list_info()
     {
+    BS_TRACE_ENTER("update_user_machine_list_info");
         if (!m_agent) return;
 
         BOOST_LOG_TRIVIAL(debug) << "update_user_machine_list_info";
@@ -816,6 +841,7 @@ namespace Slic3r
 
     void DeviceManager::record_user_last_machine(const std::string& dev_id)
     {
+    BS_TRACE_ENTER("record_user_last_machine");
         if (GUI::wxGetApp().app_config) {
             GUI::wxGetApp().app_config->set("user_last_selected_machine", dev_id);
         }
@@ -823,6 +849,7 @@ namespace Slic3r
 
     std::string DeviceManager::get_user_last_machine() const
     {
+    BS_TRACE_ENTER("get_user_last_machine");
         if (GUI::wxGetApp().app_config) {
             const auto& user_last_machine = GUI::wxGetApp().app_config->get("user_last_selected_machine");
             if (!user_last_machine.empty()) {
@@ -837,6 +864,7 @@ namespace Slic3r
 
     void DeviceManager::load_last_machine()
     {
+    BS_TRACE_ENTER("load_last_machine");
         if (userMachineList.empty()) return;
         else if (userMachineList.size() == 1) {
             this->set_selected_machine(userMachineList.begin()->second->get_dev_id());
@@ -852,6 +880,7 @@ namespace Slic3r
 
     void DeviceManager::OnMachineBindStateChanged(MachineObject* obj, const std::string& new_state)
     {
+    BS_TRACE_ENTER("OnMachineBindStateChanged");
         if (!obj) { return; }
         if (obj->get_dev_id() == selected_machine)
         {
@@ -861,6 +890,7 @@ namespace Slic3r
 
     void DeviceManager::OnSelectedMachineLost()
     {
+    BS_TRACE_ENTER("OnSelectedMachineLost");
         GUI::wxGetApp().sidebar().update_sync_status(nullptr);
         GUI::wxGetApp().sidebar().load_ams_list(nullptr);
     }
@@ -868,6 +898,7 @@ namespace Slic3r
     void DeviceManager::OnSelectedMachineChanged(const std::string& /*pre_dev_id*/,
                                                  const std::string& /*new_dev_id*/)
     {
+    BS_TRACE_ENTER("OnSelectedMachineChanged");
         if (MachineObject* obj_ = get_selected_machine()) {
             GUI::wxGetApp().sidebar().reset_fila_switch();
             GUI::wxGetApp().sidebar().update_sync_status(obj_);
@@ -886,6 +917,7 @@ namespace Slic3r
 
     void DeviceManager::reload_printer_settings()
     {
+    BS_TRACE_ENTER("reload_printer_settings");
         for (auto obj : this->userMachineList) { obj.second->reload_printer_settings(); };
     }
 

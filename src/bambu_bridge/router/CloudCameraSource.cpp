@@ -84,13 +84,23 @@ bool CloudCameraSource::open() {
     }
 
     if (!plugin || !plugin->agent_ready()) {
+        std::fprintf(stderr,
+            "[cloud-camera-source] open(dev=%s) failed: no plugin handle "
+            "(get_camera_url requires the proprietary bambu_networking plugin)\n",
+            m_cfg.dev_id.c_str());
         return false;
     }
     if (!source) {
+        std::fprintf(stderr,
+            "[cloud-camera-source] open(dev=%s) failed: no BambuSourceHandle\n",
+            m_cfg.dev_id.c_str());
         return false;
     }
     if (!source->library_ready()) source->init();
     if (!source->library_ready()) {
+        std::fprintf(stderr,
+            "[cloud-camera-source] open(dev=%s) failed: BambuSource not loaded\n",
+            m_cfg.dev_id.c_str());
         return false;
     }
 
@@ -101,12 +111,18 @@ bool CloudCameraSource::open() {
         // build_media_live_url helper — use it verbatim instead of
         // hitting the plugin's get_camera_url endpoint again.
         url = m_cfg.url_override;
+        std::fprintf(stderr,
+            "[cloud-camera-source] dev=%s using GUI-provided url_override\n",
+            m_cfg.dev_id.c_str());
     } else {
         const int timeout_ms = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 m_cfg.connect_timeout).count());
         rc = plugin->get_camera_url(m_cfg.dev_id, &url, timeout_ms);
         if (rc != 0 || url.empty()) {
+            std::fprintf(stderr,
+                "[cloud-camera-source] dev=%s get_camera_url rc=%d url='%s'\n",
+                m_cfg.dev_id.c_str(), rc, url.c_str());
             return false;
         }
     }
@@ -119,10 +135,16 @@ bool CloudCameraSource::open() {
     void* tunnel = nullptr;
     rc = source->bambu_create(&tunnel, url);
     if (rc != 0 || !tunnel) {
+        std::fprintf(stderr,
+            "[cloud-camera-source] dev=%s Bambu_Create rc=%d\n",
+            m_cfg.dev_id.c_str(), rc);
         return false;
     }
     rc = source->bambu_open(tunnel);
     if (rc != 0) {
+        std::fprintf(stderr,
+            "[cloud-camera-source] dev=%s Bambu_Open rc=%d\n",
+            m_cfg.dev_id.c_str(), rc);
         source->bambu_destroy(tunnel);
         return false;
     }
@@ -140,9 +162,17 @@ bool CloudCameraSource::open() {
             ++loops;
         } while (std::chrono::steady_clock::now() - start < timeout);
         if (loops > 0) {
+            std::fprintf(stderr,
+                "[cloud-camera-source] dev=%s StartStream settled after "
+                "%d retries (final rc=%d)\n",
+                m_cfg.dev_id.c_str(), loops, rc);
         }
     }
     if (rc != 0) {
+        std::fprintf(stderr,
+            "[cloud-camera-source] dev=%s Bambu_StartStream rc=%d (gave up "
+            "after retry loop)\n",
+            m_cfg.dev_id.c_str(), rc);
         source->bambu_close(tunnel);
         source->bambu_destroy(tunnel);
         return false;

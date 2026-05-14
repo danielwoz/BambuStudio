@@ -106,6 +106,8 @@ void log_ssl_err(const char* where) {
     unsigned long e = ERR_peek_last_error();
     char buf[256] = {0};
     if (e) ERR_error_string_n(e, buf, sizeof(buf));
+    std::fprintf(stderr, "[rtsp-server] ssl-err at %s: %s\n",
+                 where, buf[0] ? buf : "no-error");
     ERR_clear_error();
 }
 
@@ -697,6 +699,9 @@ void session_io_loop(RtspServer::Device* dev,
             auto frame = src->next_frame(33);
             if (frame) {
                 if (!stream_one_frame(*frame)) {
+                    std::fprintf(stderr,
+                        "[rtsp-server] session=%s stream write failed; "
+                        "closing\n", session_id.c_str());
                     return;
                 }
             }
@@ -819,6 +824,8 @@ void RtspServer::start() {
     for (auto& kv : m_devices) {
         try { start_device(*kv.second); }
         catch (const std::exception& ex) {
+            std::fprintf(stderr, "[rtsp-server] failed to start device %s: %s\n",
+                         kv.first.c_str(), ex.what());
         }
     }
 }

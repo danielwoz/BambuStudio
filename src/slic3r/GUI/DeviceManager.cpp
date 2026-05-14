@@ -1,4 +1,5 @@
 #include "libslic3r/libslic3r.h"
+#include "../Utils/BambuTrace.hpp"
 #include "DeviceManager.hpp"
 #include "libslic3r/Time.hpp"
 #include "libslic3r/Thread.hpp"
@@ -60,6 +61,7 @@
 #include "DeviceCore/DevMapping.h"
 #include "DeviceCore/DevManager.h"
 #include "DeviceCore/DevUtil.h"
+
 
 #define CALI_DEBUG
 #define MINUTE_30 1800000    //ms
@@ -377,6 +379,7 @@ NozzleVolumeType convert_to_nozzle_type(const std::string &str)
 
 wxString MachineObject::get_printer_type_display_str() const
 {
+    BS_TRACE_ENTER("get_printer_type_display_str");
     std::string display_name = DevPrinterConfigUtil::get_printer_display_name(printer_type);
     if (!display_name.empty())
         return display_name;
@@ -386,6 +389,7 @@ wxString MachineObject::get_printer_type_display_str() const
 
 std::string MachineObject::get_printer_thumbnail_img_str() const
 {
+    BS_TRACE_ENTER("get_printer_thumbnail_img_str");
     std::string img_str = DevPrinterConfigUtil::get_printer_thumbnail_img(printer_type);
     std::string img_url;
 
@@ -411,16 +415,19 @@ std::string MachineObject::get_printer_thumbnail_img_str() const
 
 std::string MachineObject::get_auto_pa_cali_thumbnail_img_str() const
 {
+    BS_TRACE_ENTER("get_auto_pa_cali_thumbnail_img_str");
     return DevPrinterConfigUtil::get_printer_auto_pa_cali_image(printer_type);
 }
 
 std::string MachineObject::get_ftp_folder()
 {
+    BS_TRACE_ENTER("get_ftp_folder");
     return DevPrinterConfigUtil::get_ftp_folder(printer_type);
 }
 
 bool MachineObject::HasRecentCloudMessage()
 {
+    BS_TRACE_ENTER("HasRecentCloudMessage");
     auto curr_time = std::chrono::system_clock::now();
     auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(curr_time - last_cloud_msg_time_);
     return diff.count() < 5000;
@@ -428,6 +435,7 @@ bool MachineObject::HasRecentCloudMessage()
 
 bool MachineObject::HasRecentLanMessage()
 {
+    BS_TRACE_ENTER("HasRecentLanMessage");
     auto curr_time = std::chrono::system_clock::now();
     auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(curr_time - last_lan_msg_time_);
     return diff.count() < 5000;
@@ -435,6 +443,7 @@ bool MachineObject::HasRecentLanMessage()
 
 std::string MachineObject::get_access_code() const
 {
+    BS_TRACE_ENTER("get_access_code");
     if (get_user_access_code().empty())
         return access_code;
     return get_user_access_code();
@@ -442,6 +451,7 @@ std::string MachineObject::get_access_code() const
 
 void MachineObject::set_access_code(std::string code, bool only_refresh)
 {
+    BS_TRACE_ENTER("set_access_code");
     this->access_code = code;
     if (only_refresh) {
         AppConfig* config = GUI::wxGetApp().app_config;
@@ -457,6 +467,7 @@ void MachineObject::set_access_code(std::string code, bool only_refresh)
 
 void MachineObject::erase_user_access_code()
 {
+    BS_TRACE_ENTER("erase_user_access_code");
     this->user_access_code = "";
     AppConfig* config = GUI::wxGetApp().app_config;
     if (config) {
@@ -467,6 +478,7 @@ void MachineObject::erase_user_access_code()
 
 void MachineObject::set_user_access_code(std::string code, bool only_refresh)
 {
+    BS_TRACE_ENTER("set_user_access_code");
     this->user_access_code = code;
     if (only_refresh && !code.empty()) {
         AppConfig* config = GUI::wxGetApp().app_config;
@@ -478,6 +490,7 @@ void MachineObject::set_user_access_code(std::string code, bool only_refresh)
 
 std::string MachineObject::get_user_access_code() const
 {
+    BS_TRACE_ENTER("get_user_access_code");
     AppConfig* config = GUI::wxGetApp().app_config;
     if (config) {
         return GUI::wxGetApp().app_config->get("user_access_code", get_dev_id());
@@ -487,6 +500,7 @@ std::string MachineObject::get_user_access_code() const
 
 void MachineObject::record_user_access_dev_ip()
 {
+    BS_TRACE_ENTER("record_user_access_dev_ip");
     if (!is_lan_mode_printer()) {
         assert(false);
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": should not record un-lan dev";
@@ -505,6 +519,7 @@ void MachineObject::record_user_access_dev_ip()
 
 void MachineObject::erase_user_access_dev_ip()
 {
+    BS_TRACE_ENTER("erase_user_access_dev_ip");
     if (GUI::wxGetApp().app_config) {
         GUI::wxGetApp().app_config->erase("user_access_dev_ip", get_dev_id());
     }
@@ -512,6 +527,7 @@ void MachineObject::erase_user_access_dev_ip()
 
 std::string MachineObject::get_show_printer_type() const
 {
+    BS_TRACE_ENTER("get_show_printer_type");
     std::string printer_type = this->printer_type;
     if (this->is_support_upgrade_kit && this->installed_upgrade_kit)
         printer_type = "C12";
@@ -519,6 +535,7 @@ std::string MachineObject::get_show_printer_type() const
 }
 PrinterSeries MachineObject::get_printer_series() const
 {
+    BS_TRACE_ENTER("get_printer_series");
     std::string series =  DevPrinterConfigUtil::get_printer_series_str(printer_type);
     if (series == "series_x1" || series == "series_o")
         return PrinterSeries::SERIES_X1;
@@ -530,11 +547,13 @@ PrinterSeries MachineObject::get_printer_series() const
 
 PrinterArch MachineObject::get_printer_arch() const
 {
+    BS_TRACE_ENTER("get_printer_arch");
     return DevPrinterConfigUtil::get_printer_arch(printer_type);
 }
 
 std::string MachineObject::get_printer_ams_type() const
 {
+    BS_TRACE_ENTER("get_printer_ams_type");
     return DevPrinterConfigUtil::get_printer_use_ams_type(printer_type);
 }
 
@@ -552,6 +571,7 @@ std::string MachineObject::get_printer_series_str() const{ return DevPrinterConf
 
 void MachineObject::reload_printer_settings()
 {
+    BS_TRACE_ENTER("reload_printer_settings");
     print_json.load_compatible_settings("", "");
     parse_json("cloud", "{}");
 }
@@ -601,6 +621,7 @@ MachineObject::MachineObject(DeviceManager* manager, NetworkAgent* agent, std::s
     m_print_error_img_id = "";
 
     has_ipcam = true; // default true
+
 
     auto vslot = DevAmsTray(std::to_string(VIRTUAL_TRAY_MAIN_ID));
     vt_slot.push_back(vslot);
@@ -693,6 +714,7 @@ MachineObject::~MachineObject()
 
 bool MachineObject::is_in_extrusion_cali()
 {
+    BS_TRACE_ENTER("is_in_extrusion_cali");
     auto curr_time = std::chrono::system_clock::now();
     auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(curr_time - last_extrusion_cali_start_time);
     if (diff.count() < EXTRUSION_OMIT_TIME) {
@@ -712,6 +734,7 @@ bool MachineObject::is_in_extrusion_cali()
 
 bool MachineObject::is_extrusion_cali_finished()
 {
+    BS_TRACE_ENTER("is_extrusion_cali_finished");
     auto curr_time = std::chrono::system_clock::now();
     auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(curr_time - last_extrusion_cali_start_time);
     if (diff.count() < EXTRUSION_OMIT_TIME) {
@@ -724,6 +747,7 @@ bool MachineObject::is_extrusion_cali_finished()
     else
         return false;
 }
+
 
 DevAmsTray *MachineObject::get_curr_tray()
 {
@@ -761,6 +785,7 @@ std::string MachineObject::get_filament_display_type(const std::string& ams_id, 
 
 void MachineObject::_parse_ams_status(int ams_status)
 {
+    BS_TRACE_ENTER("_parse_ams_status");
     ams_status_sub = ams_status & 0xFF;
     int ams_status_main_int = (ams_status & 0xFF00) >> 8;
     if (ams_status_main_int == (int)AmsStatusMain::AMS_STATUS_MAIN_IDLE) {
@@ -788,6 +813,7 @@ void MachineObject::_parse_ams_status(int ams_status)
 
 bool MachineObject::can_unload_filament()
 {
+    BS_TRACE_ENTER("can_unload_filament");
     bool result = false;
     if (!HasAms())
         return true;
@@ -813,6 +839,7 @@ void MachineObject::get_ams_colors(std::vector<wxColour> &ams_colors) {
 
 std::string MachineObject::get_firmware_type_str()
 {
+    BS_TRACE_ENTER("get_firmware_type_str");
     // return product by default;
     // always return product, printer do not push this field
     return "product";
@@ -820,6 +847,7 @@ std::string MachineObject::get_firmware_type_str()
 
 std::string MachineObject::get_lifecycle_type_str()
 {
+    BS_TRACE_ENTER("get_lifecycle_type_str");
     // return product by default;
     // always return product, printer do not push this field
     return "product";
@@ -827,11 +855,13 @@ std::string MachineObject::get_lifecycle_type_str()
 
 bool MachineObject::is_in_upgrading() const
 {
+    BS_TRACE_ENTER("is_in_upgrading");
     return m_upgrade->IsUpgrading();
 }
 
 std::string MachineObject::get_ota_version()
 {
+    BS_TRACE_ENTER("get_ota_version");
     auto it = module_vers.find("ota");
     if (it != module_vers.end()) {
         //double check name
@@ -844,6 +874,7 @@ std::string MachineObject::get_ota_version()
 
 bool MachineObject::check_version_valid()
 {
+    BS_TRACE_ENTER("check_version_valid");
     bool valid = true;
     for (auto module : module_vers) {
         if (module.second.sn.empty()
@@ -859,6 +890,7 @@ bool MachineObject::check_version_valid()
 
 std::map<int, DevFirmwareVersionInfo> MachineObject::get_ams_version()
 {
+    BS_TRACE_ENTER("get_ams_version");
     std::vector<std::string> multi_tray_ams_type = {"ams", "n3f"};
     std::map<int, DevFirmwareVersionInfo> result;
     for (int i = 0; i < 8; i++) {
@@ -888,6 +920,7 @@ std::map<int, DevFirmwareVersionInfo> MachineObject::get_ams_version()
 
 void MachineObject::clear_version_info()
 {
+    BS_TRACE_ENTER("clear_version_info");
     air_pump_version_info = DevFirmwareVersionInfo();
     laser_version_info = DevFirmwareVersionInfo();
     cutting_module_version_info = DevFirmwareVersionInfo();
@@ -902,6 +935,7 @@ void MachineObject::clear_version_info()
 
 void MachineObject::store_version_info(const DevFirmwareVersionInfo& info)
 {
+    BS_TRACE_ENTER("store_version_info");
     if (info.isAirPump()) {
         air_pump_version_info = info;
     } else if (info.isLaszer()) {
@@ -927,6 +961,7 @@ void MachineObject::store_version_info(const DevFirmwareVersionInfo& info)
 
 bool MachineObject::is_system_printing()
 {
+    BS_TRACE_ENTER("is_system_printing");
     if (is_in_calibration() && is_in_printing_status(print_status))
         return true;
     //FIXME
@@ -937,6 +972,7 @@ bool MachineObject::is_system_printing()
 
 bool MachineObject::is_filament_at_extruder()
 {
+    BS_TRACE_ENTER("is_filament_at_extruder");
     if (hw_switch_state == 1)
         return true;
     else if (hw_switch_state == 0)
@@ -949,6 +985,7 @@ bool MachineObject::is_filament_at_extruder()
 
 wxString MachineObject::get_curr_stage()
 {
+    BS_TRACE_ENTER("get_curr_stage");
     if (stage_curr < 0 || stage_list_info.empty()) {
         return "";
     }
@@ -957,6 +994,7 @@ wxString MachineObject::get_curr_stage()
 
 int MachineObject::get_curr_stage_idx()
 {
+    BS_TRACE_ENTER("get_curr_stage_idx");
     int result = -1;
     for (int i = 0; i < stage_list_info.size(); i++) {
         if (stage_list_info[i] == stage_curr) {
@@ -968,6 +1006,7 @@ int MachineObject::get_curr_stage_idx()
 
 bool MachineObject::is_in_calibration()
 {
+    BS_TRACE_ENTER("is_in_calibration");
     // gcode file: auto_cali_for_user.gcode or auto_cali_for_user_param
     if (boost::contains(m_gcode_file, "auto_cali_for_user")
         && stage_curr != 0) {
@@ -983,11 +1022,13 @@ bool MachineObject::is_in_calibration()
 
 bool MachineObject::is_calibration_done()
 {
+    BS_TRACE_ENTER("is_calibration_done");
     return calibration_done;
 }
 
 bool MachineObject::is_calibration_running()
 {
+    BS_TRACE_ENTER("is_calibration_running");
     if (is_in_calibration() && is_in_printing_status(print_status))
         return true;
     return false;
@@ -995,6 +1036,7 @@ bool MachineObject::is_calibration_running()
 
 void MachineObject::parse_state_changed_event()
 {
+    BS_TRACE_ENTER("parse_state_changed_event");
     // parse calibration done
     if (last_mc_print_stage != mc_print_stage) {
         if (mc_print_stage == 1 && boost::contains(m_gcode_file, "auto_cali_for_user")) {
@@ -1008,9 +1050,11 @@ void MachineObject::parse_state_changed_event()
 
 void MachineObject::parse_home_flag(int flag)
 {
+    BS_TRACE_ENTER("parse_home_flag");
     m_home_flag = flag;
 
     is_220V_voltage = ((flag >> 3) & 0x1) != 0;
+
 
     camera_recording            = ((flag >> 5) & 0x1) != 0;
 
@@ -1022,6 +1066,7 @@ void MachineObject::parse_home_flag(int flag)
    // sdcard_state = MachineObject::SdcardState(get_flag_bits(flag, 8, 2));
    m_storage->set_sdcard_state(get_flag_bits(flag, 8, 2));
 
+
     if (time(nullptr) - ams_switch_filament_start > HOLD_TIME_3SEC)
     {
         m_fila_system->GetAmsSystemSetting().SetAutoRefillEnabled(((flag >> 10) & 0x1) != 0);
@@ -1032,6 +1077,9 @@ void MachineObject::parse_home_flag(int flag)
 
     is_support_pa_calibration = ((flag >> 16) & 0x1) != 0;
     if (this->is_series_p()) { is_support_pa_calibration = false; } // todo: Temp modification due to incorrect machine push message for P
+
+
+
 
     /*if(!is_support_motor_noise_cali){
         is_support_motor_noise_cali = ((flag >> 21) & 0x1) != 0;
@@ -1069,6 +1117,7 @@ void MachineObject::parse_home_flag(int flag)
 
 int MachineObject::get_bed_temperature_limit()
 {
+    BS_TRACE_ENTER("get_bed_temperature_limit");
     if (get_printer_series() == PrinterSeries::SERIES_X1) {
         if (is_220V_voltage)
             return 110;
@@ -1084,6 +1133,7 @@ int MachineObject::get_bed_temperature_limit()
 
 bool MachineObject::is_filament_installed()
 {
+    BS_TRACE_ENTER("is_filament_installed");
     if (m_extder_system->GetTotalExtderCount() > 0) {
         // right//or single
         auto ext = m_extder_system->m_extders[MAIN_EXTRUDER_ID];
@@ -1103,6 +1153,7 @@ bool MachineObject::is_filament_installed()
 
 bool MachineObject::is_makeworld_subtask()
 {
+    BS_TRACE_ENTER("is_makeworld_subtask");
     if (model_task && model_task->design_id > 0) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " model task id: " << model_task->task_id << " is makeworld model";
         return true;
@@ -1112,6 +1163,7 @@ bool MachineObject::is_makeworld_subtask()
 
 bool MachineObject::is_sdcard_printing()
 {
+    BS_TRACE_ENTER("is_sdcard_printing");
     if (can_abort()
         && (obj_subtask_id.compare("0") == 0 || obj_subtask_id.empty())
         && (profile_id_ == "0" || profile_id_.empty())
@@ -1121,23 +1173,29 @@ bool MachineObject::is_sdcard_printing()
         return false;
 }
 
+
+
 bool MachineObject::is_timelapse()
 {
+    BS_TRACE_ENTER("is_timelapse");
     return camera_timelapse;
 }
 
 bool MachineObject::is_recording_enable()
 {
+    BS_TRACE_ENTER("is_recording_enable");
     return camera_recording_when_printing;
 }
 
 bool MachineObject::is_recording()
 {
+    BS_TRACE_ENTER("is_recording");
     return camera_recording;
 }
 
 int MachineObject::get_liveview_remote()
 {
+    BS_TRACE_ENTER("get_liveview_remote");
     if (is_support_agora) {
         return liveview_remote == LVR_None ? LVR_Agora : liveview_remote == LVR_Tutk ? LVR_TutkAgora : liveview_remote;
     }
@@ -1146,6 +1204,7 @@ int MachineObject::get_liveview_remote()
 
 int MachineObject::get_file_remote()
 {
+    BS_TRACE_ENTER("get_file_remote");
     if (is_support_agora)
         file_remote = file_remote == FR_None ? FR_Agora : file_remote == FR_Tutk ? FR_TutkAgora : file_remote;
     return file_remote;
@@ -1153,6 +1212,7 @@ int MachineObject::get_file_remote()
 
 std::string MachineObject::parse_version()
 {
+    BS_TRACE_ENTER("parse_version");
     auto ota_version = module_vers.find("ota");
     if (ota_version != module_vers.end()) return ota_version->second.sw_ver;
     auto series = get_printer_series();
@@ -1168,10 +1228,12 @@ std::string MachineObject::parse_version()
 
 void MachineObject::parse_version_func()
 {
+    BS_TRACE_ENTER("parse_version_func");
 }
 
 bool MachineObject::canEnableTimelapse(wxString &error_message) const
 {
+    BS_TRACE_ENTER("canEnableTimelapse");
     if (!is_support_timelapse) {
         error_message = _L("Timelapse is not supported on this printer.");
         return false;
@@ -1198,6 +1260,7 @@ bool MachineObject::canEnableTimelapse(wxString &error_message) const
 
 int MachineObject::command_get_version(bool with_retry)
 {
+    BS_TRACE_ENTER("command_get_version");
     json j;
     j["info"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
     j["info"]["command"] = "get_version";
@@ -1214,8 +1277,10 @@ int MachineObject::command_get_access_code() {
     return this->publish_json(j);
 }
 
+
 int MachineObject::command_request_push_all(bool request_now)
 {
+    BS_TRACE_ENTER("command_request_push_all");
     auto curr_time = std::chrono::system_clock::now();
     auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(curr_time - last_request_push);
 
@@ -1243,6 +1308,7 @@ int MachineObject::command_request_push_all(bool request_now)
 
 int MachineObject::command_pushing(std::string cmd)
 {
+    BS_TRACE_ENTER("command_pushing");
     auto curr_time = std::chrono::system_clock::now();
     auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(curr_time - last_request_start);
     if (diff.count() < REQUEST_START_MIN_TIME) {
@@ -1265,6 +1331,7 @@ int MachineObject::command_pushing(std::string cmd)
 
 int MachineObject::command_clean_print_error(std::string subtask_id, int print_error)
 {
+    BS_TRACE_ENTER("command_clean_print_error");
     json j;
     j["print"]["command"] = "clean_print_error";
     j["print"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -1276,6 +1343,7 @@ int MachineObject::command_clean_print_error(std::string subtask_id, int print_e
 
 int MachineObject::command_clean_print_error_uiop(int print_error)
 {
+    BS_TRACE_ENTER("command_clean_print_error_uiop");
     json j;
     j["system"]["command"] = "uiop";
     j["system"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -1294,6 +1362,7 @@ int MachineObject::command_clean_print_error_uiop(int print_error)
 
 int MachineObject::command_task_partskip(std::vector<int> part_ids)
 {
+    BS_TRACE_ENTER("command_task_partskip");
     json j;
     j["print"]["command"] = "skip_objects";
     j["print"]["obj_list"] = part_ids;
@@ -1304,6 +1373,7 @@ int MachineObject::command_task_partskip(std::vector<int> part_ids)
 
 int MachineObject::command_task_abort()
 {
+    BS_TRACE_ENTER("command_task_abort");
     json j;
     j["print"]["command"] = "stop";
     j["print"]["param"] = "";
@@ -1314,6 +1384,7 @@ int MachineObject::command_task_abort()
 
 int MachineObject::command_task_cancel(std::string job_id)
 {
+    BS_TRACE_ENTER("command_task_cancel");
     json j;
     j["print"]["command"] = "stop";
     j["print"]["param"] = "";
@@ -1325,6 +1396,7 @@ int MachineObject::command_task_cancel(std::string job_id)
 
 int MachineObject::command_task_pause()
 {
+    BS_TRACE_ENTER("command_task_pause");
     json j;
     j["print"]["command"] = "pause";
     j["print"]["param"] = "";
@@ -1335,6 +1407,7 @@ int MachineObject::command_task_pause()
 
 int MachineObject::command_task_resume()
 {
+    BS_TRACE_ENTER("command_task_resume");
     if(check_resume_condition()) return 0;
 
     json j;
@@ -1347,6 +1420,7 @@ int MachineObject::command_task_resume()
 
 int MachineObject::command_hms_idle_ignore(const std::string &error_str, int type)
 {
+    BS_TRACE_ENTER("command_hms_idle_ignore");
     if(check_resume_condition()) return 0;
 
     json j;
@@ -1359,6 +1433,7 @@ int MachineObject::command_hms_idle_ignore(const std::string &error_str, int typ
 
 int MachineObject::command_hms_resume(const std::string& error_str, const std::string& job_id)
 {
+    BS_TRACE_ENTER("command_hms_resume");
     if(check_resume_condition()) return 0;
 
     json j;
@@ -1373,6 +1448,7 @@ int MachineObject::command_hms_resume(const std::string& error_str, const std::s
 
 int MachineObject::command_hms_ignore(const std::string& error_str, const std::string& job_id)
 {
+    BS_TRACE_ENTER("command_hms_ignore");
     if(check_resume_condition()) return 0;
 
     json j;
@@ -1398,6 +1474,7 @@ int MachineObject::command_hms_stop(const std::string &error_str, const std::str
 
 int MachineObject::command_purification_disable()
 {
+    BS_TRACE_ENTER("command_purification_disable");
     json j;
     j["print"]["command"] = "close_air_filt";
     j["print"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -1407,6 +1484,7 @@ int MachineObject::command_purification_disable()
 
 int MachineObject::command_dont_remind_next_time(json& mqtt_guard_json)
 {
+    BS_TRACE_ENTER("command_dont_remind_next_time");
     if (!mqtt_guard_json.contains("command") ||
         !mqtt_guard_json.contains("err_index") ||
         mqtt_guard_json["err_index"].empty()) return -1;
@@ -1447,6 +1525,7 @@ int MachineObject::command_dont_remind_next_time(json& mqtt_guard_json)
 
 int MachineObject::command_stop_buzzer()
 {
+    BS_TRACE_ENTER("command_stop_buzzer");
     json j;
     j["print"]["command"] = "buzzer_ctrl";
     j["print"]["mode"] = 0;
@@ -1457,6 +1536,7 @@ int MachineObject::command_stop_buzzer()
 
 int MachineObject::command_set_bed(int temp)
 {
+    BS_TRACE_ENTER("command_set_bed");
     if (m_support_mqtt_bet_ctrl)
     {
         json j;
@@ -1482,6 +1562,7 @@ int MachineObject::command_set_bed(int temp)
 
 int MachineObject::command_set_nozzle(int temp)
 {
+    BS_TRACE_ENTER("command_set_nozzle");
     std::string gcode_str = (boost::format("M104 S%1%\n") % temp).str();
     try {
         json j;
@@ -1497,6 +1578,7 @@ int MachineObject::command_set_nozzle(int temp)
 
 int MachineObject::command_set_nozzle_new(int nozzle_id, int temp)
 {
+    BS_TRACE_ENTER("command_set_nozzle_new");
     json j;
     j["print"]["sequence_id"]    = std::to_string(MachineObject::m_sequence_id++);
     j["print"]["command"]        = "set_nozzle_temp";
@@ -1516,6 +1598,7 @@ int MachineObject::command_refresh_nozzle(){
 
 int MachineObject::check_resume_condition()
 {
+    BS_TRACE_ENTER("check_resume_condition");
     if (jobState_ > 1) {
         GUI::wxGetApp().show_dialog(_L("To ensure your safety, certain processing tasks (such as laser) can only be resumed on printer."));
         return 1;
@@ -1525,6 +1608,7 @@ int MachineObject::check_resume_condition()
 
 int MachineObject::command_ams_change_filament(bool load, std::string ams_id, std::string slot_id, int old_temp, int new_temp, std::optional<int> extruder_id)
 {
+    BS_TRACE_ENTER("command_ams_change_filament");
     json j;
     try {
         auto tray_id = 0;
@@ -1563,6 +1647,7 @@ int MachineObject::command_ams_change_filament(bool load, std::string ams_id, st
 
 int MachineObject::command_ams_user_settings(bool start_read_opt, bool tray_read_opt, bool remain_flag)
 {
+    BS_TRACE_ENTER("command_ams_user_settings");
     json j;
     j["print"]["command"] = "ams_user_setting";
     j["print"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -1583,6 +1668,7 @@ int MachineObject::command_ams_user_settings(bool start_read_opt, bool tray_read
 
 int MachineObject::command_ams_calibrate(int ams_id)
 {
+    BS_TRACE_ENTER("command_ams_calibrate");
     std::string gcode_cmd = (boost::format("M620 C%1% \n") % ams_id).str();
     BOOST_LOG_TRIVIAL(trace) << "ams_debug: gcode_cmd" << gcode_cmd;
     return this->publish_gcode(gcode_cmd);
@@ -1590,6 +1676,7 @@ int MachineObject::command_ams_calibrate(int ams_id)
 
 int MachineObject::command_ams_filament_settings(int ams_id, int slot_id, std::string filament_id, std::string setting_id, std::string tray_color, std::string tray_type, int nozzle_temp_min, int nozzle_temp_max)
 {
+    BS_TRACE_ENTER("command_ams_filament_settings");
     int tag_tray_id = 0;
     int tag_ams_id  = ams_id;
     int tag_slot_id = slot_id;
@@ -1619,6 +1706,7 @@ int MachineObject::command_ams_filament_settings(int ams_id, int slot_id, std::s
 
 int MachineObject::command_ams_refresh_rfid(std::string tray_id)
 {
+    BS_TRACE_ENTER("command_ams_refresh_rfid");
     std::string gcode_cmd = (boost::format("M620 R%1% \n") % tray_id).str();
     BOOST_LOG_TRIVIAL(trace) << "ams_debug: gcode_cmd" << gcode_cmd;
     return this->publish_gcode(gcode_cmd);
@@ -1626,6 +1714,7 @@ int MachineObject::command_ams_refresh_rfid(std::string tray_id)
 
 int MachineObject::command_ams_refresh_rfid2(int ams_id,  int slot_id)
 {
+    BS_TRACE_ENTER("command_ams_refresh_rfid2");
     json j;
     j["print"]["command"]       = "ams_get_rfid";
     j["print"]["sequence_id"]   = std::to_string(MachineObject::m_sequence_id++);
@@ -1634,8 +1723,10 @@ int MachineObject::command_ams_refresh_rfid2(int ams_id,  int slot_id)
     return this->publish_json(j);
 }
 
+
 int MachineObject::command_ams_select_tray(std::string tray_id)
 {
+    BS_TRACE_ENTER("command_ams_select_tray");
     std::string gcode_cmd = (boost::format("M620 P%1% \n") % tray_id).str();
     BOOST_LOG_TRIVIAL(trace) << "ams_debug: gcode_cmd" << gcode_cmd;
     return this->publish_gcode(gcode_cmd);
@@ -1643,6 +1734,7 @@ int MachineObject::command_ams_select_tray(std::string tray_id)
 
 int MachineObject::command_ams_control(std::string action)
 {
+    BS_TRACE_ENTER("command_ams_control");
     if (action == "resume" && check_resume_condition()) return 0;
 
     //valid actions
@@ -1658,6 +1750,7 @@ int MachineObject::command_ams_control(std::string action)
 
 int MachineObject::command_ams_drying_stop()
 {
+    BS_TRACE_ENTER("command_ams_drying_stop");
     json j;
     j["print"]["command"] = "auto_stop_ams_dry";
     j["print"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -1666,6 +1759,7 @@ int MachineObject::command_ams_drying_stop()
 
 int MachineObject::command_start_extrusion_cali(int tray_index, int nozzle_temp, int bed_temp, float max_volumetric_speed, std::string setting_id)
 {
+    BS_TRACE_ENTER("command_start_extrusion_cali");
     BOOST_LOG_TRIVIAL(trace) << "extrusion_cali: tray_id = " << tray_index << ", nozzle_temp = " << nozzle_temp << ", bed_temp = " << bed_temp
                             << ", max_volumetric_speed = " << max_volumetric_speed;
 
@@ -1686,6 +1780,7 @@ int MachineObject::command_start_extrusion_cali(int tray_index, int nozzle_temp,
 
 int MachineObject::command_stop_extrusion_cali()
 {
+    BS_TRACE_ENTER("command_stop_extrusion_cali");
     BOOST_LOG_TRIVIAL(trace) << "extrusion_cali: stop";
     if (is_in_extrusion_cali()) {
         return command_task_abort();
@@ -1695,6 +1790,7 @@ int MachineObject::command_stop_extrusion_cali()
 
 int MachineObject::command_extrusion_cali_set(int tray_index, std::string setting_id, std::string name, float k, float n, int bed_temp, int nozzle_temp, float max_volumetric_speed)
 {
+    BS_TRACE_ENTER("command_extrusion_cali_set");
     json j;
     j["print"]["command"] = "extrusion_cali_set";
     j["print"]["sequence_id"]   = std::to_string(MachineObject::m_sequence_id++);
@@ -1712,8 +1808,10 @@ int MachineObject::command_extrusion_cali_set(int tray_index, std::string settin
     return this->publish_json(j);
 }
 
+
 int MachineObject::command_set_printing_speed(DevPrintingSpeedLevel lvl)
 {
+    BS_TRACE_ENTER("command_set_printing_speed");
     json j;
     j["print"]["command"] = "print_speed";
     j["print"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -1724,6 +1822,7 @@ int MachineObject::command_set_printing_speed(DevPrintingSpeedLevel lvl)
 
 int MachineObject::command_set_printing_option(bool auto_recovery)
 {
+    BS_TRACE_ENTER("command_set_printing_option");
     int print_option = (int)auto_recovery << (int)PRINT_OP_AUTO_RECOVERY;
     json j;
     j["print"]["command"]       = "print_option";
@@ -1734,8 +1833,10 @@ int MachineObject::command_set_printing_option(bool auto_recovery)
     return this->publish_json(j);
 }
 
+
 int MachineObject::command_ams_switch_filament(bool switch_filament)
 {
+    BS_TRACE_ENTER("command_ams_switch_filament");
     json j;
     j["print"]["command"] = "print_option";
     j["print"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -1750,6 +1851,7 @@ int MachineObject::command_ams_switch_filament(bool switch_filament)
 
 int MachineObject::command_ams_air_print_detect(bool air_print_detect)
 {
+    BS_TRACE_ENTER("command_ams_air_print_detect");
     json j;
     j["print"]["command"] = "print_option";
     j["print"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -1762,6 +1864,7 @@ int MachineObject::command_ams_air_print_detect(bool air_print_detect)
 
 int MachineObject::command_extruder_control(int nozzle_id, double val)
 {
+    BS_TRACE_ENTER("command_extruder_control");
     json j;
     j["print"]["command"]     = "set_extrusion_length";
     j["print"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -1772,6 +1875,7 @@ int MachineObject::command_extruder_control(int nozzle_id, double val)
 
 bool MachineObject::is_support_command_calibration()
 {
+    BS_TRACE_ENTER("is_support_command_calibration");
     if (get_printer_series() == PrinterSeries::SERIES_X1) {
         auto ap_ver_it = module_vers.find("rv1126");
         if (ap_ver_it != module_vers.end()) {
@@ -1784,6 +1888,7 @@ bool MachineObject::is_support_command_calibration()
 
 int MachineObject::command_start_calibration(bool vibration, bool bed_leveling, bool xcam_cali, bool motor_noise, bool nozzle_cali, bool bed_cali, bool clumppos_cali)
 {
+    BS_TRACE_ENTER("command_start_calibration");
     if (!is_support_command_calibration()) {
         // fixed gcode file
         json j;
@@ -1808,6 +1913,7 @@ int MachineObject::command_start_calibration(bool vibration, bool bed_leveling, 
 
 int MachineObject::command_start_pa_calibration(const X1CCalibInfos &pa_data, int mode)
 {
+    BS_TRACE_ENTER("command_start_pa_calibration");
     CNumericLocalesSetter locales_setter;
 
     json j;
@@ -1849,6 +1955,7 @@ int MachineObject::command_start_pa_calibration(const X1CCalibInfos &pa_data, in
 
 int MachineObject::command_set_pa_calibration(const std::vector<PACalibResult> &pa_calib_values, bool is_auto_cali)
 {
+    BS_TRACE_ENTER("command_set_pa_calibration");
     CNumericLocalesSetter locales_setter;
 
     if (pa_calib_values.size() > 0) {
@@ -1890,6 +1997,7 @@ int MachineObject::command_set_pa_calibration(const std::vector<PACalibResult> &
 
 int MachineObject::command_delete_pa_calibration(const PACalibIndexInfo& pa_calib)
 {
+    BS_TRACE_ENTER("command_delete_pa_calibration");
     json j;
     j["print"]["command"]         = "extrusion_cali_del";
     j["print"]["sequence_id"]     = std::to_string(MachineObject::m_sequence_id++);
@@ -1908,6 +2016,8 @@ int MachineObject::command_delete_pa_calibration(const PACalibIndexInfo& pa_cali
 
 int MachineObject::command_get_pa_calibration_tab(const PACalibExtruderInfo &calib_info)
 {
+    BS_TRACE_ENTER("command_get_pa_calibration_tab");
+
     json j;
     j["print"]["command"]         = "extrusion_cali_get";
     j["print"]["sequence_id"]     = std::to_string(MachineObject::m_sequence_id++);
@@ -1928,6 +2038,7 @@ int MachineObject::command_get_pa_calibration_tab(const PACalibExtruderInfo &cal
 
 int MachineObject::command_get_pa_calibration_result(float nozzle_diameter)
 {
+    BS_TRACE_ENTER("command_get_pa_calibration_result");
     json j;
     j["print"]["command"]         = "extrusion_cali_get_result";
     j["print"]["sequence_id"]     = std::to_string(MachineObject::m_sequence_id++);
@@ -1938,6 +2049,7 @@ int MachineObject::command_get_pa_calibration_result(float nozzle_diameter)
 
 int MachineObject::commnad_select_pa_calibration(const PACalibIndexInfo& pa_calib_info)
 {
+    BS_TRACE_ENTER("commnad_select_pa_calibration");
     json j;
     j["print"]["command"]         = "extrusion_cali_sel";
     j["print"]["sequence_id"]     = std::to_string(MachineObject::m_sequence_id++);
@@ -1957,6 +2069,7 @@ int MachineObject::commnad_select_pa_calibration(const PACalibIndexInfo& pa_cali
 
 int MachineObject::command_start_flow_ratio_calibration(const X1CCalibInfos& calib_data)
 {
+    BS_TRACE_ENTER("command_start_flow_ratio_calibration");
     CNumericLocalesSetter locales_setter;
 
     if (calib_data.calib_datas.size() > 0) {
@@ -2001,6 +2114,7 @@ int MachineObject::command_start_flow_ratio_calibration(const X1CCalibInfos& cal
 
 int MachineObject::command_get_flow_ratio_calibration_result(float nozzle_diameter)
 {
+    BS_TRACE_ENTER("command_get_flow_ratio_calibration_result");
     json j;
     j["print"]["command"]         = "flowrate_get_result";
     j["print"]["sequence_id"]     = std::to_string(MachineObject::m_sequence_id++);
@@ -2011,6 +2125,7 @@ int MachineObject::command_get_flow_ratio_calibration_result(float nozzle_diamet
 
 int MachineObject::command_ipcam_record(bool on_off)
 {
+    BS_TRACE_ENTER("command_ipcam_record");
     json j;
     j["camera"]["command"] = "ipcam_record_set";
     j["camera"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -2022,6 +2137,7 @@ int MachineObject::command_ipcam_record(bool on_off)
 
 int MachineObject::command_ipcam_timelapse(bool on_off)
 {
+    BS_TRACE_ENTER("command_ipcam_timelapse");
     json j;
     j["camera"]["command"] = "ipcam_timelapse";
     j["camera"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -2033,6 +2149,7 @@ int MachineObject::command_ipcam_timelapse(bool on_off)
 
 int MachineObject::command_ipcam_resolution_set(std::string resolution)
 {
+    BS_TRACE_ENTER("command_ipcam_resolution_set");
     json j;
     j["camera"]["command"] = "ipcam_resolution_set";
     j["camera"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
@@ -2043,13 +2160,16 @@ int MachineObject::command_ipcam_resolution_set(std::string resolution)
     return this->publish_json(j);
 }
 
+
 bool MachineObject::is_timelapse_storage_low(const std::string& storage) const
 {
+    BS_TRACE_ENTER("is_timelapse_storage_low");
     return m_storage && m_storage->is_timelapse_storage_low(storage);
 }
 
 int MachineObject::command_ipcam_check_timelapse_storage(const std::string& storage, int total_layer)
 {
+    BS_TRACE_ENTER("command_ipcam_check_timelapse_storage");
     json j;
     j["camera"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
     j["camera"]["command"] = "ipcam_get_media_info";
@@ -2061,6 +2181,7 @@ int MachineObject::command_ipcam_check_timelapse_storage(const std::string& stor
 
 int MachineObject::command_ipcam_delete_oldest_timelapse(const std::string& storage, int total_layer)
 {
+    BS_TRACE_ENTER("command_ipcam_delete_oldest_timelapse");
     json j;
     j["camera"]["sequence_id"] = std::to_string(MachineObject::m_sequence_id++);
     j["camera"]["command"] = "ipcam_delete_oldest_timelapse";
@@ -2093,13 +2214,16 @@ int MachineObject::command_ack_proceed(json& proceed) {
     return this->publish_json(j);
 }
 
+
 void MachineObject::set_bind_status(std::string status)
 {
+    BS_TRACE_ENTER("set_bind_status");
     bind_user_name = status;
 }
 
 std::string MachineObject::get_bind_str()
 {
+    BS_TRACE_ENTER("get_bind_str");
     std::string default_result = "N/A";
     if (bind_user_name.compare("null") == 0) {
         return "Free";
@@ -2112,6 +2236,7 @@ std::string MachineObject::get_bind_str()
 
 bool MachineObject::can_print()
 {
+    BS_TRACE_ENTER("can_print");
     if (print_status.compare("RUNNING") == 0) {
         return false;
     }
@@ -2123,6 +2248,7 @@ bool MachineObject::can_print()
 
 bool MachineObject::can_resume()
 {
+    BS_TRACE_ENTER("can_resume");
     if (print_status.compare("PAUSE") == 0)
         return true;
     return false;
@@ -2130,6 +2256,7 @@ bool MachineObject::can_resume()
 
 bool MachineObject::can_pause()
 {
+    BS_TRACE_ENTER("can_pause");
     if (print_status.compare("RUNNING") == 0)
         return true;
     return false;
@@ -2137,11 +2264,13 @@ bool MachineObject::can_pause()
 
 bool MachineObject::can_abort()
 {
+    BS_TRACE_ENTER("can_abort");
     return MachineObject::is_in_printing_status(print_status);
 }
 
 bool MachineObject::is_in_printing_status(std::string status)
 {
+    BS_TRACE_ENTER("is_in_printing_status");
     if (status.compare("PAUSE") == 0
         || status.compare("RUNNING") == 0
         || status.compare("SLICING") == 0
@@ -2151,8 +2280,10 @@ bool MachineObject::is_in_printing_status(std::string status)
     return false;
 }
 
+
 bool MachineObject::is_in_printing()
 {
+    BS_TRACE_ENTER("is_in_printing");
     /* use print_status if print_status is valid */
     if (!print_status.empty())
         return MachineObject::is_in_printing_status(print_status);
@@ -2164,16 +2295,19 @@ bool MachineObject::is_in_printing()
 
 bool MachineObject::is_in_prepare()
 {
+    BS_TRACE_ENTER("is_in_prepare");
     return print_status == "PREPARE";
 }
 
 bool MachineObject::is_in_printing_pause() const
 {
+    BS_TRACE_ENTER("is_in_printing_pause");
     return print_status == "PAUSE";
 }
 
 bool MachineObject::is_printing_finished()
 {
+    BS_TRACE_ENTER("is_printing_finished");
     if (print_status.compare("FINISH") == 0
         || print_status.compare("FAILED") == 0) {
         return true;
@@ -2183,6 +2317,7 @@ bool MachineObject::is_printing_finished()
 
 void MachineObject::reset_update_time()
 {
+    BS_TRACE_ENTER("reset_update_time");
     BOOST_LOG_TRIVIAL(trace) << "reset reset_update_time, dev_id =" << BBLCrossTalk::Crosstalk_DevId(get_dev_id());
     last_update_time = std::chrono::system_clock::now();
     subscribe_counter = SUBSCRIBE_RETRY_COUNT;
@@ -2190,6 +2325,7 @@ void MachineObject::reset_update_time()
 
 void MachineObject::reset()
 {
+    BS_TRACE_ENTER("reset");
     BOOST_LOG_TRIVIAL(trace) << "reset dev_id=" << BBLCrossTalk::Crosstalk_DevId(get_dev_id());
     last_update_time = std::chrono::system_clock::now();
     subscribe_counter = SUBSCRIBE_RETRY_COUNT;
@@ -2232,11 +2368,13 @@ void MachineObject::reset()
 
 void MachineObject::set_print_state(std::string status)
 {
+    BS_TRACE_ENTER("set_print_state");
     print_status = status;
 }
 
 int MachineObject::connect(bool use_openssl)
 {
+    BS_TRACE_ENTER("connect");
     if (get_dev_ip().empty()) return -1;
     std::string username = "bblp";
     std::string password = get_access_code();
@@ -2253,6 +2391,7 @@ int MachineObject::connect(bool use_openssl)
 
 int MachineObject::disconnect()
 {
+    BS_TRACE_ENTER("disconnect");
     if (m_agent) {
         return m_agent->disconnect_printer();
     }
@@ -2261,6 +2400,7 @@ int MachineObject::disconnect()
 
 bool MachineObject::is_connected()
 {
+    BS_TRACE_ENTER("is_connected");
     std::chrono::system_clock::time_point curr_time = std::chrono::system_clock::now();
     auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(curr_time - last_update_time);
     if (diff.count() > DISCONNECT_TIMEOUT) {
@@ -2279,17 +2419,20 @@ bool MachineObject::is_connected()
 
 bool MachineObject::is_connecting()
 {
+    BS_TRACE_ENTER("is_connecting");
     return is_connected() && m_push_count == 0;
 }
 
 void MachineObject::set_online_state(bool on_off)
 {
+    BS_TRACE_ENTER("set_online_state");
     m_is_online = on_off;
     if (!on_off) m_active_state = NotActive;
 }
 
 bool MachineObject::is_info_ready(bool check_version) const
 {
+    BS_TRACE_ENTER("is_info_ready");
     if (check_version && module_vers.empty())
     {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": not ready, failed to check version";
@@ -2310,23 +2453,28 @@ bool MachineObject::is_info_ready(bool check_version) const
     return false;
 }
 
+
 bool MachineObject::is_security_control_ready() const
 {
+    BS_TRACE_ENTER("is_security_control_ready");
     return device_cert_installed;
 }
 
 std::vector<std::string> MachineObject::get_resolution_supported()
 {
+    BS_TRACE_ENTER("get_resolution_supported");
     return camera_resolution_supported;
 }
 
 std::vector<std::string> MachineObject::get_compatible_machine()
 {
+    BS_TRACE_ENTER("get_compatible_machine");
     return DevPrinterConfigUtil::get_compatible_machine(printer_type);
 }
 
 bool MachineObject::is_camera_busy_off()
 {
+    BS_TRACE_ENTER("is_camera_busy_off");
     if (get_printer_series() == PrinterSeries::SERIES_P1P)
         return is_in_prepare() || is_in_upgrading();
     return false;
@@ -2334,6 +2482,7 @@ bool MachineObject::is_camera_busy_off()
 
 int MachineObject::publish_json(const json& json_item, int qos, int flag)
 {
+    BS_TRACE_ENTER("publish_json");
     int rtn = 0;
     if (is_lan_mode_printer()) {
         rtn = local_publish_json(json_item.dump(), qos, flag);
@@ -2352,6 +2501,7 @@ int MachineObject::publish_json(const json& json_item, int qos, int flag)
 
 int MachineObject::cloud_publish_json(std::string json_str, int qos, int flag)
 {
+    BS_TRACE_ENTER("cloud_publish_json");
     int result = -1;
     if (m_agent)
         result = m_agent->send_message(get_dev_id(), json_str, qos, flag);
@@ -2361,6 +2511,7 @@ int MachineObject::cloud_publish_json(std::string json_str, int qos, int flag)
 
 int MachineObject::local_publish_json(std::string json_str, int qos, int flag)
 {
+    BS_TRACE_ENTER("local_publish_json");
     int result = -1;
     if (m_agent) {
         result = m_agent->send_message_to_printer(get_dev_id(), json_str, qos, flag);
@@ -2370,6 +2521,7 @@ int MachineObject::local_publish_json(std::string json_str, int qos, int flag)
 
 std::string MachineObject::setting_id_to_type(std::string setting_id, std::string tray_type)
 {
+    BS_TRACE_ENTER("setting_id_to_type");
     std::string type;
     PresetBundle* preset_bundle = GUI::wxGetApp().preset_bundle;
     if (preset_bundle) {
@@ -2401,6 +2553,7 @@ static ENUM enum_index_of(char const *key, char const **enum_names, int enum_cou
 
 int MachineObject::parse_json(std::string tunnel, std::string payload, bool key_field_only)
 {
+    BS_TRACE_ENTER("parse_json");
     if (tunnel == "lan") last_lan_msg_time_ = std::chrono::system_clock::now();
     if (tunnel == "cloud") last_cloud_msg_time_ = std::chrono::system_clock::now();
 
@@ -3337,6 +3490,7 @@ int MachineObject::parse_json(std::string tunnel, std::string payload, bool key_
                     }
 #pragma endregion
 
+
 #pragma region push_ams
                     /* ams status */
                     try {
@@ -3387,6 +3541,7 @@ int MachineObject::parse_json(std::string tunnel, std::string payload, bool key_
                             else if (jj.contains("vt_tray")) {
                                 auto main_slot = parse_vt_tray(jj["vt_tray"].get<json>());
                                 main_slot.id = std::to_string(VIRTUAL_TRAY_MAIN_ID);
+
 
                                 auto it = std::next(vt_slot.begin(), 0);
                                 if (it != vt_slot.end()) {
@@ -3636,6 +3791,7 @@ void MachineObject::set_ctt_dlg( wxString text){
 
 int MachineObject::publish_gcode(std::string gcode_str)
 {
+    BS_TRACE_ENTER("publish_gcode");
     json j;
     j["print"]["command"] = "gcode_line";
     j["print"]["param"] = gcode_str;
@@ -3656,11 +3812,13 @@ int MachineObject::publish_gcode(std::string gcode_str)
 
 void MachineObject::update_device_cert_state(bool ready)
 {
+    BS_TRACE_ENTER("update_device_cert_state");
     device_cert_installed = ready;
 }
 
 BBLSubTask* MachineObject::get_subtask()
 {
+    BS_TRACE_ENTER("get_subtask");
     if (!subtask_)
         subtask_ = new BBLSubTask(nullptr);
     return subtask_;
@@ -3668,16 +3826,19 @@ BBLSubTask* MachineObject::get_subtask()
 
 BBLModelTask* MachineObject::get_modeltask()
 {
+    BS_TRACE_ENTER("get_modeltask");
     return model_task;
 }
 
 void MachineObject::set_modeltask(BBLModelTask* task)
 {
+    BS_TRACE_ENTER("set_modeltask");
     model_task = task;
 }
 
 void MachineObject::update_model_task()
 {
+    BS_TRACE_ENTER("update_model_task");
     if (request_model_result > 10) return;
     if (!m_agent) return;
     if (!model_task) return;
@@ -3775,6 +3936,7 @@ void MachineObject::update_model_task()
 
 void MachineObject::free_slice_info()
 {
+    BS_TRACE_ENTER("free_slice_info");
     if (get_slice_info_thread)
     {
         if (get_slice_info_thread->joinable())
@@ -3796,6 +3958,7 @@ void MachineObject::free_slice_info()
 
 void MachineObject::update_slice_info(std::string project_id, std::string profile_id, std::string subtask_id, int plate_idx)
 {
+    BS_TRACE_ENTER("update_slice_info");
     if (!m_agent) return;
 
     if (project_id_ != project_id || profile_id_ != profile_id || slice_info == nullptr || subtask_id_ != subtask_id) {
@@ -3898,6 +4061,7 @@ void MachineObject::update_slice_info(std::string project_id, std::string profil
 
 void MachineObject::get_firmware_info()
 {
+    BS_TRACE_ENTER("get_firmware_info");
     m_firmware_valid = false;
     if (m_firmware_thread_started)
         return;
@@ -3984,11 +4148,14 @@ void MachineObject::get_firmware_info()
 
 bool MachineObject::is_firmware_info_valid()
 {
+    BS_TRACE_ENTER("is_firmware_info_valid");
     return m_firmware_valid;
 }
 
+
 DevAmsTray MachineObject::parse_vt_tray(json vtray)
 {
+    BS_TRACE_ENTER("parse_vt_tray");
     auto vt_tray = DevAmsTray(std::to_string(VIRTUAL_TRAY_MAIN_ID));
     vt_tray.ams_type = DevAmsType::EXT_SPOOL;
 
@@ -4131,6 +4298,7 @@ DevAmsTray MachineObject::parse_vt_tray(json vtray)
 
 bool MachineObject::contains_tray(const std::string &ams_id, const std::string &tray_id) const
 {
+    BS_TRACE_ENTER("contains_tray");
     if (ams_id != VIRTUAL_AMS_MAIN_ID_STR && ams_id != VIRTUAL_AMS_DEPUTY_ID_STR) {
 
         return m_fila_system->GetAmsTray(ams_id, tray_id) != nullptr;
@@ -4145,6 +4313,7 @@ bool MachineObject::contains_tray(const std::string &ams_id, const std::string &
 
 std::optional<DevAmsTray> MachineObject::get_tray(const std::string &ams_id, const std::string &tray_id) const
 {
+    BS_TRACE_ENTER("get_tray");
     if (ams_id.empty() && tray_id.empty()) {
         return std::nullopt;
     }
@@ -4164,6 +4333,7 @@ std::optional<DevAmsTray> MachineObject::get_tray(const std::string &ams_id, con
 
 bool MachineObject::check_enable_np(const json& print) const
 {
+    BS_TRACE_ENTER("check_enable_np");
     if (print.contains("cfg") && print.contains("fun") && print.contains("aux") && print.contains("stat"))
     {
         return true;
@@ -4174,6 +4344,7 @@ bool MachineObject::check_enable_np(const json& print) const
 
 int MachineObject::get_max_filament_color_count() const
 {
+    BS_TRACE_ENTER("get_max_filament_color_count");
     if (is_support_filament_32_colors) return 32;
     if (is_enable_ams_np && !is_series_x())              return 20;
     if (!is_series_x() && !is_series_o()) return 16;
@@ -4182,6 +4353,7 @@ int MachineObject::get_max_filament_color_count() const
 
 void MachineObject::parse_new_info(json print)
 {
+    BS_TRACE_ENTER("parse_new_info");
     is_enable_np = check_enable_np(print);
     if (!is_enable_np)
     {
@@ -4198,6 +4370,7 @@ void MachineObject::parse_new_info(json print)
     if(!cfg.empty()){
         if (camera_resolution_hold_count > 0) camera_resolution_hold_count--;
         if (camera_timelapse_hold_count > 0) camera_timelapse_hold_count--;
+
 
         if (time(nullptr) - ams_user_setting_start > HOLD_COUNT_MAX)
         {
@@ -4346,6 +4519,7 @@ static bool is_hex_digit(char c) {
 
 int MachineObject::get_flag_bits(std::string str, int start, int count) const
 {
+    BS_TRACE_ENTER("get_flag_bits");
     try {
         unsigned long long decimal_value = std::stoull(str, nullptr, 16);
         unsigned long long mask = (1ULL << count) - 1;
@@ -4359,6 +4533,7 @@ int MachineObject::get_flag_bits(std::string str, int start, int count) const
 
 uint32_t MachineObject::get_flag_bits_no_border(std::string str, int start_idx, int count) const
 {
+    BS_TRACE_ENTER("get_flag_bits_no_border");
     if (start_idx < 0 || count <= 0) return 0;
 
     try {
@@ -4399,6 +4574,7 @@ uint32_t MachineObject::get_flag_bits_no_border(std::string str, int start_idx, 
         const size_t first_bit = ustart;
         const size_t last_bit = std::min(ustart + need_bits, total_bits) - 1ULL;
         if (last_bit < first_bit) return 0;
+
 
         const size_t right_index = hex.size() - 1ULL;
 
@@ -4444,6 +4620,7 @@ uint32_t MachineObject::get_flag_bits_no_border(std::string str, int start_idx, 
 
 int MachineObject::get_flag_bits(int num, int start, int count, int base) const
 {
+    BS_TRACE_ENTER("get_flag_bits");
     try {
         unsigned long long mask = (1ULL << count) - 1;
         unsigned long long value;
@@ -4464,6 +4641,7 @@ int MachineObject::get_flag_bits(int num, int start, int count, int base) const
 
 void MachineObject::update_filament_list()
 {
+    BS_TRACE_ENTER("update_filament_list");
     PresetBundle *preset_bundle = Slic3r::GUI::wxGetApp().preset_bundle;
 
     // custom filament
@@ -4530,6 +4708,7 @@ void MachineObject::update_filament_list()
 
 void MachineObject::update_printer_preset_name()
 {
+    BS_TRACE_ENTER("update_printer_preset_name");
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " " << __LINE__ << "start update preset_name";
     PresetBundle *     preset_bundle = Slic3r::GUI::wxGetApp().preset_bundle;
     if (!preset_bundle) return;
@@ -4567,6 +4746,7 @@ void MachineObject::update_printer_preset_name()
 
 void MachineObject::check_ams_filament_valid()
 {
+    BS_TRACE_ENTER("check_ams_filament_valid");
     PresetBundle * preset_bundle = Slic3r::GUI::wxGetApp().preset_bundle;
     auto printer_model = DevPrinterConfigUtil::get_printer_display_name(this->printer_type);
     std::map<std::string, std::set<std::string>> need_checked_filament_id;
@@ -4625,6 +4805,7 @@ void MachineObject::check_ams_filament_valid()
                         if (!is_equation) {
                             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " " << __LINE__ << " ams filament is not match min max temp and reset, ams_id: " << ams_id << " tray_id"
                                                     << slot_id << "filament_id: " << curr_tray->setting_id;
+
 
                             command_ams_filament_settings(std::stoi(ams_id), std::stoi(slot_id), curr_tray->setting_id, preset_setting_id, curr_tray->color, curr_tray->m_fila_type,
                                                           std::stoi(curr_tray->nozzle_temp_min), std::stoi(curr_tray->nozzle_temp_max));
@@ -4709,6 +4890,7 @@ void MachineObject::check_ams_filament_valid()
 
 void MachineObject::command_set_door_open_check(DoorOpenCheckState state)
 {
+    BS_TRACE_ENTER("command_set_door_open_check");
     json j;
     j["system"]["command"]       = "set_door_stat";
     j["system"]["sequence_id"]   = std::to_string(MachineObject::m_sequence_id++);
@@ -4729,6 +4911,7 @@ void MachineObject::command_set_door_open_check(DoorOpenCheckState state)
 
 void MachineObject::command_set_save_remote_print_file_to_storage(bool save)
 {
+    BS_TRACE_ENTER("command_set_save_remote_print_file_to_storage");
     if (get_save_remote_print_file_to_storage() != save)
     {
         json j;
@@ -4746,6 +4929,7 @@ void MachineObject::command_set_save_remote_print_file_to_storage(bool save)
 
 wxString MachineObject::get_nozzle_replace_url() const
 {
+    BS_TRACE_ENTER("get_nozzle_replace_url");
     const wxString& strLanguage = GUI::wxGetApp().app_config->get("language");
     const wxString& lan_code = strLanguage.BeforeFirst('_');
 
@@ -4763,6 +4947,7 @@ wxString MachineObject::get_nozzle_replace_url() const
 
 std::string MachineObject::get_error_code_str(int error_code)
 {
+    BS_TRACE_ENTER("get_error_code_str");
     if (error_code < 0) { return std::string();}
 
     char buf[32];
@@ -4774,6 +4959,7 @@ std::string MachineObject::get_error_code_str(int error_code)
 
 void MachineObject::add_command_error_code_dlg(int command_err, json action_json)
 {
+    BS_TRACE_ENTER("add_command_error_code_dlg");
     BOOST_LOG_TRIVIAL(error) << __FUNCTION__  << command_err;
     if (command_err > 0 && !Slic3r::GUI::wxGetApp().get_hms_query()->is_internal_error(this, command_err))
     {
@@ -4796,11 +4982,13 @@ void MachineObject::add_command_error_code_dlg(int command_err, json action_json
 
 bool MachineObject::is_multi_extruders() const
 {
+    BS_TRACE_ENTER("is_multi_extruders");
     return m_extder_system->GetTotalExtderCount() > 1;
 }
 
 DevNozzle MachineObject::get_nozzle_by_id_code(int id_code) const
 {
+    BS_TRACE_ENTER("get_nozzle_by_id_code");
     /* toolhead nozzle*/
     if (id_code == MAIN_EXTRUDER_ID || id_code == DEPUTY_EXTRUDER_ID) {
         auto extruder = m_extder_system->GetExtderById(id_code);
@@ -4823,6 +5011,7 @@ DevNozzle MachineObject::get_nozzle_by_id_code(int id_code) const
 
 DevNozzle MachineObject::get_nozzle_by_sn(const std::string& sn) const
 {
+    BS_TRACE_ENTER("get_nozzle_by_sn");
     int nozzle_id;
     DevNozzle nozzle;
 
@@ -4847,36 +5036,43 @@ DevNozzle MachineObject::get_nozzle_by_sn(const std::string& sn) const
 
 Slic3r::DevPrintingSpeedLevel MachineObject::GetPrintingSpeedLevel() const
 {
+    BS_TRACE_ENTER("GetPrintingSpeedLevel");
     return m_print_options->GetPrintingSpeedLevel();
 }
 
 bool MachineObject::is_target_slot_unload() const
 {
+    BS_TRACE_ENTER("is_target_slot_unload");
     return m_extder_system->GetTargetSlotId().compare("255") == 0;
 }
 
 Slic3r::DevAms* MachineObject::get_curr_Ams()
 {
+    BS_TRACE_ENTER("get_curr_Ams");
     return m_fila_system->GetAmsById(m_extder_system->GetCurrentAmsId());
 }
 
 Slic3r::DevAmsTray* MachineObject::get_ams_tray(std::string ams_id, std::string tray_id)
 {
+    BS_TRACE_ENTER("get_ams_tray");
     return m_fila_system->GetAmsTray(ams_id, tray_id);
 }
 
 bool MachineObject::HasAms() const
 {
+    BS_TRACE_ENTER("HasAms");
     return m_fila_system->HasAms();
 }
 
 std::optional<bool> MachineObject::IsDetectOnInsertEnabled() const
 {
+    BS_TRACE_ENTER("IsDetectOnInsertEnabled");
     return m_fila_system->GetAmsSystemSetting().IsDetectOnInsertEnabled();
 }
 
 std::shared_ptr<Slic3r::DevNozzleRack> MachineObject::GetNozzleRack() const
 {
+    BS_TRACE_ENTER("GetNozzleRack");
     return m_nozzle_system->GetNozzleRack();
 }
 
@@ -4888,8 +5084,10 @@ void MachineObject::set_dev_id(std::string val) {
     m_dev_info->SetDevId(val);
 }
 
+
 void change_the_opacity(wxColour& colour)
 {
+    BS_TRACE_ENTER("set_dev_id");
     if (colour.Alpha() == 255) {
         colour = wxColour(colour.Red(), colour.Green(), colour.Blue(), 254);
     }

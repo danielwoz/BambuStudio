@@ -381,10 +381,16 @@ struct BambuNetworkingPluginHandle::Impl {
 
         if (set_cert_file && !cfg.cert_dir.empty() && !cfg.cert_file.empty()) {
             int rc = set_cert_file(agent, cfg.cert_dir, cfg.cert_file);
+            std::fprintf(stderr,
+                "[plugin] set_cert_file('%s','%s') rc=%d\n",
+                cfg.cert_dir.c_str(), cfg.cert_file.c_str(), rc);
         }
 
         if (set_extra_http_header && !cfg.extra_http_headers.empty()) {
             int rc = set_extra_http_header(agent, cfg.extra_http_headers);
+            std::fprintf(stderr,
+                "[plugin] set_extra_http_header rc=%d (headers=%zu)\n",
+                rc, cfg.extra_http_headers.size());
         }
 
         // Install our callbacks BEFORE start() so we don't race against
@@ -430,6 +436,12 @@ struct BambuNetworkingPluginHandle::Impl {
 
         if (start) start(agent);
 
+        std::fprintf(stderr,
+            "[plugin] resolved set_cert_file=%p set_extra_http_header=%p "
+            "connect_server=%p\n",
+            (void*)set_cert_file, (void*)set_extra_http_header,
+            (void*)connect_server);
+
         // Bring the cloud session up. The GUI defers this to
         // on_user_login_handle (a wx event fired by the OAuth flow);
         // for headless mode we issue it directly because the plugin
@@ -437,6 +449,8 @@ struct BambuNetworkingPluginHandle::Impl {
         // cached tokens exist.
         if (connect_server) {
             int rc = connect_server(agent);
+            std::fprintf(stderr,
+                "[plugin] connect_server (initial) rc=%d\n", rc);
         }
 
         started = true;
@@ -507,9 +521,13 @@ int BambuNetworkingPluginHandle::publish_to_device(const std::string& dev_id,
 int BambuNetworkingPluginHandle::upload_gcode_to_sdcard(
         const CloudUploadParams& params) {
     if (!m_impl->agent) {
+        std::fprintf(stderr,
+            "[plugin] upload_gcode_to_sdcard: agent is null\n");
         return -1000; // distinguishable from a plugin-internal -1
     }
     if (!m_impl->start_send_gcode_to_sdcard) {
+        std::fprintf(stderr,
+            "[plugin] upload_gcode_to_sdcard: symbol not resolved\n");
         return -1001;
     }
 
@@ -526,10 +544,18 @@ int BambuNetworkingPluginHandle::upload_gcode_to_sdcard(
     pp.use_ssl_for_ftp  = params.use_ssl_for_ftp;
     pp.use_ssl_for_mqtt = params.use_ssl_for_mqtt;
 
+    std::fprintf(stderr,
+        "[plugin] upload_gcode_to_sdcard ENTER dev_id=%s dev_ip=%s "
+        "filename=%s connection_type=%s\n",
+        pp.dev_id.c_str(), pp.dev_ip.c_str(),
+        pp.filename.c_str(), pp.connection_type.c_str());
+
     int rc = m_impl->start_send_gcode_to_sdcard(
         m_impl->agent, std::move(pp),
         /*update_fn*/ {}, /*cancel_fn*/ {}, /*wait_fn*/ {});
 
+    std::fprintf(stderr,
+        "[plugin] upload_gcode_to_sdcard EXIT rc=%d\n", rc);
     return rc;
 }
 

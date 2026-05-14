@@ -64,6 +64,8 @@ void worker_loop(std::function<void()> cb) {
         if (cb) {
             try { cb(); }
             catch (const std::exception& ex) {
+                std::fprintf(stderr,
+                    "[signal-handler] callback threw: %s\n", ex.what());
             }
         }
     }

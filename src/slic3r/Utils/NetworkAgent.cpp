@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include "BambuTrace.hpp"
 #include <stdlib.h>
 #if defined(_MSC_VER) || defined(_WIN32)
 #include <Windows.h>
@@ -41,6 +42,7 @@ static HMODULE source_module = NULL;
 static void* networking_module = NULL;
 static void* source_module = NULL;
 #endif
+
 
 func_check_debug_consistent         NetworkAgent::check_debug_consistent_ptr = nullptr;
 func_get_version                    NetworkAgent::get_version_ptr = nullptr;
@@ -171,6 +173,7 @@ NetworkAgent::~NetworkAgent()
 
 std::string NetworkAgent::get_libpath_in_current_directory(std::string library_name)
 {
+    BS_TRACE_ENTER("get_libpath_in_current_directory");
     std::string lib_path;
 #if defined(_MSC_VER) || defined(_WIN32)
     wchar_t file_name[512];
@@ -193,8 +196,10 @@ std::string NetworkAgent::get_libpath_in_current_directory(std::string library_n
     return lib_path;
 }
 
+
 int NetworkAgent::initialize_network_module(bool using_backup, bool validate_cert)
 {
+    BS_TRACE_ENTER("initialize_network_module");
     //int ret = -1;
     std::string library;
     std::string data_dir_str = data_dir();
@@ -416,6 +421,7 @@ int NetworkAgent::initialize_network_module(bool using_backup, bool validate_cer
 
 int NetworkAgent::unload_network_module()
 {
+    BS_TRACE_ENTER("unload_network_module");
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", network module %1%")%networking_module;
     UnloadFTModule();
 #if defined(_MSC_VER) || defined(_WIN32)
@@ -548,6 +554,7 @@ HMODULE NetworkAgent::get_bambu_source_entry()
 void* NetworkAgent::get_bambu_source_entry()
 #endif
 {
+    BS_TRACE_ENTER("get_bambu_source_entry");
     if ((source_module) || (!networking_module))
         return source_module;
 
@@ -598,6 +605,7 @@ void* NetworkAgent::get_bambu_source_entry()
 
 void* NetworkAgent::get_network_function(const char* name)
 {
+    BS_TRACE_ENTER("get_network_function");
     void* function = nullptr;
 
     if (!networking_module)
@@ -617,6 +625,7 @@ void* NetworkAgent::get_network_function(const char* name)
 
 std::string NetworkAgent::get_version()
 {
+    BS_TRACE_ENTER("get_version");
     bool consistent = true;
     //check the debug consistent first
     if (check_debug_consistent_ptr) {
@@ -639,6 +648,7 @@ std::string NetworkAgent::get_version()
 
 int NetworkAgent::init_log()
 {
+    BS_TRACE_ENTER("init_log");
     int ret = 0;
     if (network_agent && init_log_ptr) {
         ret = init_log_ptr(network_agent);
@@ -650,6 +660,7 @@ int NetworkAgent::init_log()
 
 int NetworkAgent::set_config_dir(std::string config_dir)
 {
+    BS_TRACE_ENTER("set_config_dir");
     int ret = 0;
     if (network_agent && set_config_dir_ptr) {
         ret = set_config_dir_ptr(network_agent, config_dir);
@@ -661,6 +672,7 @@ int NetworkAgent::set_config_dir(std::string config_dir)
 
 int NetworkAgent::set_cert_file(std::string folder, std::string filename)
 {
+    BS_TRACE_ENTER("set_cert_file");
     int ret = 0;
     if (network_agent && set_cert_file_ptr) {
         ret = set_cert_file_ptr(network_agent, folder, filename);
@@ -672,6 +684,7 @@ int NetworkAgent::set_cert_file(std::string folder, std::string filename)
 
 int NetworkAgent::set_country_code(std::string country_code)
 {
+    BS_TRACE_ENTER("set_country_code");
     int ret = 0;
     if (network_agent && set_country_code_ptr) {
         ret = set_country_code_ptr(network_agent, country_code);
@@ -683,6 +696,7 @@ int NetworkAgent::set_country_code(std::string country_code)
 
 int NetworkAgent::start()
 {
+    BS_TRACE_ENTER("start");
     int ret = 0;
     if (network_agent && start_ptr) {
         ret = start_ptr(network_agent);
@@ -694,6 +708,7 @@ int NetworkAgent::start()
 
 int NetworkAgent::set_on_ssdp_msg_fn(OnMsgArrivedFn fn)
 {
+    BS_TRACE_ENTER("set_on_ssdp_msg_fn");
     int ret = 0;
     if (network_agent && set_on_ssdp_msg_fn_ptr) {
         ret = set_on_ssdp_msg_fn_ptr(network_agent, fn);
@@ -705,6 +720,7 @@ int NetworkAgent::set_on_ssdp_msg_fn(OnMsgArrivedFn fn)
 
 int NetworkAgent::set_on_user_login_fn(OnUserLoginFn fn)
 {
+    BS_TRACE_ENTER("set_on_user_login_fn");
     int ret = 0;
     if (network_agent && set_on_user_login_fn_ptr) {
         ret = set_on_user_login_fn_ptr(network_agent, fn);
@@ -716,6 +732,7 @@ int NetworkAgent::set_on_user_login_fn(OnUserLoginFn fn)
 
 int NetworkAgent::set_on_printer_connected_fn(OnPrinterConnectedFn fn)
 {
+    BS_TRACE_ENTER("set_on_printer_connected_fn");
     int ret = 0;
     if (network_agent && set_on_printer_connected_fn_ptr) {
         ret = set_on_printer_connected_fn_ptr(network_agent, fn);
@@ -727,6 +744,7 @@ int NetworkAgent::set_on_printer_connected_fn(OnPrinterConnectedFn fn)
 
 int NetworkAgent::set_on_server_connected_fn(OnServerConnectedFn fn)
 {
+    BS_TRACE_ENTER("set_on_server_connected_fn");
     int ret = 0;
     if (network_agent && set_on_server_connected_fn_ptr) {
         ret = set_on_server_connected_fn_ptr(network_agent, fn);
@@ -738,6 +756,7 @@ int NetworkAgent::set_on_server_connected_fn(OnServerConnectedFn fn)
 
 int NetworkAgent::set_on_http_error_fn(OnHttpErrorFn fn)
 {
+    BS_TRACE_ENTER("set_on_http_error_fn");
     int ret = 0;
     if (network_agent && set_on_http_error_fn_ptr) {
         ret = set_on_http_error_fn_ptr(network_agent, fn);
@@ -749,6 +768,7 @@ int NetworkAgent::set_on_http_error_fn(OnHttpErrorFn fn)
 
 int NetworkAgent::set_get_country_code_fn(GetCountryCodeFn fn)
 {
+    BS_TRACE_ENTER("set_get_country_code_fn");
     int ret = 0;
     if (network_agent && set_get_country_code_fn_ptr) {
         ret = set_get_country_code_fn_ptr(network_agent, fn);
@@ -760,6 +780,7 @@ int NetworkAgent::set_get_country_code_fn(GetCountryCodeFn fn)
 
 int NetworkAgent::set_on_subscribe_failure_fn(GetSubscribeFailureFn fn)
 {
+    BS_TRACE_ENTER("set_on_subscribe_failure_fn");
     int ret = 0;
     if (network_agent && set_on_subscribe_failure_fn_ptr) {
         ret = set_on_subscribe_failure_fn_ptr(network_agent, fn);
@@ -771,6 +792,7 @@ int NetworkAgent::set_on_subscribe_failure_fn(GetSubscribeFailureFn fn)
 
 int NetworkAgent::set_on_message_fn(OnMessageFn fn)
 {
+    BS_TRACE_ENTER("set_on_message_fn");
     int ret = 0;
     if (network_agent && set_on_message_fn_ptr) {
         // Wrap with the bridge tap. The slicer's `fn` runs first, then
@@ -798,6 +820,7 @@ int NetworkAgent::set_on_message_fn(OnMessageFn fn)
 
 int NetworkAgent::set_on_user_message_fn(OnMessageFn fn)
 {
+    BS_TRACE_ENTER("set_on_user_message_fn");
     int ret = 0;
     if (network_agent && set_on_user_message_fn_ptr) {
         ret = set_on_user_message_fn_ptr(network_agent, fn);
@@ -809,6 +832,7 @@ int NetworkAgent::set_on_user_message_fn(OnMessageFn fn)
 
 int NetworkAgent::set_on_local_connect_fn(OnLocalConnectedFn fn)
 {
+    BS_TRACE_ENTER("set_on_local_connect_fn");
     // Capture so the VirtualMqttClient path can fire it too when a
     // virtual-dev_id session comes up or drops.
     m_local_connect_cb = fn;
@@ -830,6 +854,11 @@ int NetworkAgent::set_on_local_connect_fn(OnLocalConnectedFn fn)
         OnLocalConnectedFn wrapped =
             [fn](int state, std::string dev_id, std::string msg) {
                 if (is_virtual_dev_id(dev_id)) {
+                    std::fprintf(stderr,
+                        "[network-agent] suppressing plugin "
+                        "on_local_connect for virtual dev_id=%s "
+                        "state=%d msg=%s\n",
+                        dev_id.c_str(), state, msg.c_str());
                     return;
                 }
                 if (fn) fn(state, dev_id, msg);
@@ -843,6 +872,7 @@ int NetworkAgent::set_on_local_connect_fn(OnLocalConnectedFn fn)
 
 int NetworkAgent::set_on_local_message_fn(OnMessageFn fn)
 {
+    BS_TRACE_ENTER("set_on_local_message_fn");
     // Capture so the VirtualMqttClient path can fire it too on
     // device/<virtual_sn>/report messages.
     m_local_message_cb = fn;
@@ -878,6 +908,7 @@ void NetworkAgent::set_bridge_message_tap(BridgeMessageTap tap)
 
 int NetworkAgent::set_queue_on_main_fn(QueueOnMainFn fn)
 {
+    BS_TRACE_ENTER("set_queue_on_main_fn");
     int ret = 0;
     if (network_agent && set_queue_on_main_fn_ptr) {
         ret = set_queue_on_main_fn_ptr(network_agent, fn);
@@ -889,6 +920,7 @@ int NetworkAgent::set_queue_on_main_fn(QueueOnMainFn fn)
 
 int NetworkAgent::connect_server()
 {
+    BS_TRACE_ENTER("connect_server");
     int ret = 0;
     if (network_agent && connect_server_ptr) {
         ret = connect_server_ptr(network_agent);
@@ -900,6 +932,7 @@ int NetworkAgent::connect_server()
 
 bool NetworkAgent::is_server_connected()
 {
+    BS_TRACE_ENTER("is_server_connected");
     bool ret = false;
     if (network_agent && is_server_connected_ptr) {
         ret = is_server_connected_ptr(network_agent);
@@ -910,6 +943,7 @@ bool NetworkAgent::is_server_connected()
 
 int NetworkAgent::refresh_connection()
 {
+    BS_TRACE_ENTER("refresh_connection");
     int ret = 0;
     if (network_agent && refresh_connection_ptr) {
         ret = refresh_connection_ptr(network_agent);
@@ -921,6 +955,7 @@ int NetworkAgent::refresh_connection()
 
 int NetworkAgent::start_subscribe(std::string module)
 {
+    BS_TRACE_ENTER("start_subscribe");
     int ret = 0;
     if (network_agent && start_subscribe_ptr) {
         ret = start_subscribe_ptr(network_agent, module);
@@ -932,6 +967,7 @@ int NetworkAgent::start_subscribe(std::string module)
 
 int NetworkAgent::stop_subscribe(std::string module)
 {
+    BS_TRACE_ENTER("stop_subscribe");
     int ret = 0;
     if (network_agent && stop_subscribe_ptr) {
         ret = stop_subscribe_ptr(network_agent, module);
@@ -943,6 +979,7 @@ int NetworkAgent::stop_subscribe(std::string module)
 
 int NetworkAgent::add_subscribe(std::vector<std::string> dev_list)
 {
+    BS_TRACE_ENTER("add_subscribe");
     int ret = 0;
     if (network_agent && add_subscribe_ptr) {
         ret = add_subscribe_ptr(network_agent, dev_list);
@@ -954,6 +991,7 @@ int NetworkAgent::add_subscribe(std::vector<std::string> dev_list)
 
 int NetworkAgent::del_subscribe(std::vector<std::string> dev_list)
 {
+    BS_TRACE_ENTER("del_subscribe");
     int ret = 0;
     if (network_agent && del_subscribe_ptr) {
         ret = del_subscribe_ptr(network_agent, dev_list);
@@ -965,6 +1003,7 @@ int NetworkAgent::del_subscribe(std::vector<std::string> dev_list)
 
 void NetworkAgent::enable_multi_machine(bool enable)
 {
+    BS_TRACE_ENTER("enable_multi_machine");
     if (network_agent && enable_multi_machine_ptr) {
         enable_multi_machine_ptr(network_agent, enable);
     }
@@ -972,6 +1011,7 @@ void NetworkAgent::enable_multi_machine(bool enable)
 
 int NetworkAgent::send_message(std::string dev_id, std::string json_str, int qos, int flag)
 {
+    BS_TRACE_ENTER("send_message");
     int ret = 0;
     if (network_agent && send_message_ptr) {
         ret = send_message_ptr(network_agent, dev_id, json_str, qos, flag);
@@ -984,11 +1024,17 @@ int NetworkAgent::send_message(std::string dev_id, std::string json_str, int qos
 
 int NetworkAgent::connect_printer(std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl)
 {
+    BS_TRACE_ENTER("connect_printer");
     if (is_virtual_dev_id(dev_id)) {
+        std::fprintf(stderr,
+            "[network-agent] VIRTUAL connect_printer dev_id=%s ip=%s\n",
+            dev_id.c_str(), dev_ip.c_str());
         auto& vc = ::Slic3r::VirtualMqttClient::instance();
         vc.set_on_local_connect(m_local_connect_cb);
         vc.set_on_message      (m_local_message_cb);
         int rc = vc.connect_printer(dev_id, dev_ip, /*access_code=*/password);
+        std::fprintf(stderr,
+            "[network-agent] VIRTUAL connect_printer rc=%d\n", rc);
         if (rc == 0) m_current_local_dev_id = dev_id;
         return rc;
     }
@@ -1006,10 +1052,14 @@ int NetworkAgent::connect_printer(std::string dev_id, std::string dev_ip, std::s
 
 int NetworkAgent::disconnect_printer()
 {
+    BS_TRACE_ENTER("disconnect_printer");
     // disconnect_printer is dev-id-less (the plugin only holds one LAN
     // session at a time). Route based on the dev_id we recorded at
     // the most-recent connect_printer.
     if (is_virtual_dev_id(m_current_local_dev_id)) {
+        std::fprintf(stderr,
+            "[network-agent] VIRTUAL disconnect_printer dev_id=%s\n",
+            m_current_local_dev_id.c_str());
         const std::string id = m_current_local_dev_id;
         m_current_local_dev_id.clear();
         return ::Slic3r::VirtualMqttClient::instance().disconnect_printer(id);
@@ -1027,7 +1077,11 @@ int NetworkAgent::disconnect_printer()
 
 int NetworkAgent::send_message_to_printer(std::string dev_id, std::string json_str, int qos, int flag)
 {
+    BS_TRACE_ENTER("send_message_to_printer");
     if (is_virtual_dev_id(dev_id)) {
+        std::fprintf(stderr,
+            "[network-agent] VIRTUAL send_message dev_id=%s qos=%d json_size=%zu\n",
+            dev_id.c_str(), qos, json_str.size());
         return ::Slic3r::VirtualMqttClient::instance()
             .send_message(dev_id, json_str, qos);
     }
@@ -1042,6 +1096,7 @@ int NetworkAgent::send_message_to_printer(std::string dev_id, std::string json_s
 
 int NetworkAgent::check_cert()
 {
+    BS_TRACE_ENTER("check_cert");
     int ret = 0;
     if (network_agent && check_cert_ptr) {
         ret = check_cert_ptr(network_agent);
@@ -1053,6 +1108,7 @@ int NetworkAgent::check_cert()
 
 void NetworkAgent::install_device_cert(std::string dev_id, bool lan_only)
 {
+    BS_TRACE_ENTER("install_device_cert");
     if (network_agent && install_device_cert_ptr) {
         install_device_cert_ptr(network_agent, dev_id, lan_only);
     }
@@ -1060,6 +1116,7 @@ void NetworkAgent::install_device_cert(std::string dev_id, bool lan_only)
 
 bool NetworkAgent::start_discovery(bool start, bool sending)
 {
+    BS_TRACE_ENTER("start_discovery");
     bool ret = false;
     if (network_agent && start_discovery_ptr) {
         ret = start_discovery_ptr(network_agent, start, sending);
@@ -1070,6 +1127,7 @@ bool NetworkAgent::start_discovery(bool start, bool sending)
 
 int  NetworkAgent::change_user(std::string user_info)
 {
+    BS_TRACE_ENTER("change_user");
     int ret = 0;
     if (network_agent && change_user_ptr) {
         ret = change_user_ptr(network_agent, user_info);
@@ -1081,6 +1139,7 @@ int  NetworkAgent::change_user(std::string user_info)
 
 bool NetworkAgent::is_user_login()
 {
+    BS_TRACE_ENTER("is_user_login");
     bool ret = false;
     if (network_agent && is_user_login_ptr) {
         ret = is_user_login_ptr(network_agent);
@@ -1090,6 +1149,7 @@ bool NetworkAgent::is_user_login()
 
 int  NetworkAgent::user_logout(bool request)
 {
+    BS_TRACE_ENTER("user_logout");
     int ret = 0;
     if (network_agent && user_logout_ptr) {
         ret = user_logout_ptr(network_agent, request);
@@ -1101,6 +1161,7 @@ int  NetworkAgent::user_logout(bool request)
 
 std::string NetworkAgent::get_user_id()
 {
+    BS_TRACE_ENTER("get_user_id");
     std::string ret;
     if (network_agent && get_user_id_ptr) {
         ret = get_user_id_ptr(network_agent);
@@ -1110,6 +1171,7 @@ std::string NetworkAgent::get_user_id()
 
 std::string NetworkAgent::get_user_name()
 {
+    BS_TRACE_ENTER("get_user_name");
     std::string ret;
     if (network_agent && get_user_name_ptr) {
         ret = get_user_name_ptr(network_agent);
@@ -1119,6 +1181,7 @@ std::string NetworkAgent::get_user_name()
 
 std::string NetworkAgent::get_user_avatar()
 {
+    BS_TRACE_ENTER("get_user_avatar");
     std::string ret;
     if (network_agent && get_user_avatar_ptr) {
         ret = get_user_avatar_ptr(network_agent);
@@ -1128,6 +1191,7 @@ std::string NetworkAgent::get_user_avatar()
 
 std::string NetworkAgent::get_user_nickanme()
 {
+    BS_TRACE_ENTER("get_user_nickanme");
     std::string ret;
     if (network_agent && get_user_nickanme_ptr) {
         ret = get_user_nickanme_ptr(network_agent);
@@ -1137,6 +1201,7 @@ std::string NetworkAgent::get_user_nickanme()
 
 std::string NetworkAgent::build_login_cmd()
 {
+    BS_TRACE_ENTER("build_login_cmd");
     std::string ret;
     if (network_agent && build_login_cmd_ptr) {
         ret = build_login_cmd_ptr(network_agent);
@@ -1146,6 +1211,7 @@ std::string NetworkAgent::build_login_cmd()
 
 std::string NetworkAgent::build_logout_cmd()
 {
+    BS_TRACE_ENTER("build_logout_cmd");
     std::string ret;
     if (network_agent && build_logout_cmd_ptr) {
         ret = build_logout_cmd_ptr(network_agent);
@@ -1155,6 +1221,7 @@ std::string NetworkAgent::build_logout_cmd()
 
 std::string NetworkAgent::build_login_info()
 {
+    BS_TRACE_ENTER("build_login_info");
     std::string ret;
     if (network_agent && build_login_info_ptr) {
         ret = build_login_info_ptr(network_agent);
@@ -1164,6 +1231,7 @@ std::string NetworkAgent::build_login_info()
 
 int NetworkAgent::ping_bind(std::string ping_code)
 {
+    BS_TRACE_ENTER("ping_bind");
     int ret = 0;
     if (network_agent && ping_bind_ptr) {
         ret = ping_bind_ptr(network_agent, ping_code);
@@ -1176,6 +1244,7 @@ int NetworkAgent::ping_bind(std::string ping_code)
 
 int NetworkAgent::bind_detect(std::string dev_ip, std::string sec_link, detectResult& detect)
 {
+    BS_TRACE_ENTER("bind_detect");
     int ret = 0;
     if (network_agent && bind_detect_ptr) {
         ret = bind_detect_ptr(network_agent, dev_ip, sec_link, detect);
@@ -1187,6 +1256,7 @@ int NetworkAgent::bind_detect(std::string dev_ip, std::string sec_link, detectRe
 
 int NetworkAgent::report_consent(std::string expand)
 {
+    BS_TRACE_ENTER("report_consent");
     int ret = 0;
     if (network_agent && report_consent_ptr) {
         ret = report_consent_ptr(network_agent, expand);
@@ -1198,6 +1268,7 @@ int NetworkAgent::report_consent(std::string expand)
 
 int NetworkAgent::set_server_callback(OnServerErrFn fn)
 {
+    BS_TRACE_ENTER("set_server_callback");
     int ret = 0;
     if (network_agent && set_server_callback_ptr) {
         ret = set_server_callback_ptr(network_agent, fn);
@@ -1210,6 +1281,7 @@ int NetworkAgent::set_server_callback(OnServerErrFn fn)
 
 int NetworkAgent::bind(std::string dev_ip, std::string dev_id, std::string sec_link, std::string timezone,  bool improved, OnUpdateStatusFn update_fn)
 {
+    BS_TRACE_ENTER("bind");
     int ret = 0;
     if (network_agent && bind_ptr) {
         ret = bind_ptr(network_agent, dev_ip, dev_id, sec_link, timezone, improved, update_fn);
@@ -1221,6 +1293,7 @@ int NetworkAgent::bind(std::string dev_ip, std::string dev_id, std::string sec_l
 
 int NetworkAgent::unbind(std::string dev_id)
 {
+    BS_TRACE_ENTER("unbind");
     int ret = 0;
     if (network_agent && unbind_ptr) {
         ret = unbind_ptr(network_agent, dev_id);
@@ -1232,6 +1305,7 @@ int NetworkAgent::unbind(std::string dev_id)
 
 std::string NetworkAgent::get_bambulab_host()
 {
+    BS_TRACE_ENTER("get_bambulab_host");
     std::string ret;
     if (network_agent && get_bambulab_host_ptr) {
         ret = get_bambulab_host_ptr(network_agent);
@@ -1241,6 +1315,7 @@ std::string NetworkAgent::get_bambulab_host()
 
 std::string NetworkAgent::get_user_selected_machine()
 {
+    BS_TRACE_ENTER("get_user_selected_machine");
     std::string ret;
     if (network_agent && get_user_selected_machine_ptr) {
         ret = get_user_selected_machine_ptr(network_agent);
@@ -1250,6 +1325,7 @@ std::string NetworkAgent::get_user_selected_machine()
 
 int NetworkAgent::set_user_selected_machine(std::string dev_id)
 {
+    BS_TRACE_ENTER("set_user_selected_machine");
     int ret = 0;
     if (network_agent && set_user_selected_machine_ptr) {
         ret = set_user_selected_machine_ptr(network_agent, dev_id);
@@ -1261,6 +1337,7 @@ int NetworkAgent::set_user_selected_machine(std::string dev_id)
 
 int NetworkAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+    BS_TRACE_ENTER("start_print");
     int ret = 0;
     if (network_agent && start_print_ptr) {
         ret = start_print_ptr(network_agent, params, update_fn, cancel_fn, wait_fn);
@@ -1272,6 +1349,7 @@ int NetworkAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, Wa
 
 int NetworkAgent::start_local_print_with_record(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+    BS_TRACE_ENTER("start_local_print_with_record");
     int ret = 0;
     if (network_agent && start_local_print_with_record_ptr) {
         ret = start_local_print_with_record_ptr(network_agent, params, update_fn, cancel_fn, wait_fn);
@@ -1282,7 +1360,15 @@ int NetworkAgent::start_local_print_with_record(PrintParams params, OnUpdateStat
 
 int NetworkAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+    BS_TRACE_ENTER("start_send_gcode_to_sdcard");
     if (is_virtual_dev_id(params.dev_id)) {
+        std::fprintf(stderr,
+            "[network-agent] VIRTUAL start_send_gcode_to_sdcard "
+            "dev_id=%s dev_ip=%s file=%s remote=%s\n",
+            params.dev_id.c_str(), params.dev_ip.c_str(),
+            params.filename.c_str(),
+            params.ftp_file.empty() ? params.dst_file.c_str()
+                                    : params.ftp_file.c_str());
         ::Slic3r::virtual_ftps::UploadParams up;
         up.host        = params.dev_ip;
         // Default high port — slicer never sees this; the bridge picks
@@ -1307,6 +1393,8 @@ int NetworkAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusF
             canc = [cancel_fn]() -> bool { return cancel_fn(); };
         }
         const int rc = ::Slic3r::virtual_ftps::upload(up, prog, canc);
+        std::fprintf(stderr,
+            "[network-agent] VIRTUAL start_send_gcode_to_sdcard rc=%d\n", rc);
         return rc;
     }
     int ret = 0;
@@ -1319,6 +1407,7 @@ int NetworkAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusF
 
 int NetworkAgent::start_local_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
 {
+    BS_TRACE_ENTER("start_local_print");
     int ret = 0;
     if (network_agent && start_local_print_ptr) {
         ret = start_local_print_ptr(network_agent, params, update_fn, cancel_fn);
@@ -1329,6 +1418,7 @@ int NetworkAgent::start_local_print(PrintParams params, OnUpdateStatusFn update_
 
 int NetworkAgent::start_sdcard_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
 {
+    BS_TRACE_ENTER("start_sdcard_print");
     int ret = 0;
     if (network_agent && start_sdcard_print_ptr) {
         ret = start_sdcard_print_ptr(network_agent, params, update_fn, cancel_fn);
@@ -1339,6 +1429,7 @@ int NetworkAgent::start_sdcard_print(PrintParams params, OnUpdateStatusFn update
 
 int NetworkAgent::get_user_presets(std::map<std::string, std::map<std::string, std::string>>* user_presets)
 {
+    BS_TRACE_ENTER("get_user_presets");
     int ret = 0;
     if (network_agent && get_user_presets_ptr) {
         ret = get_user_presets_ptr(network_agent, user_presets);
@@ -1349,6 +1440,7 @@ int NetworkAgent::get_user_presets(std::map<std::string, std::map<std::string, s
 
 std::string NetworkAgent::request_setting_id(std::string name, std::map<std::string, std::string>* values_map, unsigned int* http_code)
 {
+    BS_TRACE_ENTER("request_setting_id");
     std::string ret;
     if (network_agent && request_setting_id_ptr) {
         ret = request_setting_id_ptr(network_agent, name, values_map, http_code);
@@ -1360,6 +1452,7 @@ std::string NetworkAgent::request_setting_id(std::string name, std::map<std::str
 
 int NetworkAgent::put_setting(std::string setting_id, std::string name, std::map<std::string, std::string>* values_map, unsigned int* http_code)
 {
+    BS_TRACE_ENTER("put_setting");
     int ret;
     if (network_agent && put_setting_ptr) {
         ret = put_setting_ptr(network_agent, setting_id, name, values_map, http_code);
@@ -1371,6 +1464,7 @@ int NetworkAgent::put_setting(std::string setting_id, std::string name, std::map
 
 int NetworkAgent::get_setting_list(std::string bundle_version, ProgressFn pro_fn, WasCancelledFn cancel_fn)
 {
+    BS_TRACE_ENTER("get_setting_list");
     int ret = 0;
     if (network_agent && get_setting_list_ptr) {
         ret = get_setting_list_ptr(network_agent, bundle_version, pro_fn, cancel_fn);
@@ -1381,6 +1475,7 @@ int NetworkAgent::get_setting_list(std::string bundle_version, ProgressFn pro_fn
 
 int NetworkAgent::get_setting_list2(std::string bundle_version, CheckFn chk_fn, ProgressFn pro_fn, WasCancelledFn cancel_fn)
 {
+    BS_TRACE_ENTER("get_setting_list2");
     int ret = 0;
     if (network_agent && get_setting_list2_ptr) {
         ret = get_setting_list2_ptr(network_agent, bundle_version, chk_fn, pro_fn, cancel_fn);
@@ -1393,6 +1488,7 @@ int NetworkAgent::get_setting_list2(std::string bundle_version, CheckFn chk_fn, 
 
 int NetworkAgent::delete_setting(std::string setting_id)
 {
+    BS_TRACE_ENTER("delete_setting");
     int ret = 0;
     if (network_agent && delete_setting_ptr) {
         ret = delete_setting_ptr(network_agent, setting_id);
@@ -1404,6 +1500,7 @@ int NetworkAgent::delete_setting(std::string setting_id)
 
 std::string NetworkAgent::get_studio_info_url()
 {
+    BS_TRACE_ENTER("get_studio_info_url");
     std::string ret;
     if (network_agent && get_studio_info_url_ptr) {
         ret = get_studio_info_url_ptr(network_agent);
@@ -1413,6 +1510,7 @@ std::string NetworkAgent::get_studio_info_url()
 
 int NetworkAgent::set_extra_http_header(std::map<std::string, std::string> extra_headers)
 {
+    BS_TRACE_ENTER("set_extra_http_header");
     int ret = 0;
     if (network_agent && set_extra_http_header_ptr) {
         ret = set_extra_http_header_ptr(network_agent, extra_headers);
@@ -1424,6 +1522,7 @@ int NetworkAgent::set_extra_http_header(std::map<std::string, std::string> extra
 
 int NetworkAgent::get_my_message(int type, int after, int limit, unsigned int* http_code, std::string* http_body)
 {
+    BS_TRACE_ENTER("get_my_message");
     int ret = 0;
     if (network_agent && get_my_message_ptr) {
         ret = get_my_message_ptr(network_agent, type, after, limit, http_code, http_body);
@@ -1435,6 +1534,7 @@ int NetworkAgent::get_my_message(int type, int after, int limit, unsigned int* h
 
 int NetworkAgent::check_user_task_report(int* task_id, bool* printable)
 {
+    BS_TRACE_ENTER("check_user_task_report");
     int ret = 0;
     if (network_agent && check_user_task_report_ptr) {
         ret = check_user_task_report_ptr(network_agent, task_id, printable);
@@ -1445,6 +1545,7 @@ int NetworkAgent::check_user_task_report(int* task_id, bool* printable)
 
 int NetworkAgent::get_user_print_info(unsigned int* http_code, std::string* http_body)
 {
+    BS_TRACE_ENTER("get_user_print_info");
     int ret = 0;
     if (network_agent && get_user_print_info_ptr) {
         ret = get_user_print_info_ptr(network_agent, http_code, http_body);
@@ -1455,6 +1556,7 @@ int NetworkAgent::get_user_print_info(unsigned int* http_code, std::string* http
 
 int NetworkAgent::get_user_tasks(TaskQueryParams params, std::string* http_body)
 {
+    BS_TRACE_ENTER("get_user_tasks");
     int ret = 0;
     if (network_agent && get_user_tasks_ptr) {
         ret = get_user_tasks_ptr(network_agent, params, http_body);
@@ -1465,6 +1567,7 @@ int NetworkAgent::get_user_tasks(TaskQueryParams params, std::string* http_body)
 
 int NetworkAgent::get_filament_spools(FilamentQueryParams params, std::string* http_body)
 {
+    BS_TRACE_ENTER("get_filament_spools");
     if (!network_agent || !get_filament_spools_ptr) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": unavailable (network_agent="
             << network_agent << " func_ptr=" << (void*)get_filament_spools_ptr << ")";
@@ -1477,6 +1580,7 @@ int NetworkAgent::get_filament_spools(FilamentQueryParams params, std::string* h
 
 int NetworkAgent::create_filament_spool(std::string request_body, std::string* http_body)
 {
+    BS_TRACE_ENTER("create_filament_spool");
     if (!network_agent || !create_filament_spool_ptr) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": unavailable (network_agent="
             << network_agent << " func_ptr=" << (void*)create_filament_spool_ptr << ")";
@@ -1489,6 +1593,7 @@ int NetworkAgent::create_filament_spool(std::string request_body, std::string* h
 
 int NetworkAgent::update_filament_spool(std::string spool_id, std::string request_body, std::string* http_body)
 {
+    BS_TRACE_ENTER("update_filament_spool");
     if (!network_agent || !update_filament_spool_ptr) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": unavailable (network_agent="
             << network_agent << " func_ptr=" << (void*)update_filament_spool_ptr << ")";
@@ -1501,6 +1606,7 @@ int NetworkAgent::update_filament_spool(std::string spool_id, std::string reques
 
 int NetworkAgent::delete_filament_spools(FilamentDeleteParams params, std::string* http_body)
 {
+    BS_TRACE_ENTER("delete_filament_spools");
     if (!network_agent || !delete_filament_spools_ptr) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": unavailable (network_agent="
             << network_agent << " func_ptr=" << (void*)delete_filament_spools_ptr << ")";
@@ -1513,6 +1619,7 @@ int NetworkAgent::delete_filament_spools(FilamentDeleteParams params, std::strin
 
 int NetworkAgent::get_filament_config(std::string* http_body)
 {
+    BS_TRACE_ENTER("get_filament_config");
     if (!network_agent || !get_filament_config_ptr) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": unavailable (network_agent="
             << network_agent << " func_ptr=" << (void*)get_filament_config_ptr << ")";
@@ -1525,6 +1632,7 @@ int NetworkAgent::get_filament_config(std::string* http_body)
 
 int NetworkAgent::get_printer_firmware(std::string dev_id, unsigned* http_code, std::string* http_body)
 {
+    BS_TRACE_ENTER("get_printer_firmware");
     int ret = 0;
     if (network_agent && get_printer_firmware_ptr) {
         ret = get_printer_firmware_ptr(network_agent, dev_id, http_code, http_body);
@@ -1535,6 +1643,7 @@ int NetworkAgent::get_printer_firmware(std::string dev_id, unsigned* http_code, 
 
 int NetworkAgent::get_task_plate_index(std::string task_id, int* plate_index)
 {
+    BS_TRACE_ENTER("get_task_plate_index");
     int ret = 0;
     if (network_agent && get_task_plate_index_ptr) {
         ret = get_task_plate_index_ptr(network_agent, task_id, plate_index);
@@ -1546,6 +1655,7 @@ int NetworkAgent::get_task_plate_index(std::string task_id, int* plate_index)
 
 int NetworkAgent::get_user_info(int* identifier)
 {
+    BS_TRACE_ENTER("get_user_info");
     int ret = 0;
     if (network_agent && get_user_info_ptr) {
         ret = get_user_info_ptr(network_agent, identifier);
@@ -1557,6 +1667,7 @@ int NetworkAgent::get_user_info(int* identifier)
 
 int NetworkAgent::request_bind_ticket(std::string* ticket)
 {
+    BS_TRACE_ENTER("request_bind_ticket");
     int ret = 0;
     if (network_agent && request_bind_ticket_ptr) {
         ret = request_bind_ticket_ptr(network_agent, ticket);
@@ -1568,6 +1679,7 @@ int NetworkAgent::request_bind_ticket(std::string* ticket)
 
 int NetworkAgent::get_subtask_info(std::string subtask_id, std::string* task_json, unsigned int* http_code, std::string* http_body)
 {
+    BS_TRACE_ENTER("get_subtask_info");
     int ret = 0;
     if (network_agent && get_subtask_info_ptr) {
         ret = get_subtask_info_ptr(network_agent, subtask_id, task_json, http_code, http_body);
@@ -1579,6 +1691,7 @@ int NetworkAgent::get_subtask_info(std::string subtask_id, std::string* task_jso
 
 int NetworkAgent::get_slice_info(std::string project_id, std::string profile_id, int plate_index, std::string* slice_json)
 {
+    BS_TRACE_ENTER("get_slice_info");
     int ret;
     if (network_agent && get_slice_info_ptr) {
         ret = get_slice_info_ptr(network_agent, project_id, profile_id, plate_index, slice_json);
@@ -1590,6 +1703,7 @@ int NetworkAgent::get_slice_info(std::string project_id, std::string profile_id,
 
 int NetworkAgent::query_bind_status(std::vector<std::string> query_list, unsigned int* http_code, std::string* http_body)
 {
+    BS_TRACE_ENTER("query_bind_status");
     int ret;
     if (network_agent && query_bind_status_ptr) {
         ret = query_bind_status_ptr(network_agent, query_list, http_code, http_body);
@@ -1601,6 +1715,7 @@ int NetworkAgent::query_bind_status(std::vector<std::string> query_list, unsigne
 
 int NetworkAgent::modify_printer_name(std::string dev_id, std::string dev_name)
 {
+    BS_TRACE_ENTER("modify_printer_name");
     int ret = 0;
     if (network_agent && modify_printer_name_ptr) {
         ret = modify_printer_name_ptr(network_agent, dev_id, dev_name);
@@ -1611,6 +1726,7 @@ int NetworkAgent::modify_printer_name(std::string dev_id, std::string dev_name)
 
 int NetworkAgent::get_camera_url(std::string dev_id, std::function<void(std::string)> callback)
 {
+    BS_TRACE_ENTER("get_camera_url");
     int ret = 0;
     if (network_agent && get_camera_url_ptr) {
         ret = get_camera_url_ptr(network_agent, dev_id, callback);
@@ -1622,6 +1738,7 @@ int NetworkAgent::get_camera_url(std::string dev_id, std::function<void(std::str
 
 int NetworkAgent::get_camera_url_for_golive(std::string dev_id, std::string sdev_id, std::function<void(std::string)> callback)
 {
+    BS_TRACE_ENTER("get_camera_url_for_golive");
     int ret = 0;
     if (network_agent && get_camera_url_for_golive_ptr) {
         ret = get_camera_url_for_golive_ptr(network_agent, dev_id, sdev_id, callback);
@@ -1633,6 +1750,7 @@ int NetworkAgent::get_camera_url_for_golive(std::string dev_id, std::string sdev
 
 int NetworkAgent::get_design_staffpick(int offset, int limit, std::function<void(std::string)> callback)
 {
+    BS_TRACE_ENTER("get_design_staffpick");
     int ret = 0;
     if (network_agent && get_design_staffpick_ptr) {
         ret = get_design_staffpick_ptr(network_agent, offset, limit, callback);
@@ -1644,6 +1762,7 @@ int NetworkAgent::get_design_staffpick(int offset, int limit, std::function<void
 
 int NetworkAgent::get_mw_user_preference(std::function<void(std::string)> callback)
 {
+    BS_TRACE_ENTER("get_mw_user_preference");
     int ret = 0;
     if (network_agent && get_mw_user_preference_ptr) {
         ret = get_mw_user_preference_ptr(network_agent,callback);
@@ -1652,8 +1771,10 @@ int NetworkAgent::get_mw_user_preference(std::function<void(std::string)> callba
     return ret;
 }
 
+
 int NetworkAgent::get_mw_user_4ulist(int seed, int limit, std::function<void(std::string)> callback)
 {
+    BS_TRACE_ENTER("get_mw_user_4ulist");
     int ret = 0;
     if (network_agent && get_mw_user_4ulist_ptr) {
         ret = get_mw_user_4ulist_ptr(network_agent,seed, limit, callback);
@@ -1664,6 +1785,7 @@ int NetworkAgent::get_mw_user_4ulist(int seed, int limit, std::function<void(std
 
 int NetworkAgent::get_hms_snapshot(std::string dev_id, std::string file_name, std::function<void(std::string, int)> callback)
 {
+    BS_TRACE_ENTER("get_hms_snapshot");
     int ret = -1;
     if (network_agent && get_hms_snapshot_ptr) {
         ret = get_hms_snapshot_ptr(network_agent, dev_id, file_name, callback);
@@ -1674,6 +1796,7 @@ int NetworkAgent::get_hms_snapshot(std::string dev_id, std::string file_name, st
 
 int NetworkAgent::start_publish(PublishParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, std::string *out)
 {
+    BS_TRACE_ENTER("start_publish");
     int ret = 0;
     if (network_agent && start_publish_ptr) {
         ret = start_publish_ptr(network_agent, params, update_fn, cancel_fn, out);
@@ -1685,6 +1808,7 @@ int NetworkAgent::start_publish(PublishParams params, OnUpdateStatusFn update_fn
 
 int NetworkAgent::get_model_publish_url(std::string* url)
 {
+    BS_TRACE_ENTER("get_model_publish_url");
     int ret = 0;
     if (network_agent && get_model_publish_url_ptr) {
         ret = get_model_publish_url_ptr(network_agent, url);
@@ -1696,6 +1820,7 @@ int NetworkAgent::get_model_publish_url(std::string* url)
 
 int NetworkAgent::get_subtask(BBLModelTask* task, OnGetSubTaskFn getsub_fn)
 {
+    BS_TRACE_ENTER("get_subtask");
     int ret = 0;
     if (network_agent && get_subtask_ptr) {
         ret = get_subtask_ptr(network_agent, task, getsub_fn);
@@ -1708,6 +1833,7 @@ int NetworkAgent::get_subtask(BBLModelTask* task, OnGetSubTaskFn getsub_fn)
 
 int NetworkAgent::get_model_mall_home_url(std::string* url)
 {
+    BS_TRACE_ENTER("get_model_mall_home_url");
     int ret = 0;
     if (network_agent && get_model_publish_url_ptr) {
         ret = get_model_mall_home_url_ptr(network_agent, url);
@@ -1719,6 +1845,7 @@ int NetworkAgent::get_model_mall_home_url(std::string* url)
 
 int NetworkAgent::get_model_mall_detail_url(std::string* url, std::string id)
 {
+    BS_TRACE_ENTER("get_model_mall_detail_url");
     int ret = 0;
     if (network_agent && get_model_publish_url_ptr) {
         ret = get_model_mall_detail_url_ptr(network_agent, url, id);
@@ -1730,6 +1857,7 @@ int NetworkAgent::get_model_mall_detail_url(std::string* url, std::string id)
 
 int NetworkAgent::get_my_profile(std::string token, unsigned int *http_code, std::string *http_body)
 {
+    BS_TRACE_ENTER("get_my_profile");
     int ret = 0;
     if (network_agent && get_my_profile_ptr) {
         ret = get_my_profile_ptr(network_agent, token, http_code, http_body);
@@ -1741,6 +1869,7 @@ int NetworkAgent::get_my_profile(std::string token, unsigned int *http_code, std
 
 int NetworkAgent::get_my_token(std::string ticket, unsigned int* http_code, std::string* http_body)
 {
+    BS_TRACE_ENTER("get_my_token");
     int ret = 0;
     if (network_agent && get_my_token_ptr) {
         ret = get_my_token_ptr(network_agent, ticket, http_code, http_body);
@@ -1752,6 +1881,7 @@ int NetworkAgent::get_my_token(std::string ticket, unsigned int* http_code, std:
 
 int NetworkAgent::track_enable(bool enable)
 {
+    BS_TRACE_ENTER("track_enable");
     enable_track = enable;
     int ret = 0;
     if (network_agent && track_enable_ptr) {
@@ -1764,6 +1894,7 @@ int NetworkAgent::track_enable(bool enable)
 
 int NetworkAgent::track_remove_files()
 {
+    BS_TRACE_ENTER("track_remove_files");
     int ret = 0;
     if (network_agent && track_remove_files_ptr) {
         ret = track_remove_files_ptr(network_agent);
@@ -1774,6 +1905,7 @@ int NetworkAgent::track_remove_files()
 
 int NetworkAgent::track_event(std::string evt_key, std::string content)
 {
+    BS_TRACE_ENTER("track_event");
     if (!this->enable_track)
         return 0;
 
@@ -1791,6 +1923,7 @@ int NetworkAgent::track_event(std::string evt_key, std::string content)
 
 int NetworkAgent::track_header(std::string header)
 {
+    BS_TRACE_ENTER("track_header");
     if (!this->enable_track)
         return 0;
     int ret = 0;
@@ -1804,6 +1937,7 @@ int NetworkAgent::track_header(std::string header)
 
 int NetworkAgent::track_update_property(std::string name, std::string value, std::string type)
 {
+    BS_TRACE_ENTER("track_update_property");
     if (!this->enable_track)
         return 0;
 
@@ -1818,6 +1952,7 @@ int NetworkAgent::track_update_property(std::string name, std::string value, std
 
 int NetworkAgent::track_get_property(std::string name, std::string& value, std::string type)
 {
+    BS_TRACE_ENTER("track_get_property");
     if (!this->enable_track)
         return 0;
 
@@ -1832,6 +1967,7 @@ int NetworkAgent::track_get_property(std::string name, std::string& value, std::
 
 int NetworkAgent::put_model_mall_rating(int rating_id, int score, std::string content, std::vector<std::string> images, unsigned int &http_code, std::string &http_error)
 {
+    BS_TRACE_ENTER("put_model_mall_rating");
     int ret = 0;
     if (network_agent && get_model_publish_url_ptr) {
         ret = put_model_mall_rating_url_ptr(network_agent, rating_id, score, content, images, http_code, http_error);
@@ -1842,6 +1978,7 @@ int NetworkAgent::put_model_mall_rating(int rating_id, int score, std::string co
 
 int NetworkAgent::get_oss_config(std::string &config, std::string country_code, unsigned int &http_code, std::string &http_error)
 {
+    BS_TRACE_ENTER("get_oss_config");
     int ret = 0;
     if (network_agent && get_oss_config_ptr) {
         ret = get_oss_config_ptr(network_agent, config, country_code, http_code, http_error);
@@ -1852,6 +1989,7 @@ int NetworkAgent::get_oss_config(std::string &config, std::string country_code, 
 
 int NetworkAgent::put_rating_picture_oss(std::string &config, std::string &pic_oss_path, std::string model_id, int profile_id, unsigned int &http_code, std::string &http_error)
 {
+    BS_TRACE_ENTER("put_rating_picture_oss");
     int ret = 0;
     if (network_agent && put_rating_picture_oss_ptr) {
         ret = put_rating_picture_oss_ptr(network_agent, config, pic_oss_path, model_id, profile_id, http_code, http_error);
@@ -1862,6 +2000,7 @@ int NetworkAgent::put_rating_picture_oss(std::string &config, std::string &pic_o
 
 int NetworkAgent::get_model_mall_rating_result(int job_id, std::string &rating_result, unsigned int &http_code, std::string &http_error)
 {
+    BS_TRACE_ENTER("get_model_mall_rating_result");
     int ret = 0;
     if (network_agent && get_model_mall_rating_result_ptr) {
         ret = get_model_mall_rating_result_ptr(network_agent, job_id, rating_result, http_code, http_error);

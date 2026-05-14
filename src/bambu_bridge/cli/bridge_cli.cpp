@@ -336,11 +336,18 @@ int cmd_announce(int argc, char** argv) {
     dev.secure    = true;
     responder.add_device(dev);
 
+    std::fprintf(stderr,
+        "[bridge-cli] announcing as %s:%u for %d s (dev_id=%s, model=%s, firmware=%s)\n",
+        lan_ip.c_str(), static_cast<unsigned>(http_port), duration,
+        dev_id.c_str(), model.c_str(), firmware.c_str());
+
     std::signal(SIGINT,  on_announce_signal);
     std::signal(SIGTERM, on_announce_signal);
 
     responder.start();
     if (!responder.running()) {
+        std::fprintf(stderr, "[bridge-cli] responder failed to start "
+                              "(port 1900 in use? need root?)\n");
         return 1;
     }
 
@@ -349,6 +356,7 @@ int cmd_announce(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     responder.stop();
+    std::fprintf(stderr, "[bridge-cli] announce stopped.\n");
     return 0;
 }
 
@@ -396,6 +404,8 @@ int cmd_broker(int argc, char** argv) {
     try {
         tls::CertFactory factory(cfg);
         cert = factory.get_or_create(dev_id);
+        std::fprintf(stderr, "[bridge-cli] minted cert fp=%s\n",
+                     cert.fingerprint_sha256.c_str());
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "bridge-cli: cert mint failed: %s\n", ex.what());
         return 1;
@@ -422,6 +432,9 @@ int cmd_broker(int argc, char** argv) {
         return 1;
     }
     const uint16_t bound = broker->bound_port(dev_id);
+    std::fprintf(stderr,
+        "[bridge-cli] broker listening on %s:%u for dev_id=%s\n",
+        bind.c_str(), bound, dev_id.c_str());
 
     std::signal(SIGINT,  on_broker_signal);
     std::signal(SIGTERM, on_broker_signal);
@@ -429,6 +442,7 @@ int cmd_broker(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     broker->stop();
+    std::fprintf(stderr, "[bridge-cli] broker stopped.\n");
     return 0;
 }
 
@@ -490,6 +504,8 @@ int cmd_lan_bridge(int argc, char** argv) {
     try {
         tls::CertFactory factory(cfg);
         cert = factory.get_or_create(dev_id);
+        std::fprintf(stderr, "[bridge-cli] minted cert fp=%s\n",
+                     cert.fingerprint_sha256.c_str());
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "bridge-cli: cert mint failed: %s\n", ex.what());
         return 1;
@@ -498,6 +514,10 @@ int cmd_lan_bridge(int argc, char** argv) {
     // 2) LanUplink first. Without a proprietary plugin handle this is a
     //    no-op — LAN now requires the plugin. The `lan-bridge` subcommand
     //    is mostly a relic of the pre-plugin LAN path; warn loudly.
+    std::fprintf(stderr,
+        "[bridge-cli] lan-bridge: LAN now routes through bambu_networking; "
+        "this subcommand will be a no-op uplink unless used together with "
+        "the 'proxy' subcommand's --plugin flag. Consider using 'proxy'.\n");
     auto lan_uplink = std::make_shared<router::LanUplink>();
     router::LanUplinkConfig lcfg;
     lcfg.dev_id       = dev_id;
@@ -542,13 +562,24 @@ int cmd_lan_bridge(int argc, char** argv) {
     responder->add_device(sdev);
     responder->start();
     if (!responder->running()) {
+        std::fprintf(stderr,
+            "[bridge-cli] WARNING: ssdp responder failed to start (port 1900 in use? need root?) — broker still up.\n");
     }
+
+    std::fprintf(stderr,
+        "[bridge-cli] lan-bridge up: dev_id=%s\n"
+        "             broker  at %s:%u  (point slicer here)\n"
+        "             uplink  to %s:%u  (real printer)\n",
+        dev_id.c_str(),
+        bind.c_str(), bound,
+        printer_ip.c_str(), static_cast<unsigned>(port));
 
     std::signal(SIGINT,  on_lanbridge_signal);
     std::signal(SIGTERM, on_lanbridge_signal);
     while (!g_lanbridge_stop) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
+    std::fprintf(stderr, "[bridge-cli] lan-bridge stopping.\n");
     if (responder) responder->stop();
     broker->stop();
     lan_uplink->remove_device(dev_id);
@@ -618,6 +649,9 @@ int cmd_cloud_bridge(int argc, char** argv) {
             plugin_path.c_str());
         return 1;
     }
+    std::fprintf(stderr, "[bridge-cli] plugin loaded; user_login=%s server_conn=%s\n",
+                 handle->is_user_login() ? "yes" : "no",
+                 handle->is_server_connected() ? "yes" : "no");
 
     // 2) Mint a self-signed cert for the bridge's MQTT broker.
     tls::CertFactoryConfig ccfg;
@@ -626,6 +660,8 @@ int cmd_cloud_bridge(int argc, char** argv) {
     try {
         tls::CertFactory factory(ccfg);
         cert = factory.get_or_create(dev_id);
+        std::fprintf(stderr, "[bridge-cli] minted cert fp=%s\n",
+                     cert.fingerprint_sha256.c_str());
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "bridge-cli: cert mint failed: %s\n", ex.what());
         return 1;
@@ -676,13 +712,24 @@ int cmd_cloud_bridge(int argc, char** argv) {
     responder->add_device(sdev);
     responder->start();
     if (!responder->running()) {
+        std::fprintf(stderr,
+            "[bridge-cli] WARNING: ssdp responder failed to start (port 1900 in use? need root?) — broker still up.\n");
     }
+
+    std::fprintf(stderr,
+        "[bridge-cli] cloud-bridge up: dev_id=%s\n"
+        "             broker  at %s:%u  (point slicer here)\n"
+        "             uplink  via cloud plugin '%s'\n",
+        dev_id.c_str(),
+        bind.c_str(), bound,
+        plugin_path.c_str());
 
     std::signal(SIGINT,  on_cloudbridge_signal);
     std::signal(SIGTERM, on_cloudbridge_signal);
     while (!g_cloudbridge_stop) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
+    std::fprintf(stderr, "[bridge-cli] cloud-bridge stopping.\n");
     if (responder) responder->stop();
     broker->stop();
     cloud_uplink->remove_device(dev_id);
@@ -709,6 +756,7 @@ public:
         if (!out) {
             r.ok            = false;
             r.error_message = "could not open " + dest.string() + " for write";
+            std::fprintf(stderr, "[ftps-cli] FAIL %s\n", r.error_message.c_str());
             return r;
         }
         if (!job.content.empty()) {
@@ -718,6 +766,10 @@ public:
         out.close();
         r.ok         = true;
         r.remote_url = "file://" + dest.string();
+        std::fprintf(stderr,
+            "[ftps-cli] saved dev=%s file=%s bytes=%zu -> %s\n",
+            job.dev_id.c_str(), job.filename.c_str(),
+            job.content.size(), dest.string().c_str());
         return r;
     }
 private:
@@ -768,6 +820,8 @@ int cmd_ftps(int argc, char** argv) {
     try {
         tls::CertFactory factory(cfg);
         cert = factory.get_or_create(dev_id);
+        std::fprintf(stderr, "[bridge-cli] minted cert fp=%s\n",
+                     cert.fingerprint_sha256.c_str());
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "bridge-cli: cert mint failed: %s\n", ex.what());
         return 1;
@@ -798,6 +852,10 @@ int cmd_ftps(int argc, char** argv) {
         return 1;
     }
     const uint16_t bound = srv->bound_port(dev_id);
+    std::fprintf(stderr,
+        "[bridge-cli] ftps listening on %s:%u for dev_id=%s\n"
+        "             uploads -> %s/\n",
+        bind.c_str(), bound, dev_id.c_str(), udir.string().c_str());
 
     std::signal(SIGINT,  on_ftps_signal);
     std::signal(SIGTERM, on_ftps_signal);
@@ -805,6 +863,7 @@ int cmd_ftps(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     srv->stop();
+    std::fprintf(stderr, "[bridge-cli] ftps stopped.\n");
     return 0;
 }
 
@@ -859,6 +918,8 @@ int cmd_rtsp(int argc, char** argv) {
     try {
         tls::CertFactory factory(cfg);
         cert = factory.get_or_create(dev_id);
+        std::fprintf(stderr, "[bridge-cli] minted cert fp=%s\n",
+                     cert.fingerprint_sha256.c_str());
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "bridge-cli: cert mint failed: %s\n", ex.what());
         return 1;
@@ -909,6 +970,11 @@ int cmd_rtsp(int argc, char** argv) {
         return 1;
     }
     const uint16_t bound = srv->bound_port(dev_id);
+    std::fprintf(stderr,
+        "[bridge-cli] rtsp listening on %s:%u for dev_id=%s (source=%s)\n"
+        "             URL: rtsps://%s:%u/streaming/live/1\n",
+        bind.c_str(), bound, dev_id.c_str(), source_kind.c_str(),
+        bind.c_str(), bound);
 
     std::signal(SIGINT,  on_rtsp_signal);
     std::signal(SIGTERM, on_rtsp_signal);
@@ -916,6 +982,7 @@ int cmd_rtsp(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     srv->stop();
+    std::fprintf(stderr, "[bridge-cli] rtsp stopped.\n");
     return 0;
 }
 
@@ -957,6 +1024,9 @@ public:
         out.close();
         r.ok         = true;
         r.remote_url = "file://" + dest.string();
+        std::fprintf(stderr, "[proxy] upload dev=%s file=%s bytes=%zu -> %s\n",
+                     job.dev_id.c_str(), job.filename.c_str(),
+                     job.content.size(), dest.string().c_str());
         return r;
     }
 private:
@@ -1025,6 +1095,8 @@ int cmd_proxy(int argc, char** argv) {
     try {
         tls::CertFactory factory(ccfg);
         cert = factory.get_or_create(dev_id);
+        std::fprintf(stderr, "[proxy] minted cert fp=%s\n",
+                     cert.fingerprint_sha256.c_str());
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "bridge-cli: cert mint failed: %s\n", ex.what());
         return 1;
@@ -1039,10 +1111,18 @@ int cmd_proxy(int argc, char** argv) {
         hcfg.country_code = country_code;
         plugin = std::make_shared<BambuNetworkingPluginHandle>(hcfg);
         if (!plugin->init()) {
+            std::fprintf(stderr,
+                "[proxy] WARNING: plugin '%s' failed to init — cloud path disabled\n",
+                plugin_path.c_str());
             plugin.reset();
         } else {
+            std::fprintf(stderr,
+                "[proxy] plugin loaded; user_login=%s server_conn=%s\n",
+                plugin->is_user_login() ? "yes" : "no",
+                plugin->is_server_connected() ? "yes" : "no");
         }
     } else {
+        std::fprintf(stderr, "[proxy] no --plugin given; LAN-only mode\n");
     }
 
     // 3) LanUplink to the real printer. The LAN side now also routes
@@ -1206,12 +1286,28 @@ int cmd_proxy(int argc, char** argv) {
     const uint16_t bound_mqtt = service.mqtt_broker() ? service.mqtt_broker()->bound_port(dev_id) : 0;
     const uint16_t bound_ftps = service.ftps_server() ? service.ftps_server()->bound_port(dev_id) : 0;
     const uint16_t bound_rtsp = service.rtsp_server() ? service.rtsp_server()->bound_port(dev_id) : 0;
+    std::fprintf(stderr,
+        "[proxy] up: dev_id=%s\n"
+        "        mqtt  %s:%u (point slicer here)\n"
+        "        ftps  %s:%u\n"
+        "        rtsp  %s:%u  (rtsps://%s:%u/streaming/live/1)\n"
+        "        uplink: LAN -> %s:%u + cloud=%s\n"
+        "        uploads -> %s/\n",
+        dev_id.c_str(),
+        bind.c_str(), bound_mqtt,
+        bind.c_str(), bound_ftps,
+        bind.c_str(), bound_rtsp,
+        bind.c_str(), bound_rtsp,
+        printer_ip.c_str(), static_cast<unsigned>(printer_mqtt_port),
+        cloud_uplink ? "on" : "off",
+        udir.string().c_str());
 
     std::signal(SIGINT,  on_proxy_signal);
     std::signal(SIGTERM, on_proxy_signal);
     while (!g_proxy_stop) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
+    std::fprintf(stderr, "[proxy] stopping.\n");
     service.stop();
     lan_uplink->remove_device(dev_id);
     if (cloud_uplink) cloud_uplink->remove_device(dev_id);

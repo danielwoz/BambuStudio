@@ -69,6 +69,9 @@ void BridgeStorageBackend::send_request(const std::string& real_dev_id,
                                         nlohmann::json     request_body,
                                         ReplyCallback      cb) {
     if (real_dev_id.empty()) {
+        std::fprintf(stderr,
+            "[bridge-storage] send_request with empty real_dev_id — "
+            "refusing\n");
         if (cb) cb(/*ERROR_PIPE*/3, nlohmann::json::object());
         return;
     }
@@ -96,6 +99,9 @@ void BridgeStorageBackend::send_request(const std::string& real_dev_id,
     auto enqueue_send = [entry, cmdtype, req = std::move(request_body),
                          cb = std::move(cb), dev_id = real_dev_id]() {
         if (!entry->fs) {
+            std::fprintf(stderr,
+                "[bridge-storage] dev_id=%s: PFS gone before send, "
+                "firing ERROR_PIPE\n", dev_id.c_str());
             if (cb) cb(/*ERROR_PIPE*/3, nlohmann::json::object());
             return;
         }
@@ -131,6 +137,10 @@ void BridgeStorageBackend::send_request(const std::string& real_dev_id,
                 mo = dev->get_my_machine(real_dev_id);
             }
             if (!mo) {
+                std::fprintf(stderr,
+                    "[bridge-storage] dev_id=%s: not in DeviceManager — "
+                    "can't resolve URL; failing\n",
+                    real_dev_id.c_str());
                 std::vector<std::function<void()>> drain;
                 drain.swap(entry->pending_sends);
                 for (auto& fn : drain) (void) fn;  // no-ops; cbs already fired via ERROR_PIPE below
@@ -140,8 +150,15 @@ void BridgeStorageBackend::send_request(const std::string& real_dev_id,
                 [entry, real_dev_id](std::string url,
                                      ::Slic3r::GUI::MediaUrlError err) {
                     if (err != ::Slic3r::GUI::MediaUrlError::Ok) {
+                        std::fprintf(stderr,
+                            "[bridge-storage] dev_id=%s: URL resolution "
+                            "failed err=%d\n",
+                            real_dev_id.c_str(), int(err));
                         return;
                     }
+                    std::fprintf(stderr,
+                        "[bridge-storage] dev_id=%s: resolved url=%s\n",
+                        real_dev_id.c_str(), url.c_str());
                     entry->url = url;
                     // Push directly into PFS so we don't depend on
                     // catching the next Initializing event — when
@@ -151,6 +168,10 @@ void BridgeStorageBackend::send_request(const std::string& real_dev_id,
                     // any thread.
                     if (entry->fs) entry->fs->SetUrl(url);
                 });
+            std::fprintf(stderr,
+                "[bridge-storage] dev_id=%s: creating PFS (url=%s)\n",
+                real_dev_id.c_str(),
+                entry->url.empty() ? "<pending>" : entry->url.c_str());
             entry->fs = boost::shared_ptr<PrinterFileSystem>(new PrinterFileSystem());
             entry->fs->Attached();
             // Match MediaFilePanel's PFS-setup pattern exactly. The
@@ -186,6 +207,12 @@ void BridgeStorageBackend::send_request(const std::string& real_dev_id,
                     auto entry = wentry.lock();
                     if (!entry) return;
                     const int status = e.GetInt();
+                    std::fprintf(stderr,
+                        "[bridge-storage] dev_id=%s: PFS status -> %d "
+                        "(pending=%zu ready=%d)\n",
+                        dev_id_log.c_str(), status,
+                        entry->pending_sends.size(),
+                        entry->ready ? 1 : 0);
                     if (status == PrinterFileSystem::Initializing) {
                         // PFS' Reconnect() calls m_messages.clear() at the
                         // very top of its work loop, so any URL pushed
@@ -194,6 +221,10 @@ void BridgeStorageBackend::send_request(const std::string& real_dev_id,
                         // pushing the URL only *after* the Initializing
                         // event fires. Mirror that pattern here.
                         if (entry->fs && !entry->url.empty()) {
+                            std::fprintf(stderr,
+                                "[bridge-storage] dev_id=%s: pushing URL on "
+                                "Initializing\n",
+                                dev_id_log.c_str());
                             entry->fs->SetUrl(entry->url);
                         }
                     } else if (status == PrinterFileSystem::ListSyncing) {

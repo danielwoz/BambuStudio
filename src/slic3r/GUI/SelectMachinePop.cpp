@@ -18,6 +18,7 @@
 #include "Widgets/StaticBox.hpp"
 #include "ConnectPrinter.hpp"
 
+
 #include <wx/progdlg.h>
 #include <wx/clipbrd.h>
 #include <wx/dcgraph.h>
@@ -42,6 +43,7 @@ wxDEFINE_EVENT(EVT_DISSMISS_MACHINE_LIST, wxCommandEvent);
 wxDEFINE_EVENT(EVT_CONNECT_LAN_PRINT, wxCommandEvent);
 wxDEFINE_EVENT(EVT_EDIT_PRINT_NAME, wxCommandEvent);
 wxDEFINE_EVENT(EVT_CLEAR_IPADDRESS, wxCommandEvent);
+
 
 #define INITIAL_NUMBER_OF_MACHINES 0
 #define LIST_REFRESH_INTERVAL 200
@@ -90,6 +92,7 @@ MachineObjectPanel::MachineObjectPanel(wxWindow *parent, wxWindowID id, const wx
 #endif
 
 }
+
 
 MachineObjectPanel::~MachineObjectPanel() {}
 
@@ -199,6 +202,7 @@ void MachineObjectPanel::doRender(wxDC &dc)
     }
 
     dc.DrawText(finally_name, wxPoint(left, (size.y - sizet.y) / 2));
+
 
     if (m_hover || m_is_macos_special_version) {
 
@@ -311,6 +315,7 @@ SelectMachinePopup::SelectMachinePopup(wxWindow *parent)
     SetDoubleBuffered(true);
 #endif //__WINDOWS__
 
+
     SetSize(SELECT_MACHINE_POPUP_SIZE);
     SetMinSize(SELECT_MACHINE_POPUP_SIZE);
     SetMaxSize(SELECT_MACHINE_POPUP_SIZE);
@@ -318,6 +323,8 @@ SelectMachinePopup::SelectMachinePopup(wxWindow *parent)
     Freeze();
     wxBoxSizer *m_sizer_main = new wxBoxSizer(wxVERTICAL);
     SetBackgroundColour(SELECT_MACHINE_GREY400);
+
+
 
     m_scrolledWindow = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition, SELECT_MACHINE_LIST_SIZE, wxHSCROLL | wxVSCROLL);
     m_scrolledWindow->SetBackgroundColour(*wxWHITE);
@@ -342,6 +349,7 @@ SelectMachinePopup::SelectMachinePopup(wxWindow *parent)
     m_sizer_my_devices    = new wxBoxSizer(wxVERTICAL);
     auto other_title      = create_title_panel(_L("Other Device"));
     m_sizer_other_devices = new wxBoxSizer(wxVERTICAL);
+
 
     m_panel_ping_code = new PinCodePanel(m_scrolledWindow, 0, wxID_ANY, wxDefaultPosition, SELECT_MACHINE_ITEM_SIZE);
     m_panel_direct_connection = new PinCodePanel(m_scrolledWindow, 1, wxID_ANY, wxDefaultPosition, SELECT_MACHINE_ITEM_SIZE);
@@ -594,6 +602,7 @@ void SelectMachinePopup::update_other_devices()
     m_hyperlink = new wxHyperlinkCtrl(m_placeholder_panel, wxID_ANY, _L("Can't find my devices?"), wxT("https://wiki.bambulab.com/en/software/bambu-studio/failed-to-connect-printer"), wxDefaultPosition, wxDefaultSize, wxHL_DEFAULT_STYLE);
     placeholder_sizer->Add(m_hyperlink, 0, wxALIGN_CENTER | wxALL, 5);
 
+
     m_placeholder_panel->SetSizer(placeholder_sizer);
     m_placeholder_panel->Layout();
     placeholder_sizer->Fit(m_placeholder_panel);
@@ -705,6 +714,9 @@ void SelectMachinePopup::update_user_devices()
                         Slic3r::VirtualLanPrinterStore store;
                         store.remove(dev_id);
                         dev->erase_local_machine(dev_id);
+                        std::fprintf(stderr,
+                            "[virtual-store] removed dev_id=%s\n",
+                            dev_id.c_str());
                     }
                 }
 
@@ -894,6 +906,7 @@ EditDevNameDialog::EditDevNameDialog(Plater *plater /*= nullptr*/)
     m_static_valid->SetFont(::Label::Body_13);
     m_static_valid->SetForegroundColour(wxColour(255, 111, 0));
     m_sizer_main->Add(m_static_valid, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP | wxLEFT | wxRIGHT, FromDIP(10));
+
 
     m_button_confirm = new Button(this, _L("Confirm"));
     StateColor btn_bg_green(std::pair<wxColour, int>(wxColour(27, 136, 68), StateColor::Pressed), std::pair<wxColour, int>(wxColour(0, 174, 66), StateColor::Normal));

@@ -88,10 +88,14 @@ std::unique_ptr<RtspServer> try_start(const std::string& bind_ip,
         srv->add_device(d);
         srv->start();
     } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[rtsp-loopback] start at %s:%u failed: %s\n",
+                     bind_ip.c_str(), port, ex.what());
         return nullptr;
     }
     bound_out = srv->bound_port(d.dev_id);
     if (bound_out == 0) { srv->stop(); return nullptr; }
+    std::fprintf(stderr, "[rtsp-loopback] bound %s:%u\n",
+                 bind_ip.c_str(), bound_out);
     return srv;
 }
 
@@ -193,6 +197,8 @@ int main() {
     std::vector<RtpFrame> frames;
     c.read_interleaved_rtp(frames, /*max_frames=*/8,
                            /*deadline=*/std::chrono::seconds(2));
+    std::fprintf(stderr, "[rtsp-loopback] received %zu interleaved frames\n",
+                 frames.size());
     check(frames.size() >= 3, "received at least 3 interleaved RTP frames");
 
     int valid = 0;

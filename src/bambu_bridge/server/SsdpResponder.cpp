@@ -406,6 +406,10 @@ void SsdpResponder::emit_notify(bool alive) {
             if (verbose) {
                 std::lock_guard<std::mutex> lk(sm);
                 if (dumped.insert(dev.dev_id).second) {
+                    std::fprintf(stderr,
+                        "[ssdp-responder] outbound NOTIFY for dev_id=%s "
+                        "(first-occurrence dump, %zu bytes):\n%s",
+                        dev.dev_id.c_str(), body.size(), body.c_str());
                 }
             }
         }
