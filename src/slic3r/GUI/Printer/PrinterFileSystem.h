@@ -16,6 +16,13 @@ using nlohmann::json;
 #include <functional>
 #include <deque>
 
+// Forward decl so PrinterFileSystem can friend the bridge's storage backend.
+// The backend reaches into PFS' private SendRequest(int, json, callback_t2)
+// to delegate the bridge's virtual-storage JSON-RPC to PFS' proven
+// libBambuSource consumer instead of replicating the call pattern in the
+// bridge.
+namespace Slic3r { namespace bridge { class BridgeStorageBackend; } }
+
 wxDECLARE_EVENT(EVT_STATUS_CHANGED, wxCommandEvent);
 wxDECLARE_EVENT(EVT_MODE_CHANGED, wxCommandEvent);
 wxDECLARE_EVENT(EVT_FILE_CHANGED, wxCommandEvent);
@@ -337,6 +344,12 @@ private:
         };
         InstallNotify(type, c);
     }
+
+    // The bridge's BridgeStorageBackend delegates virtual-storage JSON-RPC
+    // to this method (matching the slicer's own MediaFilePanel call
+    // pattern verbatim) instead of replicating the libBambuSource
+    // protocol against the real printer port 6000.
+    friend class Slic3r::bridge::BridgeStorageBackend;
 
     boost::uint32_t SendRequest(int type, json const &req, callback_t2 const &callback, const std::string &param = "");
 

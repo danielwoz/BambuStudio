@@ -10,9 +10,23 @@
 #include "libslic3r/Utils.hpp"
 #include "slic3r/Utils/BBLUtil.hpp"
 #include "NetworkAgent.hpp"
+#include "VirtualMqttClient.hpp"
+#include "VirtualFtpsClient.hpp"
 
 #include "slic3r/Utils/FileTransferUtils.hpp"
 #include "slic3r/Utils/CertificateVerify.hpp"
+
+#if defined(BAMBU_BRIDGE_HARNESS_ENABLE)
+// Pulled in only when the harness build option is set. The ShimRecorder
+// is process-wide; the wrap function defined near the bottom of this
+// file rewrites NetworkAgent::*_ptr to point at recording trampolines.
+#include "harness/ShimRecorder.hpp"
+namespace Slic3r {
+// Forward declaration so initialize_network_module can call into the
+// wrap helper without dragging the trampolines up the file.
+void bb_harness_wrap_network_agent_pointers();
+}
+#endif
 
 using namespace BBL;
 
@@ -27,7 +41,6 @@ static HMODULE source_module = NULL;
 static void* networking_module = NULL;
 static void* source_module = NULL;
 #endif
-
 
 func_check_debug_consistent         NetworkAgent::check_debug_consistent_ptr = nullptr;
 func_get_version                    NetworkAgent::get_version_ptr = nullptr;
@@ -179,7 +192,6 @@ std::string NetworkAgent::get_libpath_in_current_directory(std::string library_n
 #endif
     return lib_path;
 }
-
 
 int NetworkAgent::initialize_network_module(bool using_backup, bool validate_cert)
 {
@@ -390,6 +402,14 @@ int NetworkAgent::initialize_network_module(bool using_backup, bool validate_cer
     get_mw_user_preference_ptr = reinterpret_cast<func_get_mw_user_preference>(get_network_function("bambu_network_get_mw_user_preference"));
     get_mw_user_4ulist_ptr     = reinterpret_cast<func_get_mw_user_4ulist>(get_network_function("bambu_network_get_mw_user_4ulist"));
     get_hms_snapshot_ptr              = reinterpret_cast<func_get_hms_snapshot>(get_network_function("bambu_network_get_hms_snapshot"));
+
+#if defined(BAMBU_BRIDGE_HARNESS_ENABLE)
+    // Harness ShimRecorder: replace the 10 function pointers listed in
+    // test_harness_plan.md §7 with recording trampolines. The wrap is
+    // a no-op until BAMBU_BRIDGE_SHIM env var is set + ShimRecorder
+    // is enabled — see bb_harness_wrap_network_agent_pointers below.
+    bb_harness_wrap_network_agent_pointers();
+#endif
 
     return 0;
 }
@@ -753,7 +773,23 @@ int NetworkAgent::set_on_message_fn(OnMessageFn fn)
 {
     int ret = 0;
     if (network_agent && set_on_message_fn_ptr) {
-        ret = set_on_message_fn_ptr(network_agent, fn);
+        // Wrap with the bridge tap. The slicer's `fn` runs first, then
+        // the in-GUI bridge (if attached) sees a copy for non-virtual
+        // dev_ids. Tap is sampled under m_bridge_tap_mu at fire time
+        // so it can be detached at runtime without recompiling the
+        // wrapper.
+        OnMessageFn wrapped =
+            [this, fn](std::string dev_id, std::string msg) {
+                if (fn) fn(dev_id, msg);
+                BridgeMessageTap tap;
+                {
+                    std::lock_guard<std::mutex> lk(m_bridge_tap_mu);
+                    tap = m_bridge_tap;
+                }
+                if (tap && !is_virtual_dev_id(dev_id))
+                    tap(dev_id, msg, /*is_local=*/false);
+            };
+        ret = set_on_message_fn_ptr(network_agent, wrapped);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
     }
@@ -773,9 +809,32 @@ int NetworkAgent::set_on_user_message_fn(OnMessageFn fn)
 
 int NetworkAgent::set_on_local_connect_fn(OnLocalConnectedFn fn)
 {
+    // Capture so the VirtualMqttClient path can fire it too when a
+    // virtual-dev_id session comes up or drops.
+    m_local_connect_cb = fn;
     int ret = 0;
     if (network_agent && set_on_local_connect_fn_ptr) {
-        ret = set_on_local_connect_fn_ptr(network_agent, fn);
+        // Plugin-side SSDP auto-discovery tries to LAN-MQTT-connect
+        // to our bridge's broadcast (DevConnect: lan), fails cert
+        // verification (Bambu CA chain), then fires this callback
+        // with state=Failed for the virtual dev_id. GUI_App's handler
+        // sees Failed + is_lan_mode_printer() and calls
+        // erase_local_machine — which yanks our entry out of the UI
+        // a few seconds after we add it.
+        //
+        // Filter: drop plugin-originating callbacks for virtual
+        // dev_ids. VirtualMqttClient::session_loop fires the same
+        // user callback directly for virtual sessions, with state
+        // derived from its own MQTT layer (which uses verify=false
+        // and actually connects).
+        OnLocalConnectedFn wrapped =
+            [fn](int state, std::string dev_id, std::string msg) {
+                if (is_virtual_dev_id(dev_id)) {
+                    return;
+                }
+                if (fn) fn(state, dev_id, msg);
+            };
+        ret = set_on_local_connect_fn_ptr(network_agent, wrapped);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
     }
@@ -784,13 +843,37 @@ int NetworkAgent::set_on_local_connect_fn(OnLocalConnectedFn fn)
 
 int NetworkAgent::set_on_local_message_fn(OnMessageFn fn)
 {
+    // Capture so the VirtualMqttClient path can fire it too on
+    // device/<virtual_sn>/report messages.
+    m_local_message_cb = fn;
     int ret = 0;
     if (network_agent && set_on_local_message_fn_ptr) {
-        ret = set_on_local_message_fn_ptr(network_agent, fn);
+        // Same filter as set_on_local_connect_fn: drop any plugin-
+        // originating messages for virtual dev_ids. VirtualMqttClient
+        // owns the inbound path for those. After dispatching to the
+        // slicer, fan a copy out to the in-GUI bridge tap if attached.
+        OnMessageFn wrapped =
+            [this, fn](std::string dev_id, std::string msg) {
+                if (is_virtual_dev_id(dev_id)) return;
+                if (fn) fn(dev_id, msg);
+                BridgeMessageTap tap;
+                {
+                    std::lock_guard<std::mutex> lk(m_bridge_tap_mu);
+                    tap = m_bridge_tap;
+                }
+                if (tap) tap(dev_id, msg, /*is_local=*/true);
+            };
+        ret = set_on_local_message_fn_ptr(network_agent, wrapped);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
     }
     return ret;
+}
+
+void NetworkAgent::set_bridge_message_tap(BridgeMessageTap tap)
+{
+    std::lock_guard<std::mutex> lk(m_bridge_tap_mu);
+    m_bridge_tap = std::move(tap);
 }
 
 int NetworkAgent::set_queue_on_main_fn(QueueOnMainFn fn)
@@ -901,29 +984,53 @@ int NetworkAgent::send_message(std::string dev_id, std::string json_str, int qos
 
 int NetworkAgent::connect_printer(std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl)
 {
+    if (is_virtual_dev_id(dev_id)) {
+        auto& vc = ::Slic3r::VirtualMqttClient::instance();
+        vc.set_on_local_connect(m_local_connect_cb);
+        vc.set_on_message      (m_local_message_cb);
+        int rc = vc.connect_printer(dev_id, dev_ip, /*access_code=*/password);
+        if (rc == 0) m_current_local_dev_id = dev_id;
+        return rc;
+    }
     int ret = 0;
     if (network_agent && connect_printer_ptr) {
         ret = connect_printer_ptr(network_agent, dev_id, dev_ip, username, password, use_ssl);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ <<
             (boost::format(" error: network_agent=%1%, ret=%2%, dev_id=%3%, dev_ip=%4%, username=%5%, password=%6%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(dev_id) %BBLCrossTalk::Crosstalk_DevIP(dev_ip) %username %password).str();
+        else
+            m_current_local_dev_id = dev_id;
     }
     return ret;
 }
 
 int NetworkAgent::disconnect_printer()
 {
+    // disconnect_printer is dev-id-less (the plugin only holds one LAN
+    // session at a time). Route based on the dev_id we recorded at
+    // the most-recent connect_printer.
+    if (is_virtual_dev_id(m_current_local_dev_id)) {
+        const std::string id = m_current_local_dev_id;
+        m_current_local_dev_id.clear();
+        return ::Slic3r::VirtualMqttClient::instance().disconnect_printer(id);
+    }
     int ret = 0;
     if (network_agent && disconnect_printer_ptr) {
         ret = disconnect_printer_ptr(network_agent);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") %network_agent %ret;
+        else
+            m_current_local_dev_id.clear();
     }
     return ret;
 }
 
 int NetworkAgent::send_message_to_printer(std::string dev_id, std::string json_str, int qos, int flag)
 {
+    if (is_virtual_dev_id(dev_id)) {
+        return ::Slic3r::VirtualMqttClient::instance()
+            .send_message(dev_id, json_str, qos);
+    }
     int ret = 0;
     if (network_agent && send_message_to_printer_ptr) {
         ret = send_message_to_printer_ptr(network_agent, dev_id, json_str, qos, flag);
@@ -1175,6 +1282,33 @@ int NetworkAgent::start_local_print_with_record(PrintParams params, OnUpdateStat
 
 int NetworkAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+    if (is_virtual_dev_id(params.dev_id)) {
+        ::Slic3r::virtual_ftps::UploadParams up;
+        up.host        = params.dev_ip;
+        // Default high port — slicer never sees this; the bridge picks
+        // it. Keep in sync with BridgeAppConfig::ftps_port_base.
+        up.port        = 39990;
+        up.user        = params.username.empty() ? "bblp" : params.username;
+        up.pass        = params.password;
+        up.local_path  = params.filename;
+        up.remote_name = params.ftp_file.empty() ? params.dst_file
+                                                 : params.ftp_file;
+        ::Slic3r::virtual_ftps::ProgressFn  prog = nullptr;
+        ::Slic3r::virtual_ftps::CancelledFn canc = nullptr;
+        if (update_fn) {
+            prog = [update_fn](int pct, std::string msg) {
+                // Plugin signature is (status, code, msg). Slicer
+                // reads `status` as percent and `msg` as label; `code`
+                // is a sub-status not relevant for virtual uploads.
+                update_fn(pct, /*code=*/0, msg);
+            };
+        }
+        if (cancel_fn) {
+            canc = [cancel_fn]() -> bool { return cancel_fn(); };
+        }
+        const int rc = ::Slic3r::virtual_ftps::upload(up, prog, canc);
+        return rc;
+    }
     int ret = 0;
     if (network_agent && start_send_gcode_to_sdcard_ptr) {
         ret = start_send_gcode_to_sdcard_ptr(network_agent, params, update_fn, cancel_fn, wait_fn);
@@ -1518,7 +1652,6 @@ int NetworkAgent::get_mw_user_preference(std::function<void(std::string)> callba
     return ret;
 }
 
-
 int NetworkAgent::get_mw_user_4ulist(int seed, int limit, std::function<void(std::string)> callback)
 {
     int ret = 0;
@@ -1736,5 +1869,204 @@ int NetworkAgent::get_model_mall_rating_result(int job_id, std::string &rating_r
     }
     return ret;
 }
+
+#if defined(BAMBU_BRIDGE_HARNESS_ENABLE)
+// ---- Harness ShimRecorder wrap -------------------------------------------
+//
+// Replace the 10 NetworkAgent::*_ptr statics listed in
+// test_harness_plan.md §7 with recording trampolines. The replacement
+// is unconditional at link time; the trampoline itself short-circuits
+// when ShimRecorder is inactive, so the runtime cost is one atomic-bool
+// load + one indirect call when the harness is OFF.
+//
+// File-scope statics hold the captured real pointers. Plain free
+// functions stay ABI-compatible with the `func_*` typedefs in
+// NetworkAgent.hpp (the proprietary plugin invokes via these slots).
+namespace {
+
+using bridge::harness::ShimRecorder;
+using bridge::harness::TraceLib;
+
+// Captured originals. Initialised once inside the wrap function below.
+static func_connect_server               s_real_connect_server               = nullptr;
+static func_is_server_connected          s_real_is_server_connected          = nullptr;
+static func_set_on_message_fn            s_real_set_on_message_fn            = nullptr;
+static func_set_on_server_connected_fn   s_real_set_on_server_connected_fn   = nullptr;
+static func_start_subscribe              s_real_start_subscribe              = nullptr;
+static func_stop_subscribe               s_real_stop_subscribe               = nullptr;
+static func_add_subscribe                s_real_add_subscribe                = nullptr;
+static func_del_subscribe                s_real_del_subscribe                = nullptr;
+static func_send_message_to_printer      s_real_send_message_to_printer      = nullptr;
+static func_get_user_print_info          s_real_get_user_print_info          = nullptr;
+static func_get_camera_url               s_real_get_camera_url               = nullptr;
+static bool                              s_wrapped                           = false;
+
+// Wrapping trampolines. Each records a TraceLine, forwards to the real
+// pointer (if non-null; the slicer tolerates missing exports), then
+// records the return value.
+
+static int bb_connect_server(void* agent) {
+    int rc = s_real_connect_server ? s_real_connect_server(agent) : -1;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "connect_server", nlohmann::json::object(), rc);
+    return rc;
+}
+
+static bool bb_is_server_connected(void* agent) {
+    bool ok = s_real_is_server_connected ? s_real_is_server_connected(agent) : false;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "is_server_connected", nlohmann::json::object(), ok);
+    return ok;
+}
+
+static int bb_set_on_message_fn(void* agent, OnMessageFn fn) {
+    // Use the std::function's target_type() as a poor-man's identity key
+    // (std::function objects are not addressable, but the wrapped target
+    // typically is). Falls back to a fresh id per call when target() is
+    // null, which is fine — every distinct registration gets a distinct id.
+    const void* key = nullptr;
+    if (fn) key = fn.target<void(*)(std::string, std::string)>();
+    const std::int64_t cb_id = ShimRecorder::instance().callback_id_for(key);
+    int rc = s_real_set_on_message_fn ? s_real_set_on_message_fn(agent, fn) : -1;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "set_on_message_fn",
+        nlohmann::json{{"_callback", "OnMessageFn"}, {"id", cb_id}},
+        rc);
+    return rc;
+}
+
+static int bb_set_on_server_connected_fn(void* agent, OnServerConnectedFn fn) {
+    const void* key = nullptr;
+    if (fn) key = fn.target<void(*)(int, int)>();
+    const std::int64_t cb_id = ShimRecorder::instance().callback_id_for(key);
+    int rc = s_real_set_on_server_connected_fn ? s_real_set_on_server_connected_fn(agent, fn) : -1;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "set_on_server_connected_fn",
+        nlohmann::json{{"_callback", "OnServerConnectedFn"}, {"id", cb_id}},
+        rc);
+    return rc;
+}
+
+static int bb_start_subscribe(void* agent, std::string module) {
+    int rc = s_real_start_subscribe ? s_real_start_subscribe(agent, module) : -1;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "start_subscribe", nlohmann::json{{"module", module}}, rc);
+    return rc;
+}
+
+static int bb_stop_subscribe(void* agent, std::string module) {
+    int rc = s_real_stop_subscribe ? s_real_stop_subscribe(agent, module) : -1;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "stop_subscribe", nlohmann::json{{"module", module}}, rc);
+    return rc;
+}
+
+static int bb_add_subscribe(void* agent, std::vector<std::string> dev_list) {
+    int rc = s_real_add_subscribe ? s_real_add_subscribe(agent, dev_list) : -1;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "add_subscribe", nlohmann::json{{"dev_list", dev_list}}, rc);
+    return rc;
+}
+
+static int bb_del_subscribe(void* agent, std::vector<std::string> dev_list) {
+    int rc = s_real_del_subscribe ? s_real_del_subscribe(agent, dev_list) : -1;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "del_subscribe", nlohmann::json{{"dev_list", dev_list}}, rc);
+    return rc;
+}
+
+static int bb_send_message_to_printer(void* agent, std::string dev_id,
+                                      std::string json_str, int qos, int flag) {
+    int rc = s_real_send_message_to_printer
+        ? s_real_send_message_to_printer(agent, dev_id, json_str, qos, flag)
+        : -1;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "send_message_to_printer",
+        nlohmann::json{
+            {"dev_id", dev_id},
+            {"json_str", json_str},
+            {"qos", qos},
+            {"flag", flag}},
+        rc);
+    return rc;
+}
+
+static int bb_get_user_print_info(void* agent, unsigned int* http_code,
+                                  std::string* http_body) {
+    int rc = s_real_get_user_print_info
+        ? s_real_get_user_print_info(agent, http_code, http_body)
+        : -1;
+    nlohmann::json out = nlohmann::json::object();
+    if (http_code) out["http_code"] = *http_code;
+    if (http_body) out["http_body"] = *http_body;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "get_user_print_info", nlohmann::json::object(), rc, out);
+    return rc;
+}
+
+static int bb_get_camera_url(void* agent, std::string dev_id,
+                             std::function<void(std::string)> callback) {
+    const std::int64_t cb_id =
+        ShimRecorder::instance().callback_id_for(
+            callback ? callback.target<void(*)(std::string)>() : nullptr);
+    // Wrap the user's callback so the URL it gets is also recorded.
+    auto wrapped_cb = [cb_id, callback](std::string url) {
+        ShimRecorder::instance().record(TraceLib::BambuNetworking,
+            "get_camera_url.callback",
+            nlohmann::json{{"url", url}},
+            nlohmann::json(),
+            nlohmann::json::object(), 0, cb_id);
+        if (callback) callback(std::move(url));
+    };
+    int rc = s_real_get_camera_url
+        ? s_real_get_camera_url(agent, dev_id, wrapped_cb)
+        : -1;
+    ShimRecorder::instance().record(TraceLib::BambuNetworking,
+        "get_camera_url",
+        nlohmann::json{{"dev_id", dev_id},
+                       {"_callback", "GetCameraUrlCb"},
+                       {"id", cb_id}},
+        rc);
+    return rc;
+}
+
+} // anonymous namespace
+
+void bb_harness_wrap_network_agent_pointers() {
+    if (s_wrapped) return;
+    s_wrapped = true;
+
+    // Capture originals (any may legitimately be nullptr; the trampoline
+    // tolerates that). Then re-point the static slots at the trampolines.
+    s_real_connect_server             = NetworkAgent::connect_server_ptr;
+    s_real_is_server_connected        = NetworkAgent::is_server_connected_ptr;
+    s_real_set_on_message_fn          = NetworkAgent::set_on_message_fn_ptr;
+    s_real_set_on_server_connected_fn = NetworkAgent::set_on_server_connected_fn_ptr;
+    s_real_start_subscribe            = NetworkAgent::start_subscribe_ptr;
+    s_real_stop_subscribe             = NetworkAgent::stop_subscribe_ptr;
+    s_real_add_subscribe              = NetworkAgent::add_subscribe_ptr;
+    s_real_del_subscribe              = NetworkAgent::del_subscribe_ptr;
+    s_real_send_message_to_printer    = NetworkAgent::send_message_to_printer_ptr;
+    s_real_get_user_print_info        = NetworkAgent::get_user_print_info_ptr;
+    s_real_get_camera_url             = NetworkAgent::get_camera_url_ptr;
+
+    NetworkAgent::connect_server_ptr             = &bb_connect_server;
+    NetworkAgent::is_server_connected_ptr        = &bb_is_server_connected;
+    NetworkAgent::set_on_message_fn_ptr          = &bb_set_on_message_fn;
+    NetworkAgent::set_on_server_connected_fn_ptr = &bb_set_on_server_connected_fn;
+    NetworkAgent::start_subscribe_ptr            = &bb_start_subscribe;
+    NetworkAgent::stop_subscribe_ptr             = &bb_stop_subscribe;
+    NetworkAgent::add_subscribe_ptr              = &bb_add_subscribe;
+    NetworkAgent::del_subscribe_ptr              = &bb_del_subscribe;
+    NetworkAgent::send_message_to_printer_ptr    = &bb_send_message_to_printer;
+    NetworkAgent::get_user_print_info_ptr        = &bb_get_user_print_info;
+    NetworkAgent::get_camera_url_ptr             = &bb_get_camera_url;
+
+    // Honour the env var: if BAMBU_BRIDGE_SHIM=1 is set and a path is
+    // not already opened, open one now. Tests that drive ShimRecorder
+    // directly can also call enable() first — this is idempotent.
+    ShimRecorder::instance().enable_from_env();
+}
+#endif // BAMBU_BRIDGE_HARNESS_ENABLE
 
 } //namespace

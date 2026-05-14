@@ -61,7 +61,6 @@
 #include "DeviceCore/DevManager.h"
 #include "DeviceCore/DevUtil.h"
 
-
 #define CALI_DEBUG
 #define MINUTE_30 1800000    //ms
 #define TIME_OUT  5000       //ms
@@ -603,7 +602,6 @@ MachineObject::MachineObject(DeviceManager* manager, NetworkAgent* agent, std::s
 
     has_ipcam = true; // default true
 
-
     auto vslot = DevAmsTray(std::to_string(VIRTUAL_TRAY_MAIN_ID));
     vt_slot.push_back(vslot);
 
@@ -726,7 +724,6 @@ bool MachineObject::is_extrusion_cali_finished()
     else
         return false;
 }
-
 
 DevAmsTray *MachineObject::get_curr_tray()
 {
@@ -1015,7 +1012,6 @@ void MachineObject::parse_home_flag(int flag)
 
     is_220V_voltage = ((flag >> 3) & 0x1) != 0;
 
-
     camera_recording            = ((flag >> 5) & 0x1) != 0;
 
     if (time(nullptr) - ams_user_setting_start > HOLD_COUNT_MAX)
@@ -1025,7 +1021,6 @@ void MachineObject::parse_home_flag(int flag)
 
    // sdcard_state = MachineObject::SdcardState(get_flag_bits(flag, 8, 2));
    m_storage->set_sdcard_state(get_flag_bits(flag, 8, 2));
-
 
     if (time(nullptr) - ams_switch_filament_start > HOLD_TIME_3SEC)
     {
@@ -1037,9 +1032,6 @@ void MachineObject::parse_home_flag(int flag)
 
     is_support_pa_calibration = ((flag >> 16) & 0x1) != 0;
     if (this->is_series_p()) { is_support_pa_calibration = false; } // todo: Temp modification due to incorrect machine push message for P
-
-
-
 
     /*if(!is_support_motor_noise_cali){
         is_support_motor_noise_cali = ((flag >> 21) & 0x1) != 0;
@@ -1128,8 +1120,6 @@ bool MachineObject::is_sdcard_printing()
     else
         return false;
 }
-
-
 
 bool MachineObject::is_timelapse()
 {
@@ -1223,7 +1213,6 @@ int MachineObject::command_get_access_code() {
 
     return this->publish_json(j);
 }
-
 
 int MachineObject::command_request_push_all(bool request_now)
 {
@@ -1645,7 +1634,6 @@ int MachineObject::command_ams_refresh_rfid2(int ams_id,  int slot_id)
     return this->publish_json(j);
 }
 
-
 int MachineObject::command_ams_select_tray(std::string tray_id)
 {
     std::string gcode_cmd = (boost::format("M620 P%1% \n") % tray_id).str();
@@ -1724,7 +1712,6 @@ int MachineObject::command_extrusion_cali_set(int tray_index, std::string settin
     return this->publish_json(j);
 }
 
-
 int MachineObject::command_set_printing_speed(DevPrintingSpeedLevel lvl)
 {
     json j;
@@ -1746,7 +1733,6 @@ int MachineObject::command_set_printing_option(bool auto_recovery)
 
     return this->publish_json(j);
 }
-
 
 int MachineObject::command_ams_switch_filament(bool switch_filament)
 {
@@ -1922,7 +1908,6 @@ int MachineObject::command_delete_pa_calibration(const PACalibIndexInfo& pa_cali
 
 int MachineObject::command_get_pa_calibration_tab(const PACalibExtruderInfo &calib_info)
 {
-
     json j;
     j["print"]["command"]         = "extrusion_cali_get";
     j["print"]["sequence_id"]     = std::to_string(MachineObject::m_sequence_id++);
@@ -2058,7 +2043,6 @@ int MachineObject::command_ipcam_resolution_set(std::string resolution)
     return this->publish_json(j);
 }
 
-
 bool MachineObject::is_timelapse_storage_low(const std::string& storage) const
 {
     return m_storage && m_storage->is_timelapse_storage_low(storage);
@@ -2108,7 +2092,6 @@ int MachineObject::command_ack_proceed(json& proceed) {
     j["print"] = proceed;
     return this->publish_json(j);
 }
-
 
 void MachineObject::set_bind_status(std::string status)
 {
@@ -2167,7 +2150,6 @@ bool MachineObject::is_in_printing_status(std::string status)
     }
     return false;
 }
-
 
 bool MachineObject::is_in_printing()
 {
@@ -2327,7 +2309,6 @@ bool MachineObject::is_info_ready(bool check_version) const
         << ", dev_id=" << BBLCrossTalk::Crosstalk_DevId(get_dev_id());
     return false;
 }
-
 
 bool MachineObject::is_security_control_ready() const
 {
@@ -2982,17 +2963,29 @@ int MachineObject::parse_json(std::string tunnel, std::string payload, bool key_
                                 network_wired = (jj["net"]["conf"].get<int>() & (0x1)) != 0;
                             }
                             if (jj["net"].contains("info")) {
-                                for (auto info_item = jj["net"]["info"].begin(); info_item != jj["net"]["info"].end(); info_item++) {
+                                // For virtual printers, `net.info[].ip` is the real
+                                // printer's local IP (192.168.x.x of the actual A1/H2S/H2D)
+                                // which the bridge forwards verbatim from the cloud-relayed
+                                // push_status. Letting that overwrite our MachineObject's
+                                // dev_ip would point every slicer-side LAN endpoint
+                                // (Storage tunnel, FTPS uploads, camera) at the real
+                                // printer's IP — which from the slicer's view is either
+                                // unreachable or busy with another client. Keep dev_ip
+                                // pinned at the bridge IP we got from SSDP.
+                                const bool is_virtual = Slic3r::NetworkAgent::is_virtual_dev_id(get_dev_id());
+                                if (!is_virtual) {
+                                    for (auto info_item = jj["net"]["info"].begin(); info_item != jj["net"]["info"].end(); info_item++) {
 
-                                    if (info_item->contains("ip")) {
-                                        auto tmp_dev_ip = (*info_item)["ip"].get<int64_t>();
-                                        if (tmp_dev_ip == 0)
-                                            continue ;
-                                        else {
-                                           set_dev_ip(DevUtil::convertToIp(tmp_dev_ip));
+                                        if (info_item->contains("ip")) {
+                                            auto tmp_dev_ip = (*info_item)["ip"].get<int64_t>();
+                                            if (tmp_dev_ip == 0)
+                                                continue ;
+                                            else {
+                                               set_dev_ip(DevUtil::convertToIp(tmp_dev_ip));
+                                            }
+                                        } else {
+                                            break;
                                         }
-                                    } else {
-                                        break;
                                     }
                                 }
                             }
@@ -3344,7 +3337,6 @@ int MachineObject::parse_json(std::string tunnel, std::string payload, bool key_
                     }
 #pragma endregion
 
-
 #pragma region push_ams
                     /* ams status */
                     try {
@@ -3395,7 +3387,6 @@ int MachineObject::parse_json(std::string tunnel, std::string payload, bool key_
                             else if (jj.contains("vt_tray")) {
                                 auto main_slot = parse_vt_tray(jj["vt_tray"].get<json>());
                                 main_slot.id = std::to_string(VIRTUAL_TRAY_MAIN_ID);
-
 
                                 auto it = std::next(vt_slot.begin(), 0);
                                 if (it != vt_slot.end()) {
@@ -3996,7 +3987,6 @@ bool MachineObject::is_firmware_info_valid()
     return m_firmware_valid;
 }
 
-
 DevAmsTray MachineObject::parse_vt_tray(json vtray)
 {
     auto vt_tray = DevAmsTray(std::to_string(VIRTUAL_TRAY_MAIN_ID));
@@ -4209,7 +4199,6 @@ void MachineObject::parse_new_info(json print)
         if (camera_resolution_hold_count > 0) camera_resolution_hold_count--;
         if (camera_timelapse_hold_count > 0) camera_timelapse_hold_count--;
 
-
         if (time(nullptr) - ams_user_setting_start > HOLD_COUNT_MAX)
         {
             m_fila_system->GetAmsSystemSetting().SetDetectOnInsertEnabled(get_flag_bits(cfg, 0));
@@ -4410,7 +4399,6 @@ uint32_t MachineObject::get_flag_bits_no_border(std::string str, int start_idx, 
         const size_t first_bit = ustart;
         const size_t last_bit = std::min(ustart + need_bits, total_bits) - 1ULL;
         if (last_bit < first_bit) return 0;
-
 
         const size_t right_index = hex.size() - 1ULL;
 
@@ -4637,7 +4625,6 @@ void MachineObject::check_ams_filament_valid()
                         if (!is_equation) {
                             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " " << __LINE__ << " ams filament is not match min max temp and reset, ams_id: " << ams_id << " tray_id"
                                                     << slot_id << "filament_id: " << curr_tray->setting_id;
-
 
                             command_ams_filament_settings(std::stoi(ams_id), std::stoi(slot_id), curr_tray->setting_id, preset_setting_id, curr_tray->color, curr_tray->m_fila_type,
                                                           std::stoi(curr_tray->nozzle_temp_min), std::stoi(curr_tray->nozzle_temp_max));
@@ -4900,7 +4887,6 @@ std::string MachineObject::get_dev_id() const {
 void MachineObject::set_dev_id(std::string val) {
     m_dev_info->SetDevId(val);
 }
-
 
 void change_the_opacity(wxColour& colour)
 {

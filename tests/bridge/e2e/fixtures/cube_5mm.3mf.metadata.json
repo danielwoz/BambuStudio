@@ -1,0 +1,6 @@
+{
+  "_comment": "Sidecar for cube_5mm.3mf — read by E2EFixtureLoader.",
+  "plate_idx": 1,
+  "is_stub": true,
+  "notes": "STUB FIXTURE — empty placeholder zip. Slice a 5x5x5mm cube in BambuStudio (any of the three printers), export the .3mf via 'Export plate sliced file', and overwrite cube_5mm.3mf with it. Then set is_stub=false in this sidecar."
+}

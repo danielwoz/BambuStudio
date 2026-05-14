@@ -66,6 +66,16 @@ class wxGLCanvas;
 class Notebook;
 struct wxLanguageInfo;
 
+#include <thread>
+namespace Slic3r {
+namespace bridge {
+class BridgeStorageBackend;
+namespace headless {
+class BridgeApp;
+}
+}
+}
+
 namespace Slic3r {
 
 class AppConfig;
@@ -362,12 +372,36 @@ private:
     boost::thread    m_check_cert_thread;
     TryLoadLastMachine m_load_last_machine;
 
+    std::unique_ptr<::Slic3r::bridge::headless::BridgeApp> m_bridge_app;
+    // Bridge -> PrinterFileSystem storage delegator. Owned here so its
+    // lifetime brackets m_bridge_app's (it must outlive the BridgeApp's
+    // VirtualTunnelServer, which holds a borrowed pointer to it).
+    std::unique_ptr<::Slic3r::bridge::BridgeStorageBackend> m_bridge_storage;
+    std::unique_ptr<std::thread> m_bridge_thread;
+    // Pushes DeviceManager snapshots into the bridge from the wx main
+    // thread (which is the same thread that mutates DeviceManager).
+    std::unique_ptr<wxTimer>     m_bridge_push_timer;
+
+public:
+    // Read-only handle to the in-GUI bridge (when one is running).
+    // MediaFilePanel uses this to translate FFFF-mangled dev_ids to
+    // the real printer's LAN IP for the storage tunnel.
+    ::Slic3r::bridge::headless::BridgeApp* get_bridge_app() const {
+        return m_bridge_app.get();
+    }
+
+private:
+
 public:
     //try again when subscription fails
     void            on_start_subscribe_again(std::string dev_id);
     std::string     get_local_models_path();
     bool            OnInit() override;
     int             OnExit() override;
+    // Bridge-debug: log every left-mouse click + its target widget so a
+    // human-in-the-loop session can correlate the slicer's UI state with
+    // the bridge's MQTT relay activity. Returns -1 (let event continue).
+    int             FilterEvent(wxEvent& event) override;
     bool            initialized() const { return m_initialized; }
     inline bool     is_enable_multi_machine() { return this->app_config&& this->app_config->get("enable_multi_machine") == "true"; }
 
@@ -762,9 +796,28 @@ public:
 private:
     int             updating_bambu_networking();
     bool            on_init_inner();
+#if defined(BAMBU_BRIDGE)
+    // Headless --bridge-only entry point. Runs the same NetworkAgent +
+    // DeviceManager + Bridge bootstrap the GUI uses, minus MainFrame /
+    // Plater / preset bundle UI. Drives BridgeApp via the same
+    // BridgeStorageBackend + NetworkAgentPluginAdapter the in-GUI
+    // worker uses; the only differences are: no MainFrame is created,
+    // wxApp::ExitOnFrameDelete is turned off, and SIGINT/SIGTERM
+    // route to ExitMainLoop. Returns true (wx runs ProcessEvent) on
+    // success, false on bootstrap failure.
+    bool            init_bridge_only_headless();
+#endif
     void            copy_network_if_available();
     bool            on_init_network(bool try_backup = false);
     void            init_networking_callbacks();
+#if defined(BAMBU_BRIDGE)
+    // Bridge-only minimal callbacks: just enough to keep DeviceManager
+    // fed (parse_json on every push_status) and to marshal back to the
+    // wx main thread. None of the dialog / plater / sidebar pieces
+    // init_networking_callbacks installs — those would crash in
+    // bridge-only mode where MainFrame and Plater are never constructed.
+    void            init_networking_callbacks_bridge_only();
+#endif
     void            init_app_config();
     void            remove_old_networking_plugins();
     //BBS set extra header for http request

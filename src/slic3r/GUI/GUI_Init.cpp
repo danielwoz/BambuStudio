@@ -10,6 +10,12 @@
 #include "slic3r/GUI/MainFrame.hpp"
 #include "slic3r/GUI/Plater.hpp"
 
+#if defined(BAMBU_BRIDGE)
+#include "slic3r/GUI/BridgeOnlyFlag.hpp"
+#endif
+
+#include <wx/app.h>
+
 // To show a message box if GUI initialization ends up with an exception thrown.
 #include <wx/msgdlg.h>
 
@@ -39,6 +45,28 @@ int GUI_Run(GUI_InitParams &params)
 
     //BBS: remove the try-catch and let exception goto above
     try {
+#if defined(BAMBU_BRIDGE)
+        // --bridge-only: do NOT pre-construct GUI_App here. The
+        // GUI_App constructor calls Label::initSysFont -> AddPrivateFont
+        // which needs wxApp::Initialize (= GTK init) to have already
+        // run; calling it before wxEntry causes a GLib/Gtk crash on
+        // both headless and Xvfb displays.
+        //
+        // Instead, let wxEntry invoke our `slic3r_create_app` factory
+        // (registered via wxAppInitializer in GUI_App.cpp), which
+        // returns `new GUI_App()` AFTER GTK has been brought up.
+        // GUI_App::on_init_inner short-circuits to
+        // init_bridge_only_headless when g_bridge_only is set, so no
+        // MainFrame is created. Skip instance_check so multiple
+        // bridges can coexist (the second one fails to bind anyway).
+        // On monitor-less servers run under Xvfb:
+        //   xvfb-run -a bambu-studio --bridge-only
+        // Slicer's init_params plumbing isn't needed in bridge-only
+        // (no CLI flags besides the bridge ones, parsed elsewhere).
+        if (Slic3r::GUI::g_bridge_only) {
+            return wxEntry(params.argc, params.argv);
+        }
+#endif
         //GUI::GUI_App* gui = new GUI::GUI_App(params.start_as_gcodeviewer ? GUI::GUI_App::EAppMode::GCodeViewer : GUI::GUI_App::EAppMode::Editor);
         GUI::GUI_App* gui = new GUI::GUI_App();
         //if (gui->get_app_mode() != GUI::GUI_App::EAppMode::GCodeViewer) {

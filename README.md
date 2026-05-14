@@ -29,6 +29,11 @@ Other major features are:
 - Assembly & explosion view
 - Flushing transition-filament into infill/object during filament change
 
+# Bambu Bridge
+
+This branch adds **Bambu Bridge** — mirror your cloud-connected Bambu printers as LAN printers for OrcaSlicer and other Bambu-protocol-compatible slicers on your network. Build with `-DBAMBU_BRIDGE=ON` (or use the standalone tree under `src/bambu_bridge/`); run `bambu-bridge-daemon`, or `BambuStudio --bridge-only` on Linux / macOS.
+See `docs/bambu_bridge_user_guide.md` for the user guide, `docs/bambu_bridge_release_notes.md` for release notes, and `docs/bambu_bridge_developer_guide.md` to hack on it.
+
 # How to compile
 Following platforms are currently supported to compile:
 - Windows 64-bit, [Compile Guide](https://github.com/bambulab/BambuStudio/wiki/Windows-Compile-Guide)

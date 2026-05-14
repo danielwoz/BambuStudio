@@ -129,6 +129,37 @@ if (NOT WIN32 AND NOT APPLE)
 endif ()
 
 target_link_libraries(BambuStudio libslic3r cereal)
+if (BAMBU_BRIDGE)
+    target_link_libraries(BambuStudio bambu_bridge)
+    target_compile_definitions(BambuStudio PRIVATE BAMBU_BRIDGE)
+    target_compile_definitions(libslic3r_gui PRIVATE BAMBU_BRIDGE)
+
+    # Standalone testbed for the virtual-MQTT path. Compiles the
+    # slicer's VirtualMqttClient + a tiny main, no wx/X11/boost::log/
+    # libslic3r — just OpenSSL + the bridge's MQTT framer. Lets us
+    # iterate on bridge ↔ virtual-printer protocol issues without
+    # restarting the GUI.
+    find_package(OpenSSL REQUIRED)
+    add_executable(bambu_virtual_cli
+        slic3r/Utils/VirtualMqttClient.cpp
+        slic3r/Utils/VirtualFtpsClient.cpp
+        slic3r/Utils/VirtualMqttCli.cpp
+    )
+    target_include_directories(bambu_virtual_cli PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/slic3r/Utils
+    )
+    target_link_libraries(bambu_virtual_cli PRIVATE
+        bambu_bridge
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        Threads::Threads
+    )
+    set_target_properties(bambu_virtual_cli PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+    )
+endif ()
 if (APPLE)
 #    add_compile_options(-stdlib=libc++)
 #    add_definitions(-DBOOST_THREAD_DONT_USE_CHRONO -DBOOST_NO_CXX11_RVALUE_REFERENCES -DBOOST_THREAD_USES_MOVE)
@@ -146,6 +177,15 @@ endif ()
 if (SLIC3R_GUI)
 #    target_link_libraries(BambuStudio ws2_32 uxtheme setupapi libslic3r_gui ${wxWidgets_LIBRARIES})
 target_link_libraries(BambuStudio libslic3r_gui)
+if (BAMBU_BRIDGE)
+    # libslic3r_gui (now including BridgeOnlyFlag.hpp's headless OnInit
+    # branch) references bambu_bridge symbols that weren't pulled out
+    # of the static archive on its first scan above (the bridge .a is
+    # listed before libslic3r_gui in the link line, but the GUI lib is
+    # what *consumes* those symbols). Re-list it here to satisfy the
+    # static-archive search order.
+    target_link_libraries(BambuStudio bambu_bridge)
+endif ()
     if (MSVC)
         # Generate debug symbols even in release mode.
         target_link_options(BambuStudio PUBLIC "$<$<CONFIG:RELEASE>:/DEBUG>")

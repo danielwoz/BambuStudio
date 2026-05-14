@@ -1456,8 +1456,235 @@ static void load_downward_settings_list_from_config(std::string config_file, std
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bambu Bridge — `--bridge-only` early-exit hook (phase 10).
+//
+// When the user invokes `BambuStudio --bridge-only [...]`, we hand off to
+// the standalone `bambu-bridge-daemon` executable (built from
+// src/bambu_bridge/) via execv. The bridge code is NOT linked into the
+// main BambuStudio binary: doing so would drag in OpenSSL, additional
+// pthread/dlopen plumbing, and a separate static lib whose ABI doesn't
+// match the existing slicer-side networking. exec keeps the slicer
+// build untouched while still letting `BambuStudio --bridge-only`
+// behave the way the docs/bambu_bridge_plan.md milestone specifies.
+//
+// Daemon discovery order:
+//   1. $BAMBU_BRIDGE_DAEMON               (explicit override)
+//   2. dirname(argv[0]) / "bambu-bridge-daemon"   (sibling of slicer)
+//   3. $PATH                              (let execvp find it)
+//
+// On Linux this is implemented with execv(2) which replaces the process
+// image, so on success this function does not return. Windows / macOS
+// support is deferred; on those platforms the flag is forwarded to the
+// slicer's own arg parser unchanged (and currently fails with "unknown
+// option").
+// (Phase-10's execv helper was removed when --bridge-only became
+// in-process; the POSIX headers it pulled in are no longer needed
+// here.)
+
+#if defined(BAMBU_BRIDGE)
+#include "bambu_bridge/headless/BridgeApp.hpp"
+#include "bambu_bridge/headless/BridgeAppCliArgs.hpp"
+#include "slic3r/GUI/BridgeOnlyFlag.hpp"
+#include "slic3r/GUI/GUI_Init.hpp"
+#include <cstdio>
+#endif
+
+#if defined(BAMBU_BRIDGE)
+// Globals consumed by GUI_App::on_init_inner when --bridge-only is set.
+// `g_bridge_only` flips the slicer into headless mode (no MainFrame, no
+// Plater, no preset bundle); `g_bridge_only_cfg` is the BridgeAppConfig
+// parsed from the CLI, handed to GUI_App so it uses the EXACT same
+// bridge bootstrap path the GUI worker thread uses.
+namespace Slic3r { namespace GUI {
+bool                                       g_bridge_only = false;
+::Slic3r::bridge::headless::BridgeAppConfig g_bridge_only_cfg;
+}}
+#endif
+
 int CLI::run(int argc, char **argv)
 {
+    // Bambu Bridge — very-early exit so the in-process daemon runs
+    // without bringing up wxApp, locale, boost::nowide::filesystem,
+    // OpenGL or anything else the slicer normally initialises.
+    //
+    // Must be BEFORE set_current_thread_name() / save_main_thread_id()
+    // so none of those side-effects leak in. The flag and every
+    // documented daemon option are parsed through the shared
+    // BridgeAppCliArgs so `BambuStudio --bridge-only ...` and
+    // `bambu-bridge-daemon ...` accept identical argument grammars.
+#if defined(BAMBU_BRIDGE)
+    {
+        bool bridge_only = false;
+        for (int i = 1; i < argc; ++i) {
+            if (argv[i] && std::strcmp(argv[i], "--bridge-only") == 0) {
+                bridge_only = true;
+                break;
+            }
+        }
+        if (bridge_only) {
+            using namespace Slic3r::bridge::headless;
+            ParseResult parsed = parse_cli_args(
+                "BambuStudio --bridge-only", argc, argv);
+            switch (parsed.exit_code) {
+                case 1:
+                    std::fputs(parsed.help_text.c_str(), stdout);
+                    std::fflush(stdout);
+                    std::_Exit(0);
+                case 2:
+                    std::fprintf(stderr, "%s\n", parsed.error_message.c_str());
+                    std::fputs(render_usage("BambuStudio --bridge-only").c_str(), stderr);
+                    std::fflush(stderr);
+                    std::_Exit(2);
+                default:
+                    break;
+            }
+
+            // Inject the X-BBL-* identification headers BambuStudio's
+            // NetworkAgent normally attaches to every cloud REST call.
+            // The plugin's HTTP path uses its own curl session, so
+            // CURLOPT_USERAGENT isn't ours to set — instead we forward
+            // the same X-BBL-* set the GUI uses (see
+            // GUI_App::get_extra_header). Without these, Bambu's cloud
+            // rejects get_user_print_info even with a logged-in agent.
+            //
+            // Caller-supplied headers (via repeated --http-header K=V)
+            // take precedence; we only fill the keys the user left
+            // empty, so test rigs can override any of these to spoof a
+            // different client profile.
+            auto seed = [&](const char* k, std::string v) {
+                if (parsed.config.http_extra_headers.find(k) ==
+                    parsed.config.http_extra_headers.end()) {
+                    parsed.config.http_extra_headers[k] = std::move(v);
+                }
+            };
+            seed("X-BBL-Client-Name",    SLIC3R_APP_NAME);
+            seed("X-BBL-Client-Version", SLIC3R_VERSION);
+            seed("X-BBL-OS-Type",        "linux");
+            seed("X-BBL-Language",       "en");
+
+            // SLIC3R_STATIC=1 builds link a static OpenSSL that doesn't
+            // know where the distro's CA bundle lives. Slic3r::Http's
+            // CurlGlobalInit normally patches SSL_CERT_FILE for the
+            // system before any HTTP call — but the bridge dispatch
+            // exits before that singleton ever runs, so the proprietary
+            // plugin's own curl session sees no CA store and rejects
+            // Bambu's cloud cert with CURLE_PEER_FAILED_VERIFICATION
+            // (http_code=60). Set the env var here, matching the same
+            // probe list CurlGlobalInit uses.
+            if (!std::getenv("SSL_CERT_FILE")) {
+                static const char* const ca_bundles[] = {
+                    "/etc/pki/tls/certs/ca-bundle.crt",
+                    "/etc/ssl/certs/ca-certificates.crt",
+                    "/usr/share/ssl/certs/ca-bundle.crt",
+                    "/usr/local/share/certs/ca-root-nss.crt",
+                    "/etc/ssl/cert.pem",
+                    "/etc/ssl/ca-bundle.pem",
+                };
+                for (const char* b : ca_bundles) {
+                    if (boost::filesystem::exists(b)) {
+                        ::setenv("SSL_CERT_FILE", b, /*overwrite=*/0);
+                        break;
+                    }
+                }
+            }
+
+            // Probe for the slicer_base64.cer the plugin uses to verify
+            // TLS to Bambu's cloud. CLI::run runs before set_resources_dir,
+            // so we can't ask libslic3r for it — probe a few likely
+            // locations relative to argv[0], then a source-tree fallback,
+            // then BAMBU_BRIDGE_CERT_DIR if the user set one.
+            if (parsed.config.cert_dir.empty() ||
+                parsed.config.cert_file.empty()) {
+                std::vector<std::string> probe;
+                if (const char* env = std::getenv("BAMBU_BRIDGE_CERT_DIR"))
+                    if (*env) probe.emplace_back(env);
+                try {
+                    auto bin = boost::filesystem::canonical(argv[0]);
+                    probe.push_back((bin.parent_path().parent_path()
+                                     / "resources" / "cert").string());
+                    probe.push_back((bin.parent_path()
+                                     / "resources" / "cert").string());
+                } catch (const std::exception&) { /* argv[0] not resolvable */ }
+                probe.push_back("/usr/share/BambuStudio/resources/cert");
+                for (const auto& d : probe) {
+                    if (boost::filesystem::exists(
+                            boost::filesystem::path(d) / "slicer_base64.cer")) {
+                        if (parsed.config.cert_dir.empty())
+                            parsed.config.cert_dir = d;
+                        if (parsed.config.cert_file.empty())
+                            parsed.config.cert_file = "slicer_base64.cer";
+                        break;
+                    }
+                }
+            }
+
+            std::fprintf(stderr,
+                "[BambuStudio --bridge-only] starting; plugin='%s' bind=%s "
+                "client='%s/%s' cert='%s/%s'\n",
+                parsed.config.plugin_path.c_str(),
+                parsed.config.lan_iface_bind.c_str(),
+                parsed.config.http_extra_headers["X-BBL-Client-Name"].c_str(),
+                parsed.config.http_extra_headers["X-BBL-Client-Version"].c_str(),
+                parsed.config.cert_dir.c_str(),
+                parsed.config.cert_file.c_str());
+
+            // Headless --bridge-only now runs the EXACT same bridge code
+            // path as the GUI: BridgeStorageBackend delegating to
+            // PrinterFileSystem, same NetworkAgent adapter, same push
+            // pump -- just with no MainFrame. We stash the parsed CLI
+            // config in a global; GUI_App::on_init_inner sees
+            // `g_bridge_only==true` and takes the headless branch.
+            //
+            // `host_drives_inventory` is forced to true here because the
+            // slicer's NetworkAgent is the (one and only) plugin
+            // consumer in this process and the wxTimer push pump feeds
+            // DeviceManager snapshots into the bridge -- exactly like
+            // the in-GUI worker.
+            parsed.config.host_drives_inventory = true;
+            ::Slic3r::GUI::g_bridge_only     = true;
+            ::Slic3r::GUI::g_bridge_only_cfg = std::move(parsed.config);
+
+            // GUI_App now runs in bridge-only mode (used to be a
+            // wxAppConsole subclass). GUI_App's constructor calls
+            // Label::initSysFont which AddPrivateFont's HarmonyOS TTFs
+            // from `<resources_dir>/fonts/`. Without resources_dir set,
+            // AddPrivateFont blows up GLib because wx tries to
+            // attach a private font to a NULL FcConfig. Mirror what
+            // the main slicer entry does (lines 8333-8353) so the
+            // GUI_App ctor sees a valid resources tree.
+#if defined(__APPLE__)
+            boost::filesystem::path path_resources =
+                boost::filesystem::canonical(argv[0]).parent_path().parent_path() / "Resources";
+#elif defined(_WIN32)
+            boost::filesystem::path path_resources =
+                boost::filesystem::path(argv[0]).parent_path() / "resources";
+#elif defined(SLIC3R_FHS)
+            boost::filesystem::path path_resources = SLIC3R_FHS_RESOURCES;
+#else
+            boost::filesystem::path path_resources =
+                boost::filesystem::canonical(argv[0]).parent_path().parent_path() / "resources";
+#endif
+            ::Slic3r::set_resources_dir(path_resources.string());
+            ::Slic3r::set_var_dir((path_resources / "images").string());
+            ::Slic3r::set_local_dir((path_resources / "i18n").string());
+            ::Slic3r::set_sys_shapes_dir((path_resources / "shapes").string());
+
+            // Route through GUI_Run so we get the slicer's full wxApp
+            // (NetworkAgent, DeviceManager, event loop) -- minus the
+            // top-level windows, which on_init_inner skips when
+            // g_bridge_only is set. We strip the original argv so the
+            // slicer's read_cli doesn't trip on --bridge-only et al.;
+            // GUI_Run only needs argv[0] anyway (wxEntry uses it for
+            // the app name).
+            Slic3r::GUI::GUI_InitParams gui_params;
+            gui_params.argc = 1;
+            gui_params.argv = argv;
+            return Slic3r::GUI::GUI_Run(gui_params);
+        }
+    }
+#endif
+
     // Mark the main thread for the debugger and for runtime checks.
     set_current_thread_name("bambustu_main");
     // Save the thread ID of the main thread.

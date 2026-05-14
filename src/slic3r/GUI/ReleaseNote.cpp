@@ -2,6 +2,9 @@
 #include "I18N.hpp"
 #include "GCodeViewer.hpp"
 
+#include "slic3r/Utils/NetworkAgent.hpp"
+#include "slic3r/Utils/VirtualLanPrinterStore.hpp"
+
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Thread.hpp"
 #include "GUI.hpp"
@@ -106,7 +109,6 @@ ReleaseNoteDialog::ReleaseNoteDialog(Plater *plater /*= nullptr*/)
 
 ReleaseNoteDialog::~ReleaseNoteDialog() {}
 
-
 void ReleaseNoteDialog::on_dpi_changed(const wxRect &suggested_rect)
 {
 }
@@ -140,8 +142,6 @@ UpdatePluginDialog::UpdatePluginDialog(wxWindow* parent /*= nullptr*/)
 
     wxBoxSizer* m_sizer_body = new wxBoxSizer(wxHORIZONTAL);
 
-
-
     auto sm = create_scaled_bitmap("BambuStudio", nullptr, 55);
     auto brand = new wxStaticBitmap(this, wxID_ANY, sm, wxDefaultPosition, wxSize(FromDIP(55), FromDIP(55)));
 
@@ -150,7 +150,6 @@ UpdatePluginDialog::UpdatePluginDialog(wxWindow* parent /*= nullptr*/)
     m_text_up_info = new Label(this, Label::Head_13, wxEmptyString, LB_AUTO_WRAP);
     m_text_up_info->SetMaxSize(wxSize(FromDIP(260), -1));
     m_text_up_info->SetForegroundColour(wxColour(0x26, 0x2E, 0x30));
-
 
     operation_tips = new ::Label(this, Label::Body_12, _L("Click OK to update the Network plug-in when Bambu Studio launches next time."), LB_AUTO_WRAP);
     operation_tips->SetMinSize(wxSize(FromDIP(260), -1));
@@ -223,7 +222,6 @@ UpdatePluginDialog::UpdatePluginDialog(wxWindow* parent /*= nullptr*/)
 
 UpdatePluginDialog::~UpdatePluginDialog() {}
 
-
 void UpdatePluginDialog::on_dpi_changed(const wxRect& suggested_rect)
 {
 }
@@ -279,15 +277,10 @@ UpdateVersionDialog::UpdateVersionDialog(wxWindow *parent)
     auto        m_line_top   = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
     m_line_top->SetBackgroundColour(wxColour(166, 169, 170));
 
-
     wxBoxSizer *m_sizer_body = new wxBoxSizer(wxHORIZONTAL);
-
-
 
     auto sm    = create_scaled_bitmap("BambuStudio", nullptr, 70);
     m_brand = new wxStaticBitmap(this, wxID_ANY, sm, wxDefaultPosition, wxSize(FromDIP(70), FromDIP(70)));
-
-
 
     wxBoxSizer *m_sizer_right = new wxBoxSizer(wxVERTICAL);
 
@@ -324,15 +317,11 @@ UpdateVersionDialog::UpdateVersionDialog(wxWindow *parent)
     m_simplebook_release_note->AddPage(m_scrollwindows_release_note, wxEmptyString, false);
     m_simplebook_release_note->AddPage(m_vebview_release_note, wxEmptyString, false);
 
-
-
     m_bitmap_open_in_browser = new wxStaticBitmap(this, wxID_ANY, create_scaled_bitmap("open_in_browser", this, 12), wxDefaultPosition, wxDefaultSize, 0 );
     m_link_open_in_browser   = new wxHyperlinkCtrl(this, wxID_ANY, "Open in browser", "");
     m_link_open_in_browser->SetFont(Label::Body_12);
 
-
     auto sizer_button = new wxBoxSizer(wxHORIZONTAL);
-
 
     StateColor btn_bg_green(std::pair<wxColour, int>(wxColour(27, 136, 68), StateColor::Pressed), std::pair<wxColour, int>(wxColour(61, 203, 115), StateColor::Hovered),
                             std::pair<wxColour, int>(AMS_CONTROL_BRAND_COLOUR, StateColor::Normal));
@@ -365,7 +354,6 @@ UpdateVersionDialog::UpdateVersionDialog(wxWindow *parent)
         wxGetApp().set_skip_version(true);
         EndModal(wxID_NO);
     });
-
 
     m_button_cancel = new Button(this, _L("Cancel"));
     m_button_cancel->SetBackgroundColor(btn_bg_white);
@@ -410,7 +398,6 @@ UpdateVersionDialog::UpdateVersionDialog(wxWindow *parent)
 }
 
 UpdateVersionDialog::~UpdateVersionDialog() {}
-
 
 wxWebView* UpdateVersionDialog::CreateTipView(wxWindow* parent)
 {
@@ -513,7 +500,6 @@ void UpdateVersionDialog::update_version_info(wxString release_note, wxString ve
         }
     }
 
-
     if (use_web_link) {
         m_brand->Hide();
         m_text_up_info->Hide();
@@ -566,7 +552,6 @@ SecondaryCheckDialog::SecondaryCheckDialog(wxWindow* parent, wxWindowID id, cons
     m_vebview_release_note->SetMinSize(wxSize(FromDIP(400), FromDIP(380)));
     m_sizer_right->Add(m_vebview_release_note, 0, wxEXPAND | wxRIGHT | wxLEFT, FromDIP(15));
 
-
     auto bottom_sizer = new wxBoxSizer(wxVERTICAL);
     auto sizer_button = new wxBoxSizer(wxHORIZONTAL);
     btn_bg_green = StateColor(std::pair<wxColour, int>(wxColour(27, 136, 68), StateColor::Pressed), std::pair<wxColour, int>(wxColour(61, 203, 115), StateColor::Hovered),
@@ -574,7 +559,6 @@ SecondaryCheckDialog::SecondaryCheckDialog(wxWindow* parent, wxWindowID id, cons
 
     btn_bg_white = StateColor(std::pair<wxColour, int>(wxColour(206, 206, 206), StateColor::Pressed), std::pair<wxColour, int>(wxColour(238, 238, 238), StateColor::Hovered),
         std::pair<wxColour, int>(*wxWHITE, StateColor::Normal));
-
 
     if (not_show_again_check) {
         auto checkbox_sizer = new wxBoxSizer(wxHORIZONTAL);
@@ -697,7 +681,6 @@ SecondaryCheckDialog::SecondaryCheckDialog(wxWindow* parent, wxWindowID id, cons
     sizer_button->Add(m_button_cancel, 0, wxALL, FromDIP(5));
     sizer_button->Add(FromDIP(5),0, 0, 0);
     bottom_sizer->Add(sizer_button, 0, wxEXPAND | wxRIGHT | wxLEFT, 0);
-
 
     m_sizer_right->Add(bottom_sizer, 0, wxEXPAND | wxRIGHT | wxLEFT, FromDIP(15));
     m_sizer_right->Add(0, 0, 0, wxTOP,FromDIP(10));
@@ -834,7 +817,6 @@ void SecondaryCheckDialog::update_title_style(wxString title, SecondaryCheckDial
 
     }
 
-
     Layout();
 }
 
@@ -907,7 +889,6 @@ PrintErrorDialog::PrintErrorDialog(wxWindow* parent, wxWindowID id, const wxStri
     Bind(wxEVT_CLOSE_WINDOW, [this](auto& e) {this->on_hide(); });
     Bind(wxEVT_ACTIVATE, [this](auto& e) { if (!e.GetActive()) this->RequestUserAttention(wxUSER_ATTENTION_ERROR); });
     Bind(wxEVT_WEBREQUEST_STATE, &PrintErrorDialog::on_webrequest_state, this);
-
 
     SetSizer(m_sizer_main);
     Layout();
@@ -1195,7 +1176,6 @@ ConfirmBeforeSendDialog::ConfirmBeforeSendDialog(wxWindow* parent, wxWindowID id
     m_vebview_release_note->SetMinSize(wxSize(FromDIP(400), FromDIP(380)));
     m_sizer_right->Add(m_vebview_release_note, 0, wxEXPAND | wxRIGHT | wxLEFT, FromDIP(15));
 
-
     auto bottom_sizer = new wxBoxSizer(wxVERTICAL);
     auto sizer_button = new wxBoxSizer(wxHORIZONTAL);
     StateColor btn_bg_green(std::pair<wxColour, int>(wxColour(27, 136, 68), StateColor::Pressed), std::pair<wxColour, int>(wxColour(61, 203, 115), StateColor::Hovered),
@@ -1203,7 +1183,6 @@ ConfirmBeforeSendDialog::ConfirmBeforeSendDialog(wxWindow* parent, wxWindowID id
 
     StateColor btn_bg_white(std::pair<wxColour, int>(wxColour(206, 206, 206), StateColor::Pressed), std::pair<wxColour, int>(wxColour(238, 238, 238), StateColor::Hovered),
         std::pair<wxColour, int>(*wxWHITE, StateColor::Normal));
-
 
     if (not_show_again_check) {
         auto checkbox_sizer = new wxBoxSizer(wxHORIZONTAL);
@@ -1276,7 +1255,6 @@ ConfirmBeforeSendDialog::ConfirmBeforeSendDialog(wxWindow* parent, wxWindowID id
     sizer_button->Add(FromDIP(5),0, 0, 0);
     bottom_sizer->Add(sizer_button, 0, wxEXPAND | wxRIGHT | wxLEFT, 0);
 
-
     m_sizer_right->Add(bottom_sizer, 0, wxEXPAND | wxRIGHT | wxLEFT, FromDIP(20));
     m_sizer_right->Add(0, 0, 0, wxTOP, FromDIP(10));
 
@@ -1327,7 +1305,6 @@ void ConfirmBeforeSendDialog::update_text(std::vector<ConfirmBeforeSendInfo> tex
 {
     wxBoxSizer* sizer_text_release_note = new wxBoxSizer(wxVERTICAL);
     m_vebview_release_note->SetSizer(sizer_text_release_note);
-
 
     auto height = 0;
     for (auto text : texts) {
@@ -1662,7 +1639,36 @@ InputIpAddressDialog::InputIpAddressDialog(wxWindow *parent)
     m_button_ok->SetBackgroundColor(wxColour(0x90, 0x90, 0x90));
     m_button_ok->SetBorderColor(wxColour(0x90, 0x90, 0x90));
 
+    // "Skip detection" — jump straight to the SN-entry panel (Panel 1),
+    // bypassing the plugin's bind_detect probe. Useful when the printer
+    // is reachable but won't pass the plugin's Bambu-CA cert check —
+    // e.g. the Bambu Bridge's self-signed certs. Panel 1 lets the user
+    // type the serial directly; insert_local_device then creates the
+    // MachineObject and selection drives NetworkAgent::connect_printer,
+    // which (for FFFF-prefixed serials) is intercepted by
+    // VirtualMqttClient and uses verify=false.
+    auto m_button_skip = new Button(this, _L("Skip detection"));
+    m_button_skip->SetBackgroundColor(btn_bg_white);
+    m_button_skip->SetBorderColor(wxColour(0xCE, 0xCE, 0xCE));
+    m_button_skip->SetTextColor(wxColour(0x33, 0x33, 0x33));
+    m_button_skip->SetFont(Label::Body_12);
+    m_button_skip->SetMinSize(wxSize(-1, FromDIP(24)));
+    m_button_skip->SetCornerRadius(FromDIP(12));
+    m_button_skip->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+        // Same effect as bind_detect returning -3 — switches the
+        // dialog to the user-supplied-SN panel AND flips
+        // m_need_input_sn so the next OK click takes the SN-aware
+        // path (`workerThreadFunc`) instead of falling back to the
+        // FTPS-probe `on_send_retry`. Layout()/Fit() re-flow the
+        // dialog so the bottom panel actually shows up.
+        m_need_input_sn = true;
+        switch_input_panel(1);
+        Layout();
+        Fit();
+    });
+
     m_sizer_button->AddStretchSpacer();
+    m_sizer_button->Add(m_button_skip, 0, wxALL, FromDIP(5));
     m_sizer_button->Add(m_button_ok, 0, wxALL, FromDIP(5));
     // m_sizer_button->Add(m_button_cancel, 0, wxALL, FromDIP(5));
     m_sizer_button->Layout();
@@ -1708,9 +1714,7 @@ InputIpAddressDialog::InputIpAddressDialog(wxWindow *parent)
     m_step_icon_panel2->SetMinSize(wxSize(-1, m_tip2->GetBestSize().y));
     m_step_icon_panel2->SetMaxSize(wxSize(-1, m_tip2->GetBestSize().y));
 
-
     m_sizer_msg->Layout();
-
 
     m_trouble_shoot->Hide();
 
@@ -1820,7 +1824,6 @@ void InputIpAddressDialog::on_cancel()
     EndModal(wxID_CANCEL);
 }
 
-
 void InputIpAddressDialog::update_title(wxString title)
 {
     SetTitle(title);
@@ -1835,7 +1838,6 @@ void InputIpAddressDialog::set_machine_obj(MachineObject* obj)
     std::string img_str = DevPrinterConfigUtil::get_printer_connect_help_img(m_obj->printer_type);
     auto diagram_bmp = create_scaled_bitmap(img_str + "_en", this, 198);
     m_img_help->SetBitmap(diagram_bmp);
-
 
     auto str_ip = m_input_ip->GetTextCtrl()->GetValue();
     auto str_access_code = m_input_access_code->GetTextCtrl()->GetValue();
@@ -2090,20 +2092,32 @@ void InputIpAddressDialog::workerThreadFunc(std::string str_ip, std::string str_
     }
     if (w.expired()) return;
 
-
     DeviceManager* dev = wxGetApp().getDeviceManager();
     m_obj = dev->insert_local_device(detectData.dev_name, detectData.dev_id, str_ip,
         detectData.connect_type, detectData.bind_state, detectData.version,
         str_access_code, detectData.model_id);
-
 
     if (w.expired()) return;
 
     if (m_obj) {
         m_obj->set_user_access_code(str_access_code);
         wxGetApp().getDeviceManager()->set_selected_machine(m_obj->get_dev_id());
-    }
 
+        // Persist virtual LAN printers so the user doesn't have to
+        // re-enter the serial + access code on every slicer launch.
+        // We only persist FFFF-prefix dev_ids; real LAN printers
+        // already round-trip their access code through app_config.
+        if (Slic3r::NetworkAgent::is_virtual_dev_id(detectData.dev_id)) {
+            Slic3r::VirtualLanPrinterStore store;
+            Slic3r::VirtualLanPrinterStore::Entry e;
+            e.dev_id       = detectData.dev_id;
+            e.dev_name     = detectData.dev_name;
+            e.lan_ip       = str_ip;
+            e.access_code  = str_access_code;
+            e.printer_type = detectData.model_id;
+            store.upsert(e);
+        }
+    }
 
     closeCount = 1;
 
@@ -2212,7 +2226,6 @@ void InputIpAddressDialog::on_dpi_changed(const wxRect& suggested_rect)
 
 }
 
-
  SendFailedConfirm::SendFailedConfirm(wxWindow *parent /*= nullptr*/):
      DPIDialog(static_cast<wxWindow *>(wxGetApp().mainframe),
                   wxID_ANY,
@@ -2232,7 +2245,6 @@ void InputIpAddressDialog::on_dpi_changed(const wxRect& suggested_rect)
      auto m_line_top = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(FromDIP(400), 1));
      m_line_top->SetBackgroundColour(wxColour(166, 169, 170));
 
-
      auto tip = new Label(this, _L("Failed to send. Click Retry to attempt sending again. If retrying does not work, please check the reason."));
      tip->Wrap(FromDIP(480));
      tip->SetMinSize(wxSize(FromDIP(480), -1));
@@ -2245,7 +2257,6 @@ void InputIpAddressDialog::on_dpi_changed(const wxRect& suggested_rect)
 
      StateColor btn_bg_white(std::pair<wxColour, int>(wxColour(206, 206, 206), StateColor::Pressed), std::pair<wxColour, int>(wxColour(238, 238, 238), StateColor::Hovered),
                              std::pair<wxColour, int>(*wxWHITE, StateColor::Normal));
-
 
      auto m_button_retry = new Button(this, _L("Retry"));
      m_button_retry->SetBackgroundColor(btn_bg_green);

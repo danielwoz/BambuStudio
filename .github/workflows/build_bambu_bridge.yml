@@ -1,0 +1,42 @@
+name: Bambu Bridge smoke
+
+# Lightweight CI job for the Bambu Bridge module (see docs/bambu_bridge_plan.md).
+# Configures the *standalone* phase-0 build (src/bambu_bridge as its own cmake
+# project) so we don't have to drag in wxWidgets / Boost / OpenSSL / OpenVDB
+# just to prove the bambu_bridge target + BridgeServiceSmoke test still wire
+# up correctly.
+#
+# When later phases want a full-tree `-DBAMBU_BRIDGE=ON` build, add it to
+# build_bambu.yml / build_ubuntu.yml; until then this stays decoupled.
+
+on:
+  pull_request:
+    paths:
+      - 'src/bambu_bridge/**'
+      - 'tests/bridge/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build_bambu_bridge.yml'
+  push:
+    branches:
+      - feature/bambu-bridge
+
+jobs:
+  bridge-smoke:
+    name: bambu_bridge standalone smoke (BAMBU_BRIDGE=ON)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install minimal build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Configure (standalone phase-0 project)
+        run: cmake -S src/bambu_bridge -B build/bridge_standalone -DBAMBU_BRIDGE=ON
+
+      - name: Build bambu_bridge + BridgeServiceSmoke
+        run: cmake --build build/bridge_standalone --target bambu_bridge BridgeServiceSmoke -j
+
+      - name: Run BridgeServiceSmoke
+        run: ctest --test-dir build/bridge_standalone -R BridgeServiceSmoke --output-on-failure
