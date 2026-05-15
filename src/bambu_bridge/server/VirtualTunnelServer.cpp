@@ -5,14 +5,15 @@
 
 #include "nlohmann/json.hpp"
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
+#include <boost/asio.hpp>
+#include <boost/system/error_code.hpp>
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#else
+#  include <sys/socket.h>
+#  include <sys/ioctl.h>
+#endif
 
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -26,6 +27,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -33,6 +35,10 @@
 namespace Slic3r {
 namespace bridge {
 namespace server {
+
+namespace asio = boost::asio;
+using asio::ip::tcp;
+using boost::system::error_code;
 
 namespace {
 
@@ -110,37 +116,34 @@ SSL_CTX* make_device_ctx(const tls::CertMaterial& cert) {
     return ctx;
 }
 
-int open_listener(const std::string& ip, uint16_t port, int backlog) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-#ifdef SO_REUSEPORT
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-#endif
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
+// Bind+listen via asio. Returns nullptr on failure, otherwise an owning
+// pointer to a listening acceptor on the given io_context.
+std::unique_ptr<tcp::acceptor> open_listener_asio(
+        asio::io_context& io, const std::string& ip, uint16_t port, int backlog)
+{
+    auto acc = std::make_unique<tcp::acceptor>(io);
+    error_code ec;
+    asio::ip::address bind_addr;
     if (ip.empty() || ip == "0.0.0.0") {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd); return -1;
+        bind_addr = asio::ip::address_v4::any();
+    } else {
+        bind_addr = asio::ip::make_address(ip, ec);
+        if (ec) return nullptr;
     }
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd); return -1;
+    tcp::endpoint ep(bind_addr, port);
+    acc->open(ep.protocol(), ec);
+    if (!ec) acc->set_option(asio::socket_base::reuse_address(true), ec);
+#ifdef SO_REUSEPORT
+    if (!ec) {
+        int one = 1;
+        ::setsockopt(acc->native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                     &one, sizeof(one));
     }
-    if (::listen(fd, backlog) < 0) {
-        ::close(fd); return -1;
-    }
-    return fd;
-}
-
-uint16_t bound_port_of(int fd) {
-    sockaddr_in addr{};
-    socklen_t   len = sizeof(addr);
-    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
-        return 0;
-    return ntohs(addr.sin_port);
+#endif
+    if (!ec) acc->bind(ep, ec);
+    if (!ec) acc->listen(backlog, ec);
+    if (ec) return nullptr;
+    return acc;
 }
 
 // Read exactly n bytes from `ssl`, blocking. Returns false on EOF/error.
@@ -164,10 +167,11 @@ bool ssl_read_exact(SSL* ssl, uint8_t* buf, size_t n) {
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
                 continue;
             const int fd = SSL_get_fd(ssl);
-            int avail = -1;
             unsigned long ssl_err_q = ERR_peek_error();
             char ssl_err_buf[256] = {0};
             if (ssl_err_q) ERR_error_string_n(ssl_err_q, ssl_err_buf, sizeof(ssl_err_buf));
+#ifndef _WIN32
+            int avail = -1;
             uint8_t peek[16] = {0};
             ssize_t peek_n = -1;
             int peek_errno = 0;
@@ -183,6 +187,13 @@ bool ssl_read_exact(SSL* ssl, uint8_t* buf, size_t n) {
                 "dt=%lldms\n",
                 my_seq, r, err, errno, got, n, fd, avail, peek_n, peek_errno,
                 ssl_err_q, ssl_err_buf, now_ms() - t_enter);
+#else
+            std::fprintf(stderr,
+                "[virtual-tunnel] ssl_read_exact failed seq=%d r=%d ssl_err=%d "
+                "errno=%d got=%zu/%zu fd=%d ssl_err_q=0x%lx (%s) dt=%lldms\n",
+                my_seq, r, err, errno, got, n, fd,
+                ssl_err_q, ssl_err_buf, now_ms() - t_enter);
+#endif
             return false;
         }
         got += static_cast<size_t>(r);
@@ -214,7 +225,10 @@ bool ssl_write_all(SSL* ssl, const uint8_t* buf, size_t n) {
 struct VirtualTunnelServer::Device {
     VirtualTunnelVirtualDevice spec;
     SSL_CTX*                   ssl_ctx     = nullptr;
-    int                        listen_fd   = -1;
+
+    // asio plumbing per-device.
+    std::unique_ptr<asio::io_context> io;
+    std::unique_ptr<tcp::acceptor>    acceptor;
     uint16_t                   bound_port  = 0;
     std::atomic<bool>          accepting{false};
     std::thread                accept_thread;
@@ -381,9 +395,21 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
         return;
     }
     {
+        int sock_err = 0; socklen_t se_len = sizeof(sock_err);
+#ifdef _WIN32
+        ::getsockopt(client_fd, SOL_SOCKET, SO_ERROR,
+                     reinterpret_cast<char*>(&sock_err), &se_len);
+        std::fprintf(stderr,
+            "[virtual-tunnel] session up dev_id=%s — backend delegation mode "
+            "tls=%s cipher=%s SSL_pending=%d SSL_has_pending=%d "
+            "SO_ERROR=%d fd=%d\n",
+            dev_id.c_str(),
+            SSL_get_version(slicer_ssl), SSL_get_cipher(slicer_ssl),
+            SSL_pending(slicer_ssl), SSL_has_pending(slicer_ssl),
+            sock_err, client_fd);
+#else
         int avail_after_accept = -1;
         ::ioctl(client_fd, FIONREAD, &avail_after_accept);
-        int sock_err = 0; socklen_t se_len = sizeof(sock_err);
         ::getsockopt(client_fd, SOL_SOCKET, SO_ERROR, &sock_err, &se_len);
         std::fprintf(stderr,
             "[virtual-tunnel] session up dev_id=%s — backend delegation mode "
@@ -393,6 +419,7 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
             SSL_get_version(slicer_ssl), SSL_get_cipher(slicer_ssl),
             SSL_pending(slicer_ssl), SSL_has_pending(slicer_ssl),
             avail_after_accept, sock_err, client_fd);
+#endif
     }
 
     // Shared write-side state. The backend's reply callback can fire on
@@ -554,26 +581,39 @@ static void session_loop(SSL_CTX* server_ctx, int client_fd,
 static void accept_loop(VirtualTunnelServer::Device* d, int io_timeout_s) {
     (void) io_timeout_s; // not used in Phase 1; sessions are stream-driven
     while (d->accepting.load()) {
-        sockaddr_in caddr{};
-        socklen_t   clen = sizeof(caddr);
-        // Use select so we can wake on shutdown.
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(d->listen_fd, &rfds);
-        timeval tv{1, 0}; // 1s tick
-        int sel = ::select(d->listen_fd + 1, &rfds, nullptr, nullptr, &tv);
-        if (sel <= 0) continue;
-        int cfd = ::accept(d->listen_fd,
-                           reinterpret_cast<sockaddr*>(&caddr), &clen);
-        std::fprintf(stderr,
-            "[virtual-tunnel] accept_loop accept -> cfd=%d errno=%d "
-            "dev_id=%s ssl_ctx=%p\n",
-            cfd, errno, d->spec.dev_id.c_str(), (void*)d->ssl_ctx);
-        if (cfd < 0) {
-            if (errno == EINTR) continue;
+        tcp::socket client_sock(*d->io);
+        error_code aec = asio::error::would_block;
+        d->acceptor->async_accept(
+            client_sock,
+            [&aec](const error_code& e) { aec = e; });
+        d->io->restart();
+        d->io->run_for(std::chrono::seconds(1));
+        if (aec == asio::error::would_block) {
+            error_code ignore;
+            d->acceptor->cancel(ignore);
+            d->io->run();
+            continue;
+        }
+        if (aec) {
+            if (aec == asio::error::operation_aborted) break;
             std::fprintf(stderr,
-                "[virtual-tunnel] accept failed dev_id=%s errno=%d (%s)\n",
-                d->spec.dev_id.c_str(), errno, std::strerror(errno));
+                "[virtual-tunnel] accept failed dev_id=%s ec=%s\n",
+                d->spec.dev_id.c_str(), aec.message().c_str());
             break;
         }
+
+        // Detach the native fd so the asio socket dtor doesn't close it
+        // out from under the SSL_set_fd in session_loop.
+        auto native = client_sock.native_handle();
+        error_code rel_ec;
+        client_sock.release(rel_ec);
+        int cfd = static_cast<int>(native);
+
+        std::fprintf(stderr,
+            "[virtual-tunnel] accept_loop accept -> cfd=%d "
+            "dev_id=%s ssl_ctx=%p\n",
+            cfd, d->spec.dev_id.c_str(), (void*)d->ssl_ctx);
+
         SSL_CTX*                                  ctx    = d->ssl_ctx;
         VirtualTunnelVirtualDevice                spec   = d->spec;
         StorageDelegate                           del    = d->storage_delegate;
@@ -588,21 +628,23 @@ static void accept_loop(VirtualTunnelServer::Device* d, int io_timeout_s) {
 }
 
 void VirtualTunnelServer::start_device(Device& d) {
-    if (d.listen_fd >= 0) return;
+    if (d.acceptor) return;
     d.storage_delegate = m_storage_delegate;
     d.slicer_net_ver = m_cfg.slicer_net_ver;
     d.slicer_cli_id  = m_cfg.slicer_cli_id;
     d.slicer_cli_ver = m_cfg.slicer_cli_ver;
-    d.listen_fd = open_listener(d.spec.lan_ip, d.spec.port,
-                                m_cfg.accept_backlog);
-    if (d.listen_fd < 0) {
+    d.io = std::make_unique<asio::io_context>();
+    d.acceptor = open_listener_asio(*d.io, d.spec.lan_ip, d.spec.port,
+                                    m_cfg.accept_backlog);
+    if (!d.acceptor) {
         std::fprintf(stderr,
             "[virtual-tunnel] listen failed dev_id=%s ip=%s port=%u\n",
             d.spec.dev_id.c_str(), d.spec.lan_ip.c_str(),
             unsigned(d.spec.port));
+        d.io.reset();
         return;
     }
-    d.bound_port = bound_port_of(d.listen_fd);
+    d.bound_port = d.acceptor->local_endpoint().port();
     std::fprintf(stderr,
         "[virtual-tunnel] dev_id=%s listening on %s:%u\n",
         d.spec.dev_id.c_str(), d.spec.lan_ip.c_str(),
@@ -615,13 +657,14 @@ void VirtualTunnelServer::start_device(Device& d) {
 
 void VirtualTunnelServer::stop_device(Device& d) {
     d.accepting.store(false);
-    if (d.listen_fd >= 0) {
-        ::shutdown(d.listen_fd, SHUT_RDWR);
-        ::close(d.listen_fd);
-        d.listen_fd = -1;
+    if (d.acceptor) {
+        error_code ignore;
+        d.acceptor->close(ignore);
     }
     if (d.accept_thread.joinable())
         d.accept_thread.join();
+    d.acceptor.reset();
+    d.io.reset();
     std::vector<std::thread> snap;
     {
         std::lock_guard<std::mutex> lk(d.session_mu);
