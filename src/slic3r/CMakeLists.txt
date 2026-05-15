@@ -12,8 +12,6 @@ set(SLIC3R_GUI_SOURCES
     GUI/Printer/MediaUrlBuilder.hpp
     GUI/Printer/PrinterFileSystem.cpp
     GUI/Printer/PrinterFileSystem.h
-    GUI/Printer/VirtualBambuTunnel.cpp
-    GUI/Printer/VirtualBambuTunnel.hpp
     GUI/Widgets/AnimaController.hpp
     GUI/Widgets/AnimaController.cpp
     GUI/Widgets/AxisCtrlButton.cpp
@@ -617,12 +615,6 @@ set(SLIC3R_GUI_SOURCES
     Utils/NetworkAgent.hpp
     Utils/NetworkAgentPluginAdapter.cpp
     Utils/NetworkAgentPluginAdapter.hpp
-    Utils/VirtualLanPrinterStore.cpp
-    Utils/VirtualLanPrinterStore.hpp
-    Utils/VirtualMqttClient.cpp
-    Utils/VirtualMqttClient.hpp
-    Utils/VirtualFtpsClient.cpp
-    Utils/VirtualFtpsClient.hpp
     Utils/MKS.hpp
     Utils/MKS.cpp
     Utils/CpuMemory.cpp
@@ -716,6 +708,28 @@ target_include_directories(libslic3r_gui PRIVATE Utils)
 if (WIN32)
     target_include_directories(libslic3r_gui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../deps/WebView2/include)
 endif()
+
+# ---- Shared virtual-printer client (git submodule) -------------------------
+# The client-side virtual-printer wire layer (MQTT/FTPS/Tunnel) lives in the
+# bambu-virtual-client repo, consumed here as a git submodule at
+# Utils/bambu_virtual_client/. The same submodule is consumed by
+# OrcaSlicer-bridge. Server-side code (bambu_bridge/...) does NOT live in the
+# submodule by design.
+set(BAMBU_VIRTUAL_CLIENT_SLIC3R_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}
+    CACHE PATH "src/slic3r path for bambu_virtual_client" FORCE)
+set(BAMBU_VIRTUAL_CLIENT_SLICER_SRC_DIR     ${CMAKE_CURRENT_SOURCE_DIR}/..
+    CACHE PATH "src path for bambu_virtual_client" FORCE)
+set(BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR   ${CMAKE_CURRENT_SOURCE_DIR}/..
+    CACHE PATH "nlohmann/json include dir for bambu_virtual_client" FORCE)
+set(BAMBU_VIRTUAL_CLIENT_BOOST_INCLUDE_DIR  ${Boost_INCLUDE_DIRS}
+    CACHE PATH "Boost include dir for bambu_virtual_client" FORCE)
+set(BAMBU_VIRTUAL_CLIENT_EXTRA_INCLUDE_DIRS
+    "${CMAKE_BINARY_DIR}/src/libslic3r;${CMAKE_BINARY_DIR}/src/slic3r;${CMAKE_BINARY_DIR}/src/platform;${CMAKE_SOURCE_DIR}/src/eigen;${CMAKE_SOURCE_DIR}/src/libigl;${CMAKE_SOURCE_DIR}/src/hidapi/include;${CMAKE_SOURCE_DIR}/src/libnest2d/include;${CMAKE_SOURCE_DIR}/src/miniz;${CMAKE_SOURCE_DIR}/src/glu-libtess/include;${CMAKE_SOURCE_DIR}/src/clipper2/Clipper2Lib/include;${CMAKE_SOURCE_DIR}/src/minilzo;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include/opencascade"
+    CACHE STRING "extra include dirs (generated headers) for bambu_virtual_client" FORCE)
+set(BAMBU_VIRTUAL_CLIENT_BUILD_CLI OFF CACHE BOOL "" FORCE)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/Utils/bambu_virtual_client
+                 ${CMAKE_BINARY_DIR}/bambu_virtual_client)
+target_link_libraries(libslic3r_gui bambu_virtual_client)
 
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SLIC3R_GUI_SOURCES})
 

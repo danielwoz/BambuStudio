@@ -125,8 +125,8 @@
 #include "slic3r/GUI/BridgeOnlyConsoleApp.hpp"
 #include "slic3r/GUI/Printer/BridgeStorageBackend.hpp"
 #include "slic3r/Utils/NetworkAgentPluginAdapter.hpp"
-#include "slic3r/Utils/VirtualLanPrinterStore.hpp"
-#include "slic3r/Utils/VirtualMqttClient.hpp"
+#include "slic3r/Utils/bambu_virtual_client/VirtualLanPrinterStore.hpp"
+#include "slic3r/Utils/bambu_virtual_client/VirtualMqttClient.hpp"
 #include <cstring>
 #include <csignal>
 #include <unistd.h>

@@ -10,8 +10,8 @@
 #include "libslic3r/Utils.hpp"
 #include "slic3r/Utils/BBLUtil.hpp"
 #include "NetworkAgent.hpp"
-#include "VirtualMqttClient.hpp"
-#include "VirtualFtpsClient.hpp"
+#include "bambu_virtual_client/VirtualMqttClient.hpp"
+#include "bambu_virtual_client/VirtualFtpsClient.hpp"
 
 #include "slic3r/Utils/FileTransferUtils.hpp"
 #include "slic3r/Utils/CertificateVerify.hpp"

@@ -1,5 +1,5 @@
 #include "PrinterFileSystem.h"
-#include "VirtualBambuTunnel.hpp"
+#include "../../Utils/bambu_virtual_client/VirtualBambuTunnel.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Model.hpp"

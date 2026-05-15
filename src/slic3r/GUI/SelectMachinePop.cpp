@@ -6,7 +6,7 @@
 
 #include "slic3r/Utils/WxFontUtils.hpp"
 #include "slic3r/Utils/NetworkAgent.hpp"
-#include "slic3r/Utils/VirtualLanPrinterStore.hpp"
+#include "slic3r/Utils/bambu_virtual_client/VirtualLanPrinterStore.hpp"
 
 #include "GUI.hpp"
 #include "GUI_App.hpp"

@@ -133,32 +133,10 @@ if (BAMBU_BRIDGE)
     target_link_libraries(BambuStudio bambu_bridge)
     target_compile_definitions(BambuStudio PRIVATE BAMBU_BRIDGE)
     target_compile_definitions(libslic3r_gui PRIVATE BAMBU_BRIDGE)
+    target_link_libraries(BambuStudio bambu_virtual_client)
 
-    # Standalone testbed for the virtual-MQTT path. Compiles the
-    # slicer's VirtualMqttClient + a tiny main, no wx/X11/boost::log/
-    # libslic3r — just OpenSSL + the bridge's MQTT framer. Lets us
-    # iterate on bridge ↔ virtual-printer protocol issues without
-    # restarting the GUI.
-    find_package(OpenSSL REQUIRED)
-    add_executable(bambu_virtual_cli
-        slic3r/Utils/VirtualMqttClient.cpp
-        slic3r/Utils/VirtualFtpsClient.cpp
-        slic3r/Utils/VirtualMqttCli.cpp
-    )
-    target_include_directories(bambu_virtual_cli PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/slic3r/Utils
-    )
-    target_link_libraries(bambu_virtual_cli PRIVATE
-        bambu_bridge
-        OpenSSL::SSL
-        OpenSSL::Crypto
-        Threads::Threads
-    )
-    set_target_properties(bambu_virtual_cli PROPERTIES
-        CXX_STANDARD 17
-        CXX_STANDARD_REQUIRED ON
-    )
+    # The bambu_virtual_cli standalone testbed now ships with the
+    # bambu_virtual_client submodule (Utils/bambu_virtual_client/).
 endif ()
 if (APPLE)
 #    add_compile_options(-stdlib=libc++)

@@ -3,7 +3,7 @@
 #include "GCodeViewer.hpp"
 
 #include "slic3r/Utils/NetworkAgent.hpp"
-#include "slic3r/Utils/VirtualLanPrinterStore.hpp"
+#include "slic3r/Utils/bambu_virtual_client/VirtualLanPrinterStore.hpp"
 
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Thread.hpp"

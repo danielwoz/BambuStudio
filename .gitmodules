@@ -1,0 +1,3 @@
+[submodule "src/slic3r/Utils/bambu_virtual_client"]
+	path = src/slic3r/Utils/bambu_virtual_client
+	url = file:///home/danielwoz/bambu-virtual-client.git
