@@ -31,13 +31,19 @@
 // The broker isn't designed for thousands of concurrent virtual devices
 // — Bambu users typically own 1–4 printers, so 4 accept threads + 4 I/O
 // threads is fine.
+//
+// Networking is built on boost::asio for portability; the TLS layer is
+// still raw OpenSSL (SSL/SSL_CTX) because:
+//   - we need TLS-1.2-only pinning + in-memory PEM loading, which is
+//     simpler with the OpenSSL API than asio::ssl::context's wrapper;
+//   - the existing session I/O uses blocking SSL_read/SSL_write driven
+//     by select(), and we keep that loop intact by giving SSL the
+//     asio socket's native_handle().
+// The accept loop and the underlying TCP socket are asio, so the
+// Linux-only listen+accept+select scaffolding is gone.
 
 #ifndef SLIC3R_BAMBU_BRIDGE_SERVER_MQTT_BROKER_HPP
 #define SLIC3R_BAMBU_BRIDGE_SERVER_MQTT_BROKER_HPP
-
-#ifdef _WIN32
-#  error "phase 4 MqttBroker is Linux-only for now"
-#endif
 
 #include <atomic>
 #include <cstdint>

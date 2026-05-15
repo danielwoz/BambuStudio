@@ -1,4 +1,10 @@
 // Bambu Bridge — TLS MQTT broker implementation (phase 4b).
+//
+// Networking: boost::asio TCP for accept + per-session sockets.
+// TLS:        raw OpenSSL (SSL/SSL_CTX) on top of the asio socket's
+//             native_handle() — preserves TLS 1.2 pinning + in-memory PEM
+//             loading exactly as it was, while removing the Linux-only
+//             listen/accept/select scaffolding.
 
 #include "MqttBroker.hpp"
 
@@ -14,6 +20,8 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -21,14 +29,8 @@
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <boost/asio.hpp>
+#include <boost/system/error_code.hpp>
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -36,9 +38,21 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#ifdef _WIN32
+#  include <winsock2.h>
+#else
+#  include <sys/socket.h>
+#  include <sys/select.h>
+#  include <netinet/tcp.h>
+#endif
+
 namespace Slic3r {
 namespace bridge {
 namespace server {
+
+namespace asio = boost::asio;
+using asio::ip::tcp;
+using boost::system::error_code;
 
 namespace {
 
@@ -138,49 +152,6 @@ SSL_CTX* make_device_ctx(const tls::CertMaterial& cert) {
     return ctx;
 }
 
-// Bind a TCP listening socket to (ip, port). Returns -1 on failure and
-// sets `errno`.  On port==0 the kernel picks an ephemeral port; caller
-// can recover it with getsockname.
-int open_listener(const std::string& ip, uint16_t port, int backlog,
-                  uint16_t& bound_port_out) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
-    if (ip.empty() || ip == "0.0.0.0") {
-        addr.sin_addr.s_addr = INADDR_ANY;
-    } else if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
-        errno = EINVAL;
-        return -1;
-    }
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        const int saved = errno;
-        ::close(fd);
-        errno = saved;
-        return -1;
-    }
-    if (::listen(fd, backlog) < 0) {
-        const int saved = errno;
-        ::close(fd);
-        errno = saved;
-        return -1;
-    }
-    // Recover the actually-bound port (matters when port==0).
-    sockaddr_in actual{};
-    socklen_t len = sizeof(actual);
-    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&actual), &len) == 0) {
-        bound_port_out = ntohs(actual.sin_port);
-    } else {
-        bound_port_out = port;
-    }
-    return fd;
-}
-
 // Constant-time string compare for access-code validation. Real LAN
 // printers don't actually do this (their MQTT auth is plaintext), but it
 // costs nothing here and stops local timing-side-channel paranoia.
@@ -202,8 +173,11 @@ bool secure_streq(const std::string& a, const std::string& b) {
 struct MqttBroker::Device {
     MqttBrokerVirtualDevice spec;
     SSL_CTX*                ssl_ctx       = nullptr;
-    int                     listen_fd     = -1;
-    uint16_t                bound_port    = 0;
+
+    // asio plumbing. io_context is owned per-device, driven by accept_thread.
+    std::unique_ptr<asio::io_context>   io;
+    std::unique_ptr<tcp::acceptor>      acceptor;
+    uint16_t                            bound_port    = 0;
 
     std::atomic<bool>       stopped{false};
     std::thread             accept_thread;
@@ -211,10 +185,10 @@ struct MqttBroker::Device {
     // Sessions currently active for this device. The broker enforces
     // max_clients_per_device by checking size() at accept time.
     struct Session {
-        SSL*                ssl       = nullptr;
-        int                 fd        = -1;
-        std::thread         io_thread;
-        std::atomic<bool>   stopped{false};
+        SSL*                                  ssl       = nullptr;
+        std::unique_ptr<tcp::socket>          sock;     // owns native handle
+        std::thread                           io_thread;
+        std::atomic<bool>                     stopped{false};
 
         // Subscribed topic filters. We don't implement full wildcard
         // routing (Bambu doesn't use it on LAN), but we remember the set
@@ -229,6 +203,10 @@ struct MqttBroker::Device {
 
         // Per-session client-id from CONNECT, for logging.
         std::string client_id;
+
+        // Native socket fd cached at session creation so the I/O loop can
+        // hand it to SSL/select without re-asking asio.
+        int native_fd = -1;
     };
 
     // Pointers, not values, because std::thread inside Session makes
@@ -313,13 +291,16 @@ void session_io_loop(MqttBroker::Device* dev,
 // `http://<ip>:<mqtt_port>/upnp/desc.xml`) get a valid XML back
 // instead of a TLS error. The slicer then proceeds with MQTT-over-TLS
 // on a fresh TCP connection to the same port.
-void serve_http_descriptor(int fd, const MqttBrokerVirtualDevice& spec) {
+void serve_http_descriptor(tcp::socket& sock,
+                           const MqttBrokerVirtualDevice& spec) {
     // Drain the request line + headers; we don't actually parse them.
+    // Best-effort, non-blocking peek-style drain.
     {
         char drain[2048];
-        // Best-effort, single recv. If the slicer pipelined later
-        // requests we just close after the first one.
-        (void) ::recv(fd, drain, sizeof(drain), MSG_DONTWAIT);
+        error_code ignore;
+        sock.non_blocking(true, ignore);
+        sock.read_some(asio::buffer(drain, sizeof(drain)), ignore);
+        sock.non_blocking(false, ignore);
     }
 
     const std::string sn   = spec.virtual_dev_id.empty()
@@ -348,7 +329,8 @@ void serve_http_descriptor(int fd, const MqttBrokerVirtualDevice& spec) {
          << "\r\n"
          << body;
     const std::string r = resp.str();
-    (void) ::send(fd, r.data(), r.size(), MSG_NOSIGNAL);
+    error_code ignore;
+    asio::write(sock, asio::buffer(r), ignore);
 }
 }
 
@@ -385,19 +367,39 @@ void MqttBroker::stop() {
 }
 
 void MqttBroker::start_device(Device& d) {
-    if (d.listen_fd >= 0) return;
-    uint16_t bound = 0;
-    int fd = open_listener(d.spec.lan_ip, d.spec.port,
-                           m_cfg.accept_backlog, bound);
-    if (fd < 0) {
-        const int saved = errno;
-        throw std::runtime_error(std::string("MqttBroker: listen failed for ") +
+    if (d.acceptor) return;
+
+    d.io = std::make_unique<asio::io_context>();
+    d.acceptor = std::make_unique<tcp::acceptor>(*d.io);
+
+    error_code ec;
+    asio::ip::address bind_addr;
+    if (d.spec.lan_ip.empty() || d.spec.lan_ip == "0.0.0.0") {
+        bind_addr = asio::ip::address_v4::any();
+    } else {
+        bind_addr = asio::ip::make_address(d.spec.lan_ip, ec);
+        if (ec) {
+            d.acceptor.reset();
+            d.io.reset();
+            throw std::runtime_error("MqttBroker: bad bind addr " + d.spec.lan_ip +
+                                     ": " + ec.message());
+        }
+    }
+    tcp::endpoint ep(bind_addr, d.spec.port);
+
+    d.acceptor->open(ep.protocol(), ec);
+    if (!ec) d.acceptor->set_option(asio::socket_base::reuse_address(true), ec);
+    if (!ec) d.acceptor->bind(ep, ec);
+    if (!ec) d.acceptor->listen(m_cfg.accept_backlog, ec);
+    if (ec) {
+        d.acceptor.reset();
+        d.io.reset();
+        throw std::runtime_error("MqttBroker: listen failed for " +
                                  d.spec.lan_ip + ":" +
                                  std::to_string(d.spec.port) +
-                                 ": " + std::strerror(saved));
+                                 ": " + ec.message());
     }
-    d.listen_fd  = fd;
-    d.bound_port = bound;
+    d.bound_port = d.acceptor->local_endpoint().port();
     d.stopped.store(false);
 
     IUplink* uplink = m_cfg.uplink.get();
@@ -406,23 +408,28 @@ void MqttBroker::start_device(Device& d) {
 
     d.accept_thread = std::thread([&d, uplink, max_clients, io_timeout]() {
         while (!d.stopped.load()) {
-            // select() on the listener with a short timeout so stop() can
-            // wake us promptly without needing a self-pipe.
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(d.listen_fd, &rfds);
-            timeval tv{};
-            tv.tv_sec  = 0;
-            tv.tv_usec = 200 * 1000;  // 200 ms
+            // Async accept driven by io_context::run_for so the accept
+            // thread sees d.stopped flips promptly (within ~200ms). We
+            // reset() the io_context between iterations because it
+            // remembers the "no work + run() returned" state.
+            auto client_sock = std::make_unique<tcp::socket>(*d.io);
+            error_code aec = asio::error::would_block;
+            d.acceptor->async_accept(
+                *client_sock,
+                [&aec](const error_code& e) { aec = e; });
 
-            int rc = ::select(d.listen_fd + 1, &rfds, nullptr, nullptr, &tv);
-            if (rc <= 0) continue;
-
-            sockaddr_in peer{};
-            socklen_t peer_len = sizeof(peer);
-            int cfd = ::accept(d.listen_fd,
-                               reinterpret_cast<sockaddr*>(&peer), &peer_len);
-            if (cfd < 0) continue;
+            d.io->restart();
+            d.io->run_for(std::chrono::milliseconds(200));
+            if (aec == asio::error::would_block) {
+                // No connection arrived within the poll window. Cancel
+                // the pending async_accept so the next iteration starts
+                // clean, then loop.
+                error_code ignore;
+                d.acceptor->cancel(ignore);
+                d.io->run();
+                continue;
+            }
+            if (aec) continue;
 
             // Protocol-detect: TLS ClientHello starts with 0x16 (SSL3/
             // TLS Handshake content type). Anything else on this port
@@ -433,13 +440,15 @@ void MqttBroker::start_device(Device& d) {
             // TCP connection.
             unsigned char first = 0;
             {
-                int peeked = ::recv(cfd, &first, 1, MSG_PEEK);
-                if (peeked <= 0) { ::close(cfd); continue; }
+                // MSG_PEEK isn't directly exposed by asio; fall back to
+                // the native_handle for the one-byte peek.
+                int peeked = ::recv(client_sock->native_handle(),
+                                    reinterpret_cast<char*>(&first), 1, MSG_PEEK);
+                if (peeked <= 0) { continue; }   // socket auto-closes via dtor
             }
             if (first != 0x16) {
-                serve_http_descriptor(cfd, d.spec);
-                ::close(cfd);
-                continue;
+                serve_http_descriptor(*client_sock, d.spec);
+                continue;             // socket auto-closes
             }
 
             // Enforce max-concurrent-clients before doing the TLS handshake.
@@ -459,33 +468,37 @@ void MqttBroker::start_device(Device& d) {
                         "[mqtt-broker] rejecting connect for %s: "
                         "max_clients_per_device=%d reached\n",
                         d.spec.dev_id.c_str(), max_clients);
-                    ::close(cfd);
                     continue;
                 }
             }
 
-            // Socket-level options: keep-alive + receive timeout so a dead
-            // peer eventually gets reaped.
-            int one = 1;
-            ::setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-            ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            // Socket-level options: keep-alive + nodelay + receive timeout
+            // so a dead peer eventually gets reaped.
+            error_code ignore;
+            client_sock->set_option(asio::socket_base::keep_alive(true), ignore);
+            client_sock->set_option(tcp::no_delay(true), ignore);
             if (io_timeout > 0) {
+#ifdef _WIN32
+                DWORD rt_ms = io_timeout * 1000;
+                ::setsockopt(client_sock->native_handle(), SOL_SOCKET, SO_RCVTIMEO,
+                             reinterpret_cast<const char*>(&rt_ms), sizeof(rt_ms));
+#else
                 timeval rt{};
                 rt.tv_sec = io_timeout;
-                ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof(rt));
+                ::setsockopt(client_sock->native_handle(), SOL_SOCKET, SO_RCVTIMEO,
+                             &rt, sizeof(rt));
+#endif
             }
 
             // Build SSL object on this device's CTX.
             SSL* ssl = SSL_new(d.ssl_ctx);
-            if (!ssl) {
-                ::close(cfd);
-                continue;
-            }
-            SSL_set_fd(ssl, cfd);
+            if (!ssl) continue;
+            SSL_set_fd(ssl, static_cast<int>(client_sock->native_handle()));
 
             auto sess        = std::make_unique<MqttBroker::Device::Session>();
             sess->ssl        = ssl;
-            sess->fd         = cfd;
+            sess->sock       = std::move(client_sock);
+            sess->native_fd  = static_cast<int>(sess->sock->native_handle());
             sess->stopped.store(false);
 
             MqttBroker::Device::Session* raw = sess.get();
@@ -500,11 +513,12 @@ void MqttBroker::start_device(Device& d) {
 
 void MqttBroker::stop_device(Device& d) {
     d.stopped.store(true);
-    if (d.accept_thread.joinable()) d.accept_thread.join();
-    if (d.listen_fd >= 0) {
-        ::close(d.listen_fd);
-        d.listen_fd = -1;
+    if (d.acceptor) {
+        error_code ignore;
+        d.acceptor->close(ignore);
     }
+    if (d.accept_thread.joinable()) d.accept_thread.join();
+    d.acceptor.reset();
     // Tear down active sessions.
     std::vector<std::unique_ptr<Device::Session>> drained;
     {
@@ -514,12 +528,20 @@ void MqttBroker::stop_device(Device& d) {
     }
     for (auto& s : drained) {
         s->stopped.store(true);
-        // Closing the fd kicks SSL_read out of select.
-        if (s->fd >= 0) ::shutdown(s->fd, SHUT_RDWR);
+        // Shutting the socket kicks SSL_read out of select.
+        if (s->sock) {
+            error_code ignore;
+            s->sock->shutdown(tcp::socket::shutdown_both, ignore);
+        }
         if (s->io_thread.joinable()) s->io_thread.join();
         if (s->ssl) { SSL_free(s->ssl); s->ssl = nullptr; }
-        if (s->fd >= 0) { ::close(s->fd); s->fd = -1; }
+        if (s->sock) {
+            error_code ignore;
+            s->sock->close(ignore);
+            s->sock.reset();
+        }
     }
+    d.io.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -600,16 +622,17 @@ void session_io_loop(MqttBroker::Device* dev,
     // plenty for the bridge's traffic shape.
     auto try_read_some = [&]() -> int {
         // -1 = error/EOF, 0 = no data within poll window, 1 = got bytes.
+        const int fd = sess->native_fd;
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(sess->fd, &rfds);
+        FD_SET(fd, &rfds);
         timeval tv{};
         tv.tv_sec  = 0;
         tv.tv_usec = 100 * 1000; // 100 ms
         // If OpenSSL has data already buffered (TLS record contained more
         // than what SSL_read pulled), skip select entirely.
         if (SSL_pending(sess->ssl) == 0) {
-            int sr = ::select(sess->fd + 1, &rfds, nullptr, nullptr, &tv);
+            int sr = ::select(fd + 1, &rfds, nullptr, nullptr, &tv);
             if (sr < 0)  return -1;
             if (sr == 0) return 0;
         }
