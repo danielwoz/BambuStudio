@@ -42,10 +42,6 @@
 #ifndef SLIC3R_BAMBU_BRIDGE_SERVER_FTPS_SERVER_HPP
 #define SLIC3R_BAMBU_BRIDGE_SERVER_FTPS_SERVER_HPP
 
-#ifdef _WIN32
-#  error "phase 7 FtpsServer is Linux-only for now"
-#endif
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>

@@ -64,15 +64,17 @@
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <signal.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <boost/asio.hpp>
+#include <boost/system/error_code.hpp>
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#else
+#  include <arpa/inet.h>
+#  include <netinet/tcp.h>
+#  include <sys/socket.h>
+#endif
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -83,6 +85,10 @@
 namespace Slic3r {
 namespace bridge {
 namespace server {
+
+namespace asio = boost::asio;
+using asio::ip::tcp;
+using boost::system::error_code;
 
 namespace {
 
@@ -165,57 +171,53 @@ SSL_CTX* make_device_ctx(const tls::CertMaterial& cert) {
     return ctx;
 }
 
-int open_listener(const std::string& ip, uint16_t port, int backlog,
-                  uint16_t& bound_port_out) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
+// Bind+listen via asio. Returns nullptr on failure, otherwise an owning
+// pointer to a listening acceptor on the given io_context.
+std::unique_ptr<tcp::acceptor> open_listener_asio(
+        asio::io_context& io, const std::string& ip, uint16_t port,
+        int backlog, uint16_t& bound_port_out)
+{
+    auto acc = std::make_unique<tcp::acceptor>(io);
+    error_code ec;
+    asio::ip::address bind_addr;
     if (ip.empty() || ip == "0.0.0.0") {
-        addr.sin_addr.s_addr = INADDR_ANY;
-    } else if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
-        errno = EINVAL;
-        return -1;
-    }
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        const int saved = errno; ::close(fd); errno = saved; return -1;
-    }
-    if (::listen(fd, backlog) < 0) {
-        const int saved = errno; ::close(fd); errno = saved; return -1;
-    }
-    sockaddr_in actual{};
-    socklen_t len = sizeof(actual);
-    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&actual), &len) == 0) {
-        bound_port_out = ntohs(actual.sin_port);
+        bind_addr = asio::ip::address_v4::any();
     } else {
-        bound_port_out = port;
+        bind_addr = asio::ip::make_address(ip, ec);
+        if (ec) return nullptr;
     }
-    return fd;
+    tcp::endpoint ep(bind_addr, port);
+    acc->open(ep.protocol(), ec);
+    if (!ec) acc->set_option(asio::socket_base::reuse_address(true), ec);
+    if (!ec) acc->bind(ep, ec);
+    if (!ec) acc->listen(backlog, ec);
+    if (ec) return nullptr;
+    bound_port_out = acc->local_endpoint().port();
+    return acc;
 }
 
 // Open + bind a PASV data listener. Tries random ports in
-// [min, max] up to `attempts` times. Returns the listener fd
-// + the port via out-param, or -1 on exhaustion.
-int open_pasv_listener(uint16_t pmin, uint16_t pmax,
-                       const std::string& bind_ip,
-                       uint16_t& bound_port_out) {
+// [min, max] up to 16 times, then falls back to a kernel-picked
+// ephemeral port. Returns nullptr on total exhaustion.
+std::unique_ptr<tcp::acceptor> open_pasv_listener_asio(
+        asio::io_context& io,
+        uint16_t pmin, uint16_t pmax,
+        const std::string& bind_ip,
+        uint16_t& bound_port_out)
+{
     static thread_local std::mt19937 rng{std::random_device{}()};
     if (pmax < pmin) std::swap(pmin, pmax);
     std::uniform_int_distribution<uint16_t> dist(pmin, pmax);
     for (int i = 0; i < 16; ++i) {
         uint16_t p = dist(rng);
         uint16_t b = 0;
-        int fd = open_listener(bind_ip, p, /*backlog=*/1, b);
-        if (fd >= 0) { bound_port_out = b; return fd; }
+        auto acc = open_listener_asio(io, bind_ip, p, /*backlog=*/1, b);
+        if (acc) { bound_port_out = b; return acc; }
     }
-    // Last-ditch: kernel-picked ephemeral.
     uint16_t b = 0;
-    return open_listener(bind_ip, 0, /*backlog=*/1, b);
+    auto acc = open_listener_asio(io, bind_ip, 0, /*backlog=*/1, b);
+    if (acc) bound_port_out = b;
+    return acc;
 }
 
 bool secure_streq(const std::string& a, const std::string& b) {
@@ -269,6 +271,11 @@ bool reply_multi(SSL* ssl, int code,
 // Pull a single \r\n-terminated line from the SSL control channel into `out`.
 // `recv_buf` may already contain queued bytes from prior reads.
 // Returns true on success, false on EOF / TLS error / timeout.
+//
+// Uses a select() on the SSL's underlying socket for the wait-for-bytes
+// poll. select() with Winsock + POSIX fds is identical at the C API level
+// so this is portable; if we ever needed to drop select() entirely we'd
+// poll the asio socket via async_read with a deadline timer instead.
 bool read_line(SSL* ssl, int fd, std::vector<uint8_t>& recv_buf,
                std::string& out, std::chrono::seconds timeout) {
     out.clear();
@@ -338,7 +345,10 @@ std::string normalize_remote_path(const std::string& cwd, const std::string& arg
 struct FtpsServer::Device {
     FtpsVirtualDevice spec;
     SSL_CTX*          ssl_ctx     = nullptr;
-    int               listen_fd   = -1;
+
+    // asio plumbing per-device.
+    std::unique_ptr<asio::io_context> io;
+    std::unique_ptr<tcp::acceptor>    acceptor;
     uint16_t          bound_port  = 0;
 
     std::atomic<bool> stopped{false};
@@ -346,7 +356,7 @@ struct FtpsServer::Device {
 
     struct Session {
         SSL*              ssl = nullptr;
-        int               fd  = -1;
+        int               fd  = -1;        // native fd owned after release
         std::thread       io_thread;
         std::atomic<bool> stopped{false};
     };
@@ -457,17 +467,16 @@ void FtpsServer::stop() {
 }
 
 void FtpsServer::start_device(Device& d) {
-    if (d.listen_fd >= 0) return;
+    if (d.acceptor) return;
     uint16_t bound = 0;
-    int fd = open_listener(d.spec.lan_ip, d.spec.port,
-                           m_cfg.accept_backlog, bound);
-    if (fd < 0) {
-        const int saved = errno;
+    d.io = std::make_unique<asio::io_context>();
+    d.acceptor = open_listener_asio(*d.io, d.spec.lan_ip, d.spec.port,
+                                    m_cfg.accept_backlog, bound);
+    if (!d.acceptor) {
+        d.io.reset();
         throw std::runtime_error(std::string("FtpsServer: listen failed for ") +
-                                 d.spec.lan_ip + ":" + std::to_string(d.spec.port) +
-                                 ": " + std::strerror(saved));
+                                 d.spec.lan_ip + ":" + std::to_string(d.spec.port));
     }
-    d.listen_fd  = fd;
     d.bound_port = bound;
     d.stopped.store(false);
 
@@ -476,23 +485,51 @@ void FtpsServer::start_device(Device& d) {
 
     d.accept_thread = std::thread([&d, sink, cfg]() {
         while (!d.stopped.load()) {
-            fd_set rfds; FD_ZERO(&rfds); FD_SET(d.listen_fd, &rfds);
-            timeval tv{}; tv.tv_sec = 0; tv.tv_usec = 200 * 1000;
-            int rc = ::select(d.listen_fd + 1, &rfds, nullptr, nullptr, &tv);
-            if (rc <= 0) continue;
+            tcp::socket client_sock(*d.io);
+            error_code aec = asio::error::would_block;
+            d.acceptor->async_accept(
+                client_sock,
+                [&aec](const error_code& e) { aec = e; });
+            d.io->restart();
+            d.io->run_for(std::chrono::milliseconds(200));
+            if (aec == asio::error::would_block) {
+                error_code ignore;
+                d.acceptor->cancel(ignore);
+                d.io->run();
+                continue;
+            }
+            if (aec) {
+                if (aec == asio::error::operation_aborted) break;
+                continue;
+            }
 
-            sockaddr_in peer{}; socklen_t plen = sizeof(peer);
-            int cfd = ::accept(d.listen_fd,
-                               reinterpret_cast<sockaddr*>(&peer), &plen);
-            if (cfd < 0) continue;
+            // Release the asio socket's native handle into the I/O
+            // thread so the asio dtor doesn't close the fd that SSL
+            // now owns.
+            auto native = client_sock.native_handle();
+            error_code rel_ec;
+            client_sock.release(rel_ec);
+            int cfd = static_cast<int>(native);
 
             int one = 1;
+#ifndef _WIN32
             ::setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
             ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             if (cfg.io_timeout_seconds > 0) {
                 timeval rt{}; rt.tv_sec = cfg.io_timeout_seconds;
                 ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof(rt));
             }
+#else
+            ::setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE,
+                         reinterpret_cast<const char*>(&one), sizeof(one));
+            ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY,
+                         reinterpret_cast<const char*>(&one), sizeof(one));
+            if (cfg.io_timeout_seconds > 0) {
+                DWORD rt_ms = cfg.io_timeout_seconds * 1000;
+                ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO,
+                             reinterpret_cast<const char*>(&rt_ms), sizeof(rt_ms));
+            }
+#endif
 
             // Reap any finished sessions.
             {
@@ -508,7 +545,14 @@ void FtpsServer::start_device(Device& d) {
             }
 
             SSL* ssl = SSL_new(d.ssl_ctx);
-            if (!ssl) { ::close(cfd); continue; }
+            if (!ssl) {
+#ifdef _WIN32
+                ::closesocket(cfd);
+#else
+                ::close(cfd);
+#endif
+                continue;
+            }
             SSL_set_fd(ssl, cfd);
 
             auto sess = std::make_unique<FtpsServer::Device::Session>();
@@ -528,8 +572,13 @@ void FtpsServer::start_device(Device& d) {
 
 void FtpsServer::stop_device(Device& d) {
     d.stopped.store(true);
+    if (d.acceptor) {
+        error_code ignore;
+        d.acceptor->close(ignore);
+    }
     if (d.accept_thread.joinable()) d.accept_thread.join();
-    if (d.listen_fd >= 0) { ::close(d.listen_fd); d.listen_fd = -1; }
+    d.acceptor.reset();
+    d.io.reset();
 
     std::vector<std::unique_ptr<Device::Session>> drained;
     {
@@ -539,10 +588,23 @@ void FtpsServer::stop_device(Device& d) {
     }
     for (auto& s : drained) {
         s->stopped.store(true);
-        if (s->fd >= 0) ::shutdown(s->fd, SHUT_RDWR);
+        if (s->fd >= 0) {
+#ifdef _WIN32
+            ::shutdown(s->fd, SD_BOTH);
+#else
+            ::shutdown(s->fd, SHUT_RDWR);
+#endif
+        }
         if (s->io_thread.joinable()) s->io_thread.join();
         if (s->ssl) { SSL_free(s->ssl); s->ssl = nullptr; }
-        if (s->fd >= 0) { ::close(s->fd); s->fd = -1; }
+        if (s->fd >= 0) {
+#ifdef _WIN32
+            ::closesocket(s->fd);
+#else
+            ::close(s->fd);
+#endif
+            s->fd = -1;
+        }
     }
 }
 
@@ -557,7 +619,14 @@ struct DataChannel {
     int  fd  = -1;
     void close() {
         if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); ssl = nullptr; }
-        if (fd >= 0) { ::close(fd); fd = -1; }
+        if (fd >= 0) {
+#ifdef _WIN32
+            ::closesocket(fd);
+#else
+            ::close(fd);
+#endif
+            fd = -1;
+        }
     }
 };
 
@@ -571,7 +640,8 @@ struct DataChannel {
 // stream/receive bytes; that returns the established DataChannel (or
 // {nullptr,-1} on failure / timeout).
 struct PasvState {
-    int             listen_fd = -1;
+    std::unique_ptr<asio::io_context> io;
+    std::unique_ptr<tcp::acceptor>    acceptor;
     uint16_t        port      = 0;
     SSL_CTX*        ctx       = nullptr;
 
@@ -582,29 +652,56 @@ struct PasvState {
     std::thread     thr;
     std::atomic<bool> stop_req{false};
 
+    // True iff a PASV listener is currently bound. Equivalent to the old
+    // `listen_fd >= 0` predicate.
+    bool armed() const { return static_cast<bool>(acceptor); }
+
     void start_accept_thread(SSL_CTX* c, std::chrono::seconds timeout) {
         ctx = c;
-        const int lfd = listen_fd;
-        thr = std::thread([this, lfd, timeout]() {
+        thr = std::thread([this, timeout]() {
             DataChannel d;
             auto deadline = std::chrono::steady_clock::now() + timeout;
             while (!stop_req.load() &&
                    std::chrono::steady_clock::now() < deadline) {
-                fd_set rfds; FD_ZERO(&rfds); FD_SET(lfd, &rfds);
-                timeval tv{}; tv.tv_sec = 0; tv.tv_usec = 200 * 1000;
-                int rc = ::select(lfd + 1, &rfds, nullptr, nullptr, &tv);
-                if (rc <= 0) continue;
-                sockaddr_in peer{}; socklen_t plen = sizeof(peer);
-                int cfd = ::accept(lfd,
-                                   reinterpret_cast<sockaddr*>(&peer), &plen);
-                if (cfd < 0) continue;
+                tcp::socket client_sock(*io);
+                error_code aec = asio::error::would_block;
+                acceptor->async_accept(
+                    client_sock,
+                    [&aec](const error_code& e) { aec = e; });
+                io->restart();
+                io->run_for(std::chrono::milliseconds(200));
+                if (aec == asio::error::would_block) {
+                    error_code ignore;
+                    acceptor->cancel(ignore);
+                    io->run();
+                    continue;
+                }
+                if (aec) {
+                    if (aec == asio::error::operation_aborted) break;
+                    continue;
+                }
+                auto native = client_sock.native_handle();
+                error_code rel_ec;
+                client_sock.release(rel_ec);
+                int cfd = static_cast<int>(native);
                 SSL* ssl = SSL_new(ctx);
-                if (!ssl) { ::close(cfd); break; }
+                if (!ssl) {
+#ifdef _WIN32
+                    ::closesocket(cfd);
+#else
+                    ::close(cfd);
+#endif
+                    break;
+                }
                 SSL_set_fd(ssl, cfd);
                 if (SSL_accept(ssl) != 1) {
                     log_ssl_err("SSL_accept(data)");
                     SSL_free(ssl);
+#ifdef _WIN32
+                    ::closesocket(cfd);
+#else
                     ::close(cfd);
+#endif
                     break;
                 }
                 d.ssl = ssl;
@@ -630,16 +727,26 @@ struct PasvState {
 
     void close() {
         stop_req.store(true);
+        if (acceptor) {
+            error_code ignore;
+            acceptor->close(ignore);
+        }
         if (thr.joinable()) thr.join();
         // dc may still hold a live SSL+fd if take_channel wasn't called.
         dc.close();
-        if (listen_fd >= 0) { ::close(listen_fd); listen_fd = -1; port = 0; }
+        acceptor.reset();
+        io.reset();
+        port = 0;
         ctx  = nullptr;
         done = false;
         stop_req.store(false);
     }
     ~PasvState() { close(); }
 };
+
+// DataChannel::close uses ::close on POSIX. On Windows we'd need
+// closesocket, but the data SSL is freed first so we use the same
+// pattern as control sessions. Patch DataChannel::close to be portable.
 
 void session_io_loop(FtpsServer::Device* dev,
                      FtpsServer::Device::Session* sess,
@@ -682,9 +789,13 @@ void session_io_loop(FtpsServer::Device* dev,
         std::string ip = cfg.pasv_advertise_ip.empty() ? dev->spec.lan_ip
                                                        : cfg.pasv_advertise_ip;
         if (ip.empty() || ip == "0.0.0.0") ip = "127.0.0.1";
-        in_addr a{};
-        if (::inet_pton(AF_INET, ip.c_str(), &a) != 1) return false;
-        nbo_out = a.s_addr;
+        error_code ec;
+        auto addr_v4 = asio::ip::make_address_v4(ip, ec);
+        if (ec) return false;
+        // PASV reply wants the IP in network byte order (4 bytes high to
+        // low as printed). asio's to_uint() returns host-byte-order; we
+        // convert to NBO via htonl.
+        nbo_out = htonl(addr_v4.to_uint());
         return true;
     };
 
@@ -799,10 +910,13 @@ void session_io_loop(FtpsServer::Device* dev,
             // We bind PASV listener on the SAME ip we advertise so a
             // client connecting back to that ip can reach us.
             std::string pasv_bind = bind_ip.empty() ? std::string("0.0.0.0") : bind_ip;
-            pasv.listen_fd = open_pasv_listener(cfg.pasv_port_min,
-                                                cfg.pasv_port_max,
-                                                pasv_bind, pport);
-            if (pasv.listen_fd < 0) {
+            pasv.io = std::make_unique<asio::io_context>();
+            pasv.acceptor = open_pasv_listener_asio(*pasv.io,
+                                                    cfg.pasv_port_min,
+                                                    cfg.pasv_port_max,
+                                                    pasv_bind, pport);
+            if (!pasv.acceptor) {
+                pasv.io.reset();
                 reply(sess->ssl, 425, "Can't open data connection.");
                 continue;
             }
@@ -835,10 +949,13 @@ void session_io_loop(FtpsServer::Device* dev,
                 cfg.pasv_advertise_ip.empty() ? dev->spec.lan_ip
                                               : cfg.pasv_advertise_ip;
             std::string pasv_bind = bind_ip.empty() ? std::string("0.0.0.0") : bind_ip;
-            pasv.listen_fd = open_pasv_listener(cfg.pasv_port_min,
-                                                cfg.pasv_port_max,
-                                                pasv_bind, pport);
-            if (pasv.listen_fd < 0) {
+            pasv.io = std::make_unique<asio::io_context>();
+            pasv.acceptor = open_pasv_listener_asio(*pasv.io,
+                                                    cfg.pasv_port_min,
+                                                    cfg.pasv_port_max,
+                                                    pasv_bind, pport);
+            if (!pasv.acceptor) {
+                pasv.io.reset();
                 reply(sess->ssl, 425, "Can't open data connection.");
                 continue;
             }
@@ -850,7 +967,7 @@ void session_io_loop(FtpsServer::Device* dev,
             reply(sess->ssl, 229, buf);
         }
         else if (cmd == "LIST" || cmd == "NLST") {
-            if (pasv.listen_fd < 0) {
+            if (!pasv.armed()) {
                 reply(sess->ssl, 425, "Use PASV first.");
                 continue;
             }
@@ -862,7 +979,7 @@ void session_io_loop(FtpsServer::Device* dev,
             reply(sess->ssl, 226, "Directory send OK.");
         }
         else if (cmd == "STOR") {
-            if (pasv.listen_fd < 0) {
+            if (!pasv.armed()) {
                 reply(sess->ssl, 425, "Use PASV first.");
                 continue;
             }
