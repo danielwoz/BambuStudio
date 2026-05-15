@@ -41,18 +41,14 @@
 //      is what makes downstream BambuStudio listeners actually pick up
 //      our virtual device.
 //
-// Threading: one std::thread receives + responds on the 1900 socket, a
-// second thread (or the same one — see impl) emits the periodic NOTIFY
-// on both channels. stop() flips an atomic, closes the sockets, and joins.
-//
-// Linux-only for this phase — Windows port lands in a later milestone.
+// Implementation: built on boost::asio (matches the rest of the slicer's
+// networking stack — see `slic3r/Utils/Bonjour.cpp` for the same UDP
+// idiom). One io_context, one worker thread, one steady_timer for the
+// periodic announce. asio gives us portable POSIX/Winsock sockets — the
+// previous raw-fd implementation was Linux-only.
 
 #ifndef SLIC3R_BAMBU_BRIDGE_SERVER_SSDP_RESPONDER_HPP
 #define SLIC3R_BAMBU_BRIDGE_SERVER_SSDP_RESPONDER_HPP
-
-#ifdef _WIN32
-#  error "phase 3 SsdpResponder is Linux-only for now"
-#endif
 
 #include <atomic>
 #include <chrono>
@@ -63,10 +59,7 @@
 #include <thread>
 #include <vector>
 
-// Forward-declare the POSIX sockaddr_in via its system header — declaring
-// it ourselves inside a namespace would introduce a different type from
-// the one in <netinet/in.h>. The header is small and zero-cost.
-#include <netinet/in.h>
+#include <boost/asio.hpp>
 
 namespace Slic3r {
 namespace bridge {
@@ -137,24 +130,32 @@ public:
                                      bool alive /* true=alive, false=byebye */);
 
 private:
-    void recv_loop();
-    void announce_loop();
-
+    void start_async_receive();
+    void on_receive(const boost::system::error_code& ec, std::size_t bytes);
     void handle_search(const std::string& payload,
-                       const ::sockaddr_in& sender,
-                       int reply_fd);
-
+                       const boost::asio::ip::udp::endpoint& sender);
+    void schedule_announce();
     void emit_notify(bool alive);   // multicast + bambu broadcast for every device
 
     SsdpResponderConfig            m_cfg;
     std::atomic<bool>              m_running{false};
 
-    int                            m_recv_fd_1900    = -1;
-    int                            m_bambu_send_fd   = -1; // 255.255.255.255:2021
-    int                            m_multicast_fd    = -1; // 239.255.255.250:1900
+    // asio plumbing — owned for the lifetime of the responder. work_guard
+    // keeps io_context::run() pinned until stop() resets it.
+    std::unique_ptr<boost::asio::io_context> m_io;
+    std::unique_ptr<boost::asio::executor_work_guard<
+        boost::asio::io_context::executor_type>> m_work;
 
-    std::thread                    m_recv_thread;
-    std::thread                    m_announce_thread;
+    std::unique_ptr<boost::asio::ip::udp::socket> m_recv_socket;   // bound to *:1900
+    std::unique_ptr<boost::asio::ip::udp::socket> m_multicast_socket; // unbound, for 239.255.255.250:1900
+    std::unique_ptr<boost::asio::ip::udp::socket> m_bambu_socket;  // unbound, for 255.255.255.255:2021
+    std::unique_ptr<boost::asio::steady_timer>    m_announce_timer;
+
+    // Receive buffer + sender endpoint for the current async_receive_from.
+    std::vector<char>                     m_recv_buf;
+    boost::asio::ip::udp::endpoint        m_recv_sender;
+
+    std::thread                    m_io_thread;
 
     mutable std::mutex             m_devices_mutex;
     std::vector<SsdpVirtualDevice> m_devices;

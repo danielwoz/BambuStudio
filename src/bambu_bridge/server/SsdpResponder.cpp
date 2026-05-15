@@ -1,4 +1,10 @@
 // Bambu Bridge — SSDP responder implementation (phase 3).
+//
+// Built on boost::asio for portability — matches the rest of the slicer's
+// networking style (see slic3r/Utils/Bonjour.cpp for the same UDP
+// async-receive idiom). Threading: one io_context driven by a single
+// worker thread. The periodic announce uses a steady_timer chained from
+// itself; M-SEARCH replies happen on the same thread via the recv socket.
 
 #include "SsdpResponder.hpp"
 
@@ -13,20 +19,17 @@
 #include <set>
 #include <sstream>
 #include <string>
-#include <thread>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <boost/asio.hpp>
+#include <boost/system/error_code.hpp>
 
 namespace Slic3r {
 namespace bridge {
 namespace server {
+
+namespace asio = boost::asio;
+using asio::ip::udp;
+using boost::system::error_code;
 
 namespace {
 
@@ -128,72 +131,6 @@ bool st_matches(const std::string& payload) {
     return false;
 }
 
-void close_fd(int& fd) {
-    if (fd >= 0) {
-        ::close(fd);
-        fd = -1;
-    }
-}
-
-// Open a UDP socket bound to bind_addr:port with SO_REUSEADDR + SO_REUSEPORT
-// (when available). Returns the fd or -1 on failure.
-int open_udp_bound(const std::string& bind_addr, uint16_t port,
-                   bool join_multicast, bool allow_broadcast)
-{
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
-
-    int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-#ifdef SO_REUSEPORT
-    // Allow other SSDP listeners (e.g. avahi, BambuStudio itself) to coexist.
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-#endif
-    if (allow_broadcast) {
-        ::setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
-    if (bind_addr.empty() || bind_addr == "0.0.0.0") {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else if (::inet_pton(AF_INET, bind_addr.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
-        return -1;
-    }
-
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
-        return -1;
-    }
-
-    if (join_multicast) {
-        ip_mreq mreq{};
-        mreq.imr_multiaddr.s_addr = ::inet_addr(kSsdpMulticastIPv4);
-        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-        // Non-fatal if it fails (lo-only test environments etc.) — recorded
-        // through the caller's error path.
-        ::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
-        // TTL=4 is what most upnp implementations use for SSDP; setting
-        // it gives us reach across one router hop without flooding.
-        unsigned char ttl = 4;
-        ::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
-        // Disable loopback only for non-test code paths; we want loopback
-        // *on* so the integration test can hear its own announces on lo.
-    }
-    return fd;
-}
-
-// Open an unbound UDP socket suitable for sending broadcasts.
-int open_udp_send_broadcast() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
-    int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
-    return fd;
-}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -255,96 +192,170 @@ std::vector<SsdpVirtualDevice> SsdpResponder::devices() const {
 void SsdpResponder::start() {
     if (m_running.exchange(true)) return;
 
+    m_io = std::make_unique<asio::io_context>();
+    m_work = std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
+        m_io->get_executor());
+
     // 1900 receive socket (also used for sending unicast replies). May fail
     // on locked-down test hosts; we keep running with the announce-only path.
-    m_recv_fd_1900 = open_udp_bound(m_cfg.bind_address, kSsdpPort,
-                                    /*join_multicast=*/true,
-                                    /*allow_broadcast=*/false);
+    {
+        error_code ec;
+        auto sock = std::make_unique<udp::socket>(*m_io);
+        sock->open(udp::v4(), ec);
+        if (!ec) {
+            sock->set_option(asio::socket_base::reuse_address(true), ec);
+#ifdef SO_REUSEPORT
+            // asio doesn't expose SO_REUSEPORT directly; set it manually
+            // so other SSDP listeners on the same host can coexist.
+            int one = 1;
+            ::setsockopt(sock->native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                         &one, sizeof(one));
+#endif
+        }
+        asio::ip::address bind_addr;
+        if (m_cfg.bind_address.empty() || m_cfg.bind_address == "0.0.0.0") {
+            bind_addr = asio::ip::address_v4::any();
+        } else {
+            bind_addr = asio::ip::make_address(m_cfg.bind_address, ec);
+        }
+        if (!ec) {
+            sock->bind(udp::endpoint(bind_addr, kSsdpPort), ec);
+        }
+        if (!ec) {
+            // Join the 239.255.255.250 multicast group; non-fatal if it
+            // fails (lo-only test environments).
+            error_code ignore;
+            sock->set_option(
+                asio::ip::multicast::join_group(
+                    asio::ip::make_address_v4(kSsdpMulticastIPv4)),
+                ignore);
+            sock->set_option(asio::ip::multicast::hops(4), ignore);
+            m_recv_socket = std::move(sock);
+        }
+        // If bind failed, m_recv_socket stays null and we operate in
+        // announce-only mode (same as old code).
+    }
 
     // Separate send socket for multicast announces — we don't bind it so
     // the kernel picks the right outbound interface per-packet.
-    m_multicast_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (m_multicast_fd >= 0) {
-        unsigned char ttl = 4;
-        ::setsockopt(m_multicast_fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
-        unsigned char loop = 1;  // hear-yourself for loopback tests
-        ::setsockopt(m_multicast_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+    {
+        error_code ec;
+        auto sock = std::make_unique<udp::socket>(*m_io);
+        sock->open(udp::v4(), ec);
+        if (!ec) {
+            error_code ignore;
+            sock->set_option(asio::ip::multicast::hops(4), ignore);
+            // hear-yourself loopback so the integration test can observe
+            // its own announces on lo.
+            sock->set_option(asio::ip::multicast::enable_loopback(true), ignore);
+            m_multicast_socket = std::move(sock);
+        }
     }
 
     if (m_cfg.enable_bambu_broadcast) {
-        m_bambu_send_fd = open_udp_send_broadcast();
+        error_code ec;
+        auto sock = std::make_unique<udp::socket>(*m_io);
+        sock->open(udp::v4(), ec);
+        if (!ec) {
+            error_code ignore;
+            sock->set_option(asio::socket_base::broadcast(true), ignore);
+            m_bambu_socket = std::move(sock);
+        }
     }
 
-    // Recv loop only if we managed to bind 1900.
-    if (m_recv_fd_1900 >= 0) {
-        m_recv_thread = std::thread([this] { recv_loop(); });
+    if (m_recv_socket) {
+        m_recv_buf.resize(4096);
+        start_async_receive();
     }
 
-    // Announce loop — emits an initial ssdp:alive immediately, then on
+    // Announce timer — emits an initial ssdp:alive immediately, then on
     // interval until stop().
-    m_announce_thread = std::thread([this] { announce_loop(); });
+    m_announce_timer = std::make_unique<asio::steady_timer>(*m_io);
+    if (m_cfg.enable_multicast_send) {
+        asio::post(*m_io, [this] { emit_notify(/*alive=*/true); });
+    }
+    schedule_announce();
+
+    // Drive the io_context on a dedicated thread.
+    m_io_thread = std::thread([this] {
+        try { m_io->run(); }
+        catch (const std::exception& ex) {
+            std::fprintf(stderr, "[ssdp-responder] io thread exception: %s\n",
+                         ex.what());
+        }
+    });
 }
 
 void SsdpResponder::stop() {
     if (!m_running.exchange(false)) return;
 
-    // Emit one final ssdp:byebye per device on a best-effort basis. This
-    // has to happen *before* we close the send sockets.
+    // Emit one final ssdp:byebye per device on a best-effort basis. Done
+    // synchronously on the calling thread before tearing down sockets.
     emit_notify(/*alive=*/false);
 
-    // Closing the recv socket interrupts the blocked select() in recv_loop.
-    close_fd(m_recv_fd_1900);
+    if (m_io) {
+        // Cancel outstanding async ops and stop the io_context so the
+        // worker thread can join.
+        asio::post(*m_io, [this] {
+            error_code ignore;
+            if (m_recv_socket)      m_recv_socket->close(ignore);
+            if (m_announce_timer)   m_announce_timer->cancel(ignore);
+        });
+        if (m_work) m_work.reset();
+        m_io->stop();
+    }
 
-    if (m_recv_thread.joinable())     m_recv_thread.join();
-    if (m_announce_thread.joinable()) m_announce_thread.join();
+    if (m_io_thread.joinable()) m_io_thread.join();
 
-    close_fd(m_multicast_fd);
-    close_fd(m_bambu_send_fd);
+    // Now safe to destroy asio objects.
+    m_recv_socket.reset();
+    m_multicast_socket.reset();
+    m_bambu_socket.reset();
+    m_announce_timer.reset();
+    m_io.reset();
 }
 
 // ---------------------------------------------------------------------------
-// Receive / respond
+// Receive / respond (asio async chain)
 // ---------------------------------------------------------------------------
 
-void SsdpResponder::recv_loop() {
-    std::array<char, 4096> buf{};
-    while (m_running.load()) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(m_recv_fd_1900, &rfds);
-        timeval tv{};
-        tv.tv_sec  = 0;
-        tv.tv_usec = 250 * 1000;        // 250 ms — bounded shutdown latency
-        int rc = ::select(m_recv_fd_1900 + 1, &rfds, nullptr, nullptr, &tv);
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (rc == 0) continue;
-        if (!FD_ISSET(m_recv_fd_1900, &rfds)) continue;
+void SsdpResponder::start_async_receive() {
+    if (!m_recv_socket) return;
+    m_recv_socket->async_receive_from(
+        asio::buffer(m_recv_buf), m_recv_sender,
+        [this](const error_code& ec, std::size_t bytes) {
+            on_receive(ec, bytes);
+        });
+}
 
-        sockaddr_in sender{};
-        socklen_t   slen = sizeof(sender);
-        ssize_t n = ::recvfrom(m_recv_fd_1900, buf.data(), buf.size(), 0,
-                               reinterpret_cast<sockaddr*>(&sender), &slen);
-        if (n <= 0) continue;
-        std::string payload(buf.data(), buf.data() + n);
-        if (!is_msearch(payload))   continue;
-        if (!st_matches(payload))   continue;
-        handle_search(payload, sender, m_recv_fd_1900);
+void SsdpResponder::on_receive(const error_code& ec, std::size_t bytes) {
+    if (!m_running.load()) return;
+    if (ec) {
+        // socket closed by stop(): bail out without rescheduling.
+        if (ec == asio::error::operation_aborted) return;
+        // Transient — try again.
+        start_async_receive();
+        return;
     }
+    if (bytes > 0) {
+        std::string payload(m_recv_buf.data(), m_recv_buf.data() + bytes);
+        if (is_msearch(payload) && st_matches(payload)) {
+            handle_search(payload, m_recv_sender);
+        }
+    }
+    start_async_receive();
 }
 
 void SsdpResponder::handle_search(const std::string& /*payload*/,
-                                  const ::sockaddr_in& sender,
-                                  int reply_fd)
+                                  const udp::endpoint& sender)
 {
+    if (!m_recv_socket) return;
     // One unicast 200-OK reply per virtual device.
     auto devs = devices();
     for (const auto& dev : devs) {
         const std::string body = format_search_response(dev);
-        ::sendto(reply_fd, body.data(), body.size(), 0,
-                 reinterpret_cast<const sockaddr*>(&sender), sizeof(sender));
+        error_code ignore;
+        m_recv_socket->send_to(asio::buffer(body), sender, 0, ignore);
     }
 }
 
@@ -352,22 +363,15 @@ void SsdpResponder::handle_search(const std::string& /*payload*/,
 // Announce
 // ---------------------------------------------------------------------------
 
-void SsdpResponder::announce_loop() {
-    // Initial alive immediately on start (real printers do the same — first
-    // NOTIFY hits the wire within a second of boot).
-    if (m_cfg.enable_multicast_send) emit_notify(/*alive=*/true);
-
-    const auto period = m_cfg.notify_interval;
-    auto next = std::chrono::steady_clock::now() + period;
-    while (m_running.load()) {
-        // Sleep in small slices so stop() doesn't have to wait `period`.
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (!m_running.load()) break;
-        if (!m_cfg.enable_multicast_send) continue;
-        if (std::chrono::steady_clock::now() < next) continue;
-        emit_notify(/*alive=*/true);
-        next = std::chrono::steady_clock::now() + period;
-    }
+void SsdpResponder::schedule_announce() {
+    if (!m_announce_timer) return;
+    m_announce_timer->expires_after(m_cfg.notify_interval);
+    m_announce_timer->async_wait([this](const error_code& ec) {
+        if (ec) return;
+        if (!m_running.load()) return;
+        if (m_cfg.enable_multicast_send) emit_notify(/*alive=*/true);
+        schedule_announce();
+    });
 }
 
 void SsdpResponder::emit_notify(bool alive) {
@@ -378,17 +382,8 @@ void SsdpResponder::emit_notify(bool alive) {
         devs = m_devices;
     }
 
-    // Multicast destination 239.255.255.250:1900.
-    sockaddr_in mcast{};
-    mcast.sin_family = AF_INET;
-    mcast.sin_port   = htons(kSsdpPort);
-    mcast.sin_addr.s_addr = ::inet_addr(kSsdpMulticastIPv4);
-
-    // Bambu broadcast destination 255.255.255.255:2021.
-    sockaddr_in bcast{};
-    bcast.sin_family = AF_INET;
-    bcast.sin_port   = htons(kBambuBroadcastPort);
-    bcast.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    udp::endpoint mcast(asio::ip::make_address_v4(kSsdpMulticastIPv4), kSsdpPort);
+    udp::endpoint bcast(asio::ip::address_v4::broadcast(), kBambuBroadcastPort);
 
     for (const auto& dev : devs) {
         const std::string body = format_notify(dev, alive);
@@ -413,13 +408,12 @@ void SsdpResponder::emit_notify(bool alive) {
                 }
             }
         }
-        if (m_multicast_fd >= 0) {
-            ::sendto(m_multicast_fd, body.data(), body.size(), 0,
-                     reinterpret_cast<const sockaddr*>(&mcast), sizeof(mcast));
+        error_code ignore;
+        if (m_multicast_socket && m_multicast_socket->is_open()) {
+            m_multicast_socket->send_to(asio::buffer(body), mcast, 0, ignore);
         }
-        if (m_bambu_send_fd >= 0) {
-            ::sendto(m_bambu_send_fd, body.data(), body.size(), 0,
-                     reinterpret_cast<const sockaddr*>(&bcast), sizeof(bcast));
+        if (m_bambu_socket && m_bambu_socket->is_open()) {
+            m_bambu_socket->send_to(asio::buffer(body), bcast, 0, ignore);
         }
     }
 }
