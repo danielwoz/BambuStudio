@@ -40,10 +40,6 @@
 #ifndef SLIC3R_BAMBU_BRIDGE_SERVER_RTSP_SERVER_HPP
 #define SLIC3R_BAMBU_BRIDGE_SERVER_RTSP_SERVER_HPP
 
-#ifdef _WIN32
-#  error "phase 8 RtspServer is Linux-only for now"
-#endif
-
 #include <atomic>
 #include <cstdint>
 #include <memory>

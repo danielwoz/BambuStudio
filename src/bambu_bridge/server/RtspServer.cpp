@@ -63,15 +63,17 @@
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <signal.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <boost/asio.hpp>
+#include <boost/system/error_code.hpp>
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#else
+#  include <arpa/inet.h>
+#  include <netinet/tcp.h>
+#  include <sys/socket.h>
+#endif
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -82,6 +84,10 @@
 namespace Slic3r {
 namespace bridge {
 namespace server {
+
+namespace asio = boost::asio;
+using asio::ip::tcp;
+using boost::system::error_code;
 
 namespace {
 
@@ -156,37 +162,29 @@ SSL_CTX* make_device_ctx(const tls::CertMaterial& cert) {
     return ctx;
 }
 
-int open_listener(const std::string& ip, uint16_t port, int backlog,
-                  uint16_t& bound_port_out) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
+// Bind+listen via asio. Returns nullptr on failure, otherwise an owning
+// pointer to a listening acceptor on the given io_context.
+std::unique_ptr<tcp::acceptor> open_listener_asio(
+        asio::io_context& io, const std::string& ip, uint16_t port,
+        int backlog, uint16_t& bound_port_out)
+{
+    auto acc = std::make_unique<tcp::acceptor>(io);
+    error_code ec;
+    asio::ip::address bind_addr;
     if (ip.empty() || ip == "0.0.0.0") {
-        addr.sin_addr.s_addr = INADDR_ANY;
-    } else if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
-        errno = EINVAL;
-        return -1;
-    }
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        const int saved = errno; ::close(fd); errno = saved; return -1;
-    }
-    if (::listen(fd, backlog) < 0) {
-        const int saved = errno; ::close(fd); errno = saved; return -1;
-    }
-    sockaddr_in actual{};
-    socklen_t len = sizeof(actual);
-    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&actual), &len) == 0) {
-        bound_port_out = ntohs(actual.sin_port);
+        bind_addr = asio::ip::address_v4::any();
     } else {
-        bound_port_out = port;
+        bind_addr = asio::ip::make_address(ip, ec);
+        if (ec) return nullptr;
     }
-    return fd;
+    tcp::endpoint ep(bind_addr, port);
+    acc->open(ep.protocol(), ec);
+    if (!ec) acc->set_option(asio::socket_base::reuse_address(true), ec);
+    if (!ec) acc->bind(ep, ec);
+    if (!ec) acc->listen(backlog, ec);
+    if (ec) return nullptr;
+    bound_port_out = acc->local_endpoint().port();
+    return acc;
 }
 
 bool ssl_write_all(SSL* ssl, const void* data, size_t n) {
@@ -537,7 +535,10 @@ std::string build_sdp(const std::string& ctrl_base,
 struct RtspServer::Device {
     RtspVirtualDevice spec;
     SSL_CTX*          ssl_ctx    = nullptr;
-    int               listen_fd  = -1;
+
+    // asio plumbing per-device.
+    std::unique_ptr<asio::io_context> io;
+    std::unique_ptr<tcp::acceptor>    acceptor;
     uint16_t          bound_port = 0;
 
     std::atomic<bool> stopped{false};
@@ -842,17 +843,16 @@ void RtspServer::stop() {
 }
 
 void RtspServer::start_device(Device& d) {
-    if (d.listen_fd >= 0) return;
+    if (d.acceptor) return;
     uint16_t bound = 0;
-    int fd = open_listener(d.spec.lan_ip, d.spec.port,
-                           m_cfg.accept_backlog, bound);
-    if (fd < 0) {
-        const int saved = errno;
+    d.io = std::make_unique<asio::io_context>();
+    d.acceptor = open_listener_asio(*d.io, d.spec.lan_ip, d.spec.port,
+                                    m_cfg.accept_backlog, bound);
+    if (!d.acceptor) {
+        d.io.reset();
         throw std::runtime_error(std::string("RtspServer: listen failed for ") +
-                                 d.spec.lan_ip + ":" + std::to_string(d.spec.port) +
-                                 ": " + std::strerror(saved));
+                                 d.spec.lan_ip + ":" + std::to_string(d.spec.port));
     }
-    d.listen_fd  = fd;
     d.bound_port = bound;
     d.stopped.store(false);
 
@@ -860,23 +860,47 @@ void RtspServer::start_device(Device& d) {
 
     d.accept_thread = std::thread([&d, cfg]() {
         while (!d.stopped.load()) {
-            fd_set rfds; FD_ZERO(&rfds); FD_SET(d.listen_fd, &rfds);
-            timeval tv{}; tv.tv_sec = 0; tv.tv_usec = 200 * 1000;
-            int rc = ::select(d.listen_fd + 1, &rfds, nullptr, nullptr, &tv);
-            if (rc <= 0) continue;
-
-            sockaddr_in peer{}; socklen_t plen = sizeof(peer);
-            int cfd = ::accept(d.listen_fd,
-                               reinterpret_cast<sockaddr*>(&peer), &plen);
-            if (cfd < 0) continue;
+            tcp::socket client_sock(*d.io);
+            error_code aec = asio::error::would_block;
+            d.acceptor->async_accept(
+                client_sock,
+                [&aec](const error_code& e) { aec = e; });
+            d.io->restart();
+            d.io->run_for(std::chrono::milliseconds(200));
+            if (aec == asio::error::would_block) {
+                error_code ignore;
+                d.acceptor->cancel(ignore);
+                d.io->run();
+                continue;
+            }
+            if (aec) {
+                if (aec == asio::error::operation_aborted) break;
+                continue;
+            }
+            auto native = client_sock.native_handle();
+            error_code rel_ec;
+            client_sock.release(rel_ec);
+            int cfd = static_cast<int>(native);
 
             int one = 1;
+#ifndef _WIN32
             ::setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
             ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             if (cfg.io_timeout_seconds > 0) {
                 timeval rt{}; rt.tv_sec = cfg.io_timeout_seconds;
                 ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof(rt));
             }
+#else
+            ::setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE,
+                         reinterpret_cast<const char*>(&one), sizeof(one));
+            ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY,
+                         reinterpret_cast<const char*>(&one), sizeof(one));
+            if (cfg.io_timeout_seconds > 0) {
+                DWORD rt_ms = cfg.io_timeout_seconds * 1000;
+                ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO,
+                             reinterpret_cast<const char*>(&rt_ms), sizeof(rt_ms));
+            }
+#endif
 
             // Reap finished sessions; enforce max_sessions_per_device.
             {
@@ -891,13 +915,24 @@ void RtspServer::start_device(Device& d) {
                 }
                 if (cfg.max_sessions_per_device > 0 &&
                     static_cast<int>(d.sessions.size()) >= cfg.max_sessions_per_device) {
+#ifdef _WIN32
+                    ::closesocket(cfd);
+#else
                     ::close(cfd);
+#endif
                     continue;
                 }
             }
 
             SSL* ssl = SSL_new(d.ssl_ctx);
-            if (!ssl) { ::close(cfd); continue; }
+            if (!ssl) {
+#ifdef _WIN32
+                ::closesocket(cfd);
+#else
+                ::close(cfd);
+#endif
+                continue;
+            }
             SSL_set_fd(ssl, cfd);
 
             auto sess = std::make_unique<RtspServer::Device::Session>();
@@ -917,8 +952,13 @@ void RtspServer::start_device(Device& d) {
 
 void RtspServer::stop_device(Device& d) {
     d.stopped.store(true);
+    if (d.acceptor) {
+        error_code ignore;
+        d.acceptor->close(ignore);
+    }
     if (d.accept_thread.joinable()) d.accept_thread.join();
-    if (d.listen_fd >= 0) { ::close(d.listen_fd); d.listen_fd = -1; }
+    d.acceptor.reset();
+    d.io.reset();
 
     std::vector<std::unique_ptr<Device::Session>> drained;
     {
@@ -928,10 +968,23 @@ void RtspServer::stop_device(Device& d) {
     }
     for (auto& s : drained) {
         s->stopped.store(true);
-        if (s->fd >= 0) ::shutdown(s->fd, SHUT_RDWR);
+        if (s->fd >= 0) {
+#ifdef _WIN32
+            ::shutdown(s->fd, SD_BOTH);
+#else
+            ::shutdown(s->fd, SHUT_RDWR);
+#endif
+        }
         if (s->io_thread.joinable()) s->io_thread.join();
         if (s->ssl) { SSL_free(s->ssl); s->ssl = nullptr; }
-        if (s->fd >= 0) { ::close(s->fd); s->fd = -1; }
+        if (s->fd >= 0) {
+#ifdef _WIN32
+            ::closesocket(s->fd);
+#else
+            ::close(s->fd);
+#endif
+            s->fd = -1;
+        }
     }
     if (d.spec.source) d.spec.source->close();
 }
