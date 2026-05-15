@@ -11,29 +11,28 @@
 // without this listener we'd never know where to point LanUplink /
 // MQTT-over-TLS at.
 //
-// Threading: one POSIX `select`+`recvfrom` loop on a dedicated thread.
-// stop() flips an atomic, closes the socket, and joins.
+// Implementation: built on boost::asio. One io_context, one worker
+// thread, async_receive_from chained from itself. stop() closes the
+// socket which triggers operation_aborted in the handler.
 //
 // Coexistence: SO_REUSEADDR + SO_REUSEPORT are both set so the listener
 // can run alongside another SSDP consumer on the same host (most notably
 // BambuStudio's own bambu_net_oss listener if we ever embed the bridge
 // in the GUI). Each consumer receives its own copy of every broadcast.
-//
-// Linux-only for now — matches SsdpResponder's scope.
 
 #ifndef SLIC3R_BAMBU_BRIDGE_SERVER_SSDP_LISTENER_HPP
 #define SLIC3R_BAMBU_BRIDGE_SERVER_SSDP_LISTENER_HPP
 
-#ifdef _WIN32
-#  error "SsdpListener is Linux-only for now"
-#endif
-
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <vector>
+
+#include <boost/asio.hpp>
 
 namespace Slic3r {
 namespace bridge {
@@ -73,15 +72,24 @@ public:
     bool running() const noexcept { return m_running.load(); }
 
 private:
-    void recv_loop();
+    void start_async_receive();
+    void on_receive(const boost::system::error_code& ec, std::size_t bytes);
 
     Config            m_cfg;
     HeardCallback     m_cb;
     std::atomic<bool> m_running{false};
-    int               m_fd = -1;
+
+    std::unique_ptr<boost::asio::io_context>           m_io;
+    std::unique_ptr<boost::asio::executor_work_guard<
+        boost::asio::io_context::executor_type>>       m_work;
+    std::unique_ptr<boost::asio::ip::udp::socket>      m_socket;
+
+    std::vector<char>                                  m_buf;
+    boost::asio::ip::udp::endpoint                     m_sender;
+
     std::thread       m_thread;
     // dev_ids whose raw NOTIFY payload we've already verbose-dumped.
-    // Single-threaded reads/writes (only the recv thread touches it).
+    // Single-threaded reads/writes (only the io thread touches it).
     std::unordered_set<std::string> m_dumped;
 };
 
