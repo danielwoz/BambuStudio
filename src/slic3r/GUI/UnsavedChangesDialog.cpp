@@ -1791,7 +1791,7 @@ void UnsavedChangesDialog::update_tree(Preset::Type type, PresetCollection* pres
             if (variant_index >= 0) {
                 if (printer_options_with_variant_2.count(opt_key.substr(0, opt_key.find_last_of('#'))) > 0)
                     variant_index /= 2;
-                if (boost::nowide::narrow(category).find("Extruder ") == 0)
+                if (boost::nowide::narrow(category.c_str()).find("Extruder ") == 0)
                     category = category.substr(0, 8);
                 if (extruder_id)
                     category = category + (wxString(" {") + (extruder_id->values[variant_index] == 1 ? _L("Left: ") : _L("Right: "))
