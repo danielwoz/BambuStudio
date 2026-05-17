@@ -1,0 +1,185 @@
+# Bambu Bridge — upstream sync, integration cleanup, test fortification plan
+
+**Date:** 2026-05-17
+**Status:** approved (Phase 1 in progress)
+**Author:** danielwoz
+
+This plan covers all three Bambu Bridge repos:
+
+- `bambulab/BambuStudio` fork → `github.com/danielwoz/BambuStudio` (this repo's `danielwoz` remote)
+- `SoftFever/OrcaSlicer` fork → `github.com/danielwoz/OrcaSlicer`
+- `github.com/danielwoz/bambu-virtual-client` (shared submodule, consumed by both slicers)
+
+It exists because the BambuStudio fork is **146 commits behind upstream master** and the integration touchpoints with upstream code are inline edits, not registration hooks — so every future upstream sync gets expensive. Before we change any of that, we want a test safety net under the only code that's physically shared by both slicers: the `bambu-virtual-client` submodule, which currently has **zero unit tests** of its own.
+
+---
+
+## Goals (in priority order)
+
+1. **Test fortification first.** Add unit + loopback tests to `bambu-virtual-client` so the contract it has with both slicers' `DeviceManager`, `NetworkAgent`, and `PrinterFileSystem` is locked down.
+2. **Then upstream sync** — bring all three slicer forks back up to their upstream HEAD. Sync is mechanical risk; tests from goal 1 catch regressions during sync.
+3. **Then optional integration-point cleanup** — shrink the BambuStudio-bridge diff against `bambulab/BambuStudio` by extracting inline modifications into hook/registration patterns. Behaviour-preserving, but makes every future sync cheaper.
+4. **(Deferred)** decide whether the cleaned-up diff is small enough to propose as a real PR upstream.
+
+---
+
+## Survey results — current state
+
+### Fork distance from upstream
+
+| Fork (branch) | Ahead | Behind | Notes |
+|---|---|---|---|
+| OrcaSlicer-bridge (`bambu-virtual-shared`) | 5 | 0 | Fully caught up. |
+| BambuStudio-bridge (`bridge-necessary`) | 5 | 146 | Minimal bridge core + narrow-fix + e2e harness. |
+| BambuStudio-bridge (`bridge-asio`) | 14 | 146 | `bridge-necessary` + virtual-client integration (still inline, not submodule). |
+| BambuStudio-bridge (`bambu-virtual-shared`) | 9 | 146 | Submodule-based variant; Virtual\*/Bridge\*.cpp extracted to submodule. |
+
+All three BambuStudio-bridge branches are kept. `bambu-virtual-shared` is the canonical "release" branch going forward; `bridge-necessary` and `bridge-asio` are preserved as fallbacks.
+
+### Integration touchpoints (BambuStudio-bridge)
+
+All currently **inline edits** of upstream files:
+
+| File | Diff (LoC) | What it does | Cleanup candidate? |
+|---|---|---|---|
+| `src/slic3r/GUI/GUI_App.cpp` | ±767 | `--bridge-only` factory dispatch + scattered `#ifdef BAMBU_BRIDGE` blocks + virtual SSDP/store hookup. | **Yes** — biggest win. Extract to `BridgeBootstrap` class; collapse to ~10 LoC inline. |
+| `src/slic3r/Utils/NetworkAgent.cpp/.hpp` | ±534 | `is_virtual_dev_id()` + 6 FFFF-prefix branches + callback multiplexing. | **Partial** — consolidate the 6 branches into one `dispatch_virtual_or_real()`. |
+| `src/slic3r/GUI/Printer/PrinterFileSystem.cpp` | ±231 | `VirtualBambuTunnel` dispatch + debug fprintf + NULL guards. | **Marginal** — could become a tunnel-factory registration. |
+| `src/slic3r/GUI/DeviceManager.cpp` | ±204 | Single `if (!is_virtual_dev_id())` inside JSON parse loop. | **No** — inline is correct. |
+
+Bridge-server code (`src/bambu_bridge/`, ~10k LoC) is cleanly in its own directory, no upstream files touched. Good shape.
+
+### Integration touchpoints (OrcaSlicer-bridge)
+
+15 files changed, +598/−19. Survey verdict: **all 4 inline hooks are already justified and minimal** — no refactor needed. One non-bridge OrcaSlicer aggregate-init shim in `src/OrcaSlicer.cpp:6514` is upstream-worthy as its own contribution.
+
+### Test coverage
+
+Bridge-server side is strong (~20 unit + 7 e2e tests). The bedrock `bambu-virtual-client` submodule itself has **zero tests**. The six concrete gaps:
+
+1. `MqttFraming` codec round-trips & edge cases (varint boundaries, QoS, DUP/RETAIN).
+2. `VirtualMqttClient` session lifecycle (connect, reconnect, send ordering, callback thread safety, clean disconnect).
+3. `VirtualSsdpDiscovery` JSON shape vs the contract `DeviceManager::on_machine_alive` consumes.
+4. `VirtualLanPrinterStore` persist/hydrate round-trip + corruption recovery.
+5. `VirtualFtpsClient` upload (no client-side coverage; bridge `FtpsServerLoopbackTest` only exercises the server).
+6. End-to-end "OrcaSlicer discovers a bridge via SSDP and receives an MQTT report" (no equivalent of BambuStudio `T04`).
+
+---
+
+## Phased execution
+
+### Phase 0 — Capture baseline (½ day)
+
+- Re-run T01–T07 e2e + full `ctest` on `bridge-asio` and `bambu-virtual-shared`; record commit SHAs as the "do-no-harm" floor.
+- Tag `pre-sync-2026-05-17` on every working branch in all three repos so we have a known-good rollback.
+
+### Phase 1 — `bambu-virtual-client` test fortification (3–5 days, **in progress**)
+
+Add a `tests/` directory inside the submodule with a CTest harness. Use the same no-framework `int main()` style the bridge uses (single fail counter, exit code = failure count, ctest skip code 77 when sockets unavailable). One CMake option `BAMBU_VIRTUAL_CLIENT_BUILD_TESTS=ON` (default ON when built standalone, OFF when consumed via `add_subdirectory()` by a slicer — keeps slicer build clean).
+
+Sub-tasks:
+
+- **1a.** `MqttFramingTest_client` — copy + adapt the bridge's `MqttFramingTest` to point at the submodule's `MqttFraming.{hpp,cpp}`. Catches drift if the two ever diverge.
+- **1b.** `VirtualMqttClientLoopbackTest` — spin a minimal in-test TLS broker on `127.0.0.1:random`, drive `VirtualMqttClient` through connect → publish → receive → disconnect. Assert idempotent reconnect, message ordering, callback thread-safety.
+- **1c.** `VirtualSsdpJsonContractTest` — golden-file: assert the JSON `VirtualSsdpDiscovery` produces matches the schema `DeviceManager::on_machine_alive` consumes (dev_name, dev_id, dev_ip, dev_type, dev_signal, connect_type, bind_state). Golden file lives in `tests/fixtures/ssdp_alive.json`.
+- **1d.** `VirtualLanPrinterStorePersistTest` — temp-dir round trip; assert persist + reload preserves entries; assert corrupted-file recovery doesn't crash.
+- **1e.** `VirtualFtpsClientLoopbackTest` — reuse the bridge's FTPS server (or stand up a minimal one) and drive the client's upload path; assert STOR completes + cert validation behaviour.
+- **1f.** Wire-level smoke (in `tests/e2e/`): script spawns the bridge, multicasts a fake ALIVE, asserts `bambu_virtual_cli` receives it and can subsequently MQTT-connect to the advertised port. Not a slicer launch; just covers the on-wire contract end-to-end. Stays manual (needs `lo` multicast).
+- **1g.** GitHub Actions workflow `.github/workflows/ci.yml` in `bambu-virtual-client` that builds + runs 1a–1e on every push. 1f stays opt-in.
+
+Exit criterion for Phase 1: all six tests green locally; CI workflow green on a push to `main`.
+
+### Phase 2 — Upstream sync (1 day Orca + 2–4 days BambuStudio)
+
+- **2a. OrcaSlicer-bridge.** `git fetch origin && git rebase origin/main`. 0 commits behind — fast-forward only. Verify with Phase 1f against it. Push `bambu-virtual-shared` to `danielwoz/OrcaSlicer`.
+- **2b. BambuStudio-bridge `bridge-necessary`.** Rebase on `origin/master` (146 behind). Resolve conflicts in `GUI_App.cpp`, `NetworkAgent.cpp`, `DeviceManager.cpp`, `PrinterFileSystem.cpp` (the known integration files). Run T01–T07 + full ctest.
+- **2c. BambuStudio-bridge `bridge-asio`.** Rebase. Heavier — 14 commits include the boost::asio refactor that touches the Virtual\* files (which only exist on this branch, not `bridge-necessary`). Run full suite.
+- **2d. BambuStudio-bridge `bambu-virtual-shared`.** Rebase. Less code in the diff (Virtual\* is in the submodule), but the submodule pointer may need bumping. Run full suite.
+
+After each rebase: tag `synced-2026-MM-DD-<branch>` and push to `danielwoz/BambuStudio`. Phase 3 work happens **only after** all three branches are green on real printers post-sync.
+
+### Phase 3 — Integration-point cleanup *(optional, decision deferred)*
+
+Goal: shrink the BambuStudio-bridge diff vs upstream so future syncs are cheaper. Behaviour-preserving throughout. **OrcaSlicer-bridge is not touched** — survey says its hooks are already minimal.
+
+Cleanup candidates ranked by leverage:
+
+- **3a.** `GUI_App.cpp` → `BridgeBootstrap` extraction. Move the hand-expanded `IMPLEMENT_APP` + `--bridge-only` entry + virtual SSDP/store hookups into a new `src/slic3r/GUI/BridgeBootstrap.{hpp,cpp}`. Upstream `GUI_App.cpp` gets exactly two new lines: `#ifdef BAMBU_BRIDGE` include + one `BridgeBootstrap::install_hooks(this)` call. Target: ±767 → ~+10 in `GUI_App.cpp`.
+- **3b.** `NetworkAgent` FFFF dispatch consolidation. Replace 6 inline `if (is_virtual_dev_id(sn))` branches with a single private `dispatch_for_dev_id()` helper. Target: ±534 → ~+50.
+- **3c.** `PrinterFileSystem` tunnel factory. Replace inline `VirtualBambuTunnel` dispatch with a registration call at init. Only worth doing if 3a/3b go cleanly.
+- **3d.** Skip `DeviceManager` — inline is correct.
+
+Sub-questions for the user at Phase 3 entry:
+
+- How aggressive on 3a? (full BridgeBootstrap vs trim-#ifdef-noise-only vs skip)
+- How aggressive on 3c? (full factory vs skip)
+
+After each refactor commit, full test re-run is mandatory. Phase 1 tests will catch contract/codec drift that the e2e suite can't see.
+
+### Phase 4 — Decision gate (after Phase 3)
+
+If the BambuStudio-bridge diff after Phase 3 is small enough — say, under ~1500 LoC across the four integration files combined, and the `#ifdef BAMBU_BRIDGE` gating means zero default-behaviour change — propose as a real PR to `bambulab/BambuStudio`. Otherwise, the smaller diff still pays for itself on every future sync.
+
+(OrcaSlicer-bridge has only the `ThumbnailsParams` shim as upstream-worthy; that's a separate one-line PR to SoftFever, unrelated to the bridge.)
+
+---
+
+## Branch policy (decided)
+
+All three BambuStudio-bridge branches stay:
+
+- `bridge-necessary` — minimal bridge core, no virtual-client wiring. Useful as the smallest possible diff if we ever want to ship just the bridge.
+- `bridge-asio` — `bridge-necessary` + Virtual\* embedded (pre-submodule). Reference snapshot of the pre-extraction architecture.
+- `bambu-virtual-shared` — `bridge-asio` + submodule extraction. **Canonical release branch.**
+
+Sync work in Phase 2 happens on all three.
+
+---
+
+## Test status floor (Phase 0 baseline)
+
+Phase 0 tagged `pre-sync-2026-05-17` on every working branch in all three repos.
+Full e2e/ctest SHA capture deferred to next bridge run with real printers
+(not blocking Phase 1 progress).
+
+The Phase 1 submodule test suite (run in `bambu-virtual-client` standalone) is
+the new safety net for the integration cleanup work; 5/5 tests green on
+`main @ f6c34e5` across multiple consecutive runs.
+
+## Phase 2 sync outcome (executed 2026-05-17)
+
+All three BambuStudio-bridge branches rebased onto upstream HEAD `e8c7dc1b8`:
+
+| Branch | Before | After | Conflicts |
+|---|---|---|---|
+| `bridge-necessary` | `0652cf1cf` | `9d830496b` | 4 (i18n + AMSMaterials + GUI_App adjacency) |
+| `bridge-asio` | `fb28f689f` | `2aa9daf66` | Same 4 on commit 1; 13 follow-ons clean |
+| `bambu-virtual-shared` | `55f966758` | `9465e6fd4` | Same 4 + submodule bump to `f6c34e5` |
+
+OrcaSlicer-bridge `bambu-virtual-shared` was a no-op rebase (0 behind) +
+submodule bump to `f6c34e5` (commit `fcba1cdf`, local-only).
+
+### Upstream-side observation (TODO)
+
+During the rebases, **upstream PR #10106 by `maziggy` shipped a stale API call
+in `AMSMaterialsSetting.cpp`**: `obj->get_extruder_id_by_ams_id()` — that
+method no longer exists on `MachineObject`. Every other callsite in the tree
+uses `obj->GetFilaSystem()->GetExtruderIdByAmsId()`. Our rebased branches
+kept the working version + the `if (ext_id > 0)` guard. This is a small
+upstream bug worth a dedicated PR to `bambulab/BambuStudio` once we file
+larger ones; capture for now and revisit.
+
+---
+
+## Phase 3 readiness checkpoint
+
+Pre-Phase-3 invariants confirmed:
+- Phase 1 submodule tests green and the bug-fix commits (SIGPIPE, TLS shutdown)
+  pulled into both slicer forks via submodule bump.
+- Phase 2 sync caught all three BambuStudio-bridge branches up to current
+  upstream master. Future syncs will be cheap if we keep this cadence.
+- Every refactor commit in Phase 3 will be the only thing the next sync has
+  to reconcile — best window for invasive cleanup.
+
+Phase 3 sub-task tracking lives in the task list (Phase 3a / 3b / 3c
+decisions are made just-in-time when each lands).
