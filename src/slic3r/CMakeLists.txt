@@ -723,6 +723,10 @@ set(BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR   ${CMAKE_CURRENT_SOURCE_DIR}/..
     CACHE PATH "nlohmann/json include dir for bambu_virtual_client" FORCE)
 set(BAMBU_VIRTUAL_CLIENT_BOOST_INCLUDE_DIR  ${Boost_INCLUDE_DIRS}
     CACHE PATH "Boost include dir for bambu_virtual_client" FORCE)
+# wx include dirs — VirtualSsdpDiscovery.cpp uses wxGetApp/CallAfter,
+# and slicer headers it pulls in transitively #include <wx/setup.h>.
+set(BAMBU_VIRTUAL_CLIENT_WX_INCLUDE_DIRS    "${wxWidgets_INCLUDE_DIRS}"
+    CACHE STRING "wxWidgets include dirs for bambu_virtual_client" FORCE)
 set(BAMBU_VIRTUAL_CLIENT_EXTRA_INCLUDE_DIRS
     "${CMAKE_BINARY_DIR}/src/libslic3r;${CMAKE_BINARY_DIR}/src/slic3r;${CMAKE_BINARY_DIR}/src/platform;${CMAKE_SOURCE_DIR}/src/eigen;${CMAKE_SOURCE_DIR}/src/libigl;${CMAKE_SOURCE_DIR}/src/hidapi/include;${CMAKE_SOURCE_DIR}/src/libnest2d/include;${CMAKE_SOURCE_DIR}/src/miniz;${CMAKE_SOURCE_DIR}/src/glu-libtess/include;${CMAKE_SOURCE_DIR}/src/clipper2/Clipper2Lib/include;${CMAKE_SOURCE_DIR}/src/minilzo;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include/opencascade"
     CACHE STRING "extra include dirs (generated headers) for bambu_virtual_client" FORCE)
