@@ -216,6 +216,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/GUI_Preview.hpp
     GUI/GUI_App.cpp
     GUI/GUI_App.hpp
+    GUI/BridgeBootstrap.cpp
+    GUI/BridgeBootstrap.hpp
     GUI/BridgeOnlyFlag.hpp
     GUI/BridgeOnlyConsoleApp.cpp
     GUI/BridgeOnlyConsoleApp.hpp
