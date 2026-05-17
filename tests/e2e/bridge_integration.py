@@ -100,22 +100,41 @@ class TestRunner:
             stderr=subprocess.STDOUT,
             env=env,
         )
-        # Wait until LAN uplinks are up — gives MQTT relay something
-        # to forward.
+        # Wait until the bridge servers are listening on every advertised
+        # port. We probe via raw TCP-connect rather than grep'ing the log
+        # for `[lan-uplink] … local_connected=1` because the silent
+        # bridge-necessary build doesn't emit that marker — only
+        # bridge-debug does. Listening sockets are the readiness signal
+        # that works on any build flavour.
+        wanted_ports = [p[4] for p in PRINTERS]            # mqtt ports
+        for i in range(len(PRINTERS)):
+            wanted_ports += [39990 + i, 38322 + i, 39998 + i]   # ftps, rtsp, vtun
         deadline = time.time() + 30
         ok = False
         while time.time() < deadline:
-            text = BRIDGE_LOG.read_text(errors="replace") if BRIDGE_LOG.exists() else ""
-            if text.count("local_connected=1") >= 3:
-                ok = True
-                break
             if self.proc.poll() is not None:
+                break
+            up = 0
+            for port in wanted_ports:
+                try:
+                    s = socket.create_connection((BRIDGE_BIND, port), timeout=0.3)
+                    s.close()
+                    up += 1
+                except OSError:
+                    pass
+            if up == len(wanted_ports):
+                # Servers up. Give the LAN uplinks a moment to settle
+                # before tests start hitting them.
+                time.sleep(2)
+                ok = True
                 break
             time.sleep(0.5)
         if not ok:
             tail = BRIDGE_LOG.read_text(errors="replace").splitlines()[-25:] if BRIDGE_LOG.exists() else []
-            raise RuntimeError("bridge did not bring up 3 LAN uplinks in 30 s. Tail:\n" + "\n".join(tail))
-        self._log("bridge: 3/3 LAN uplinks up; starting tests")
+            raise RuntimeError(
+                f"bridge listening on only {up}/{len(wanted_ports)} ports after 30 s. "
+                f"Tail:\n" + "\n".join(tail))
+        self._log(f"bridge: {len(wanted_ports)}/{len(wanted_ports)} ports listening; starting tests")
 
     def stop_bridge(self):
         if self.args.no_launch or self.proc is None:
@@ -207,8 +226,11 @@ class TestRunner:
             c.loop_start()
             clients.append(c)
 
-        # Wait up to 20 s for every printer to relay at least one report.
-        deadline = time.time() + 20
+        # Wait up to 45 s for every printer to relay at least one report.
+        # Tank A1's push_status cadence is much slower than H2S/H2D (small
+        # frames, sometimes >20 s between pushes) so we'd rather wait than
+        # flake.
+        deadline = time.time() + 45
         while time.time() < deadline:
             if all(len(v) >= 1 for v in report_byprinter.values()):
                 break
