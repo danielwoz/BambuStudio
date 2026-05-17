@@ -6,14 +6,8 @@ include(PrecompiledHeader)
 set(SLIC3R_GUI_SOURCES
     pchheader.cpp
     pchheader.hpp
-    GUI/Printer/BridgeStorageBackend.cpp
-    GUI/Printer/BridgeStorageBackend.hpp
-    GUI/Printer/MediaUrlBuilder.cpp
-    GUI/Printer/MediaUrlBuilder.hpp
     GUI/Printer/PrinterFileSystem.cpp
     GUI/Printer/PrinterFileSystem.h
-    GUI/Printer/VirtualBambuTunnel.cpp
-    GUI/Printer/VirtualBambuTunnel.hpp
     GUI/Widgets/AnimaController.hpp
     GUI/Widgets/AnimaController.cpp
     GUI/Widgets/AxisCtrlButton.cpp
@@ -216,9 +210,6 @@ set(SLIC3R_GUI_SOURCES
     GUI/GUI_Preview.hpp
     GUI/GUI_App.cpp
     GUI/GUI_App.hpp
-    GUI/BridgeOnlyFlag.hpp
-    GUI/BridgeOnlyConsoleApp.cpp
-    GUI/BridgeOnlyConsoleApp.hpp
     GUI/GUI_Utils.cpp
     GUI/GUI_Utils.hpp
     GUI/I18N.cpp
@@ -615,14 +606,6 @@ set(SLIC3R_GUI_SOURCES
     Utils/PrintHost.cpp
     Utils/NetworkAgent.cpp
     Utils/NetworkAgent.hpp
-    Utils/NetworkAgentPluginAdapter.cpp
-    Utils/NetworkAgentPluginAdapter.hpp
-    Utils/VirtualLanPrinterStore.cpp
-    Utils/VirtualLanPrinterStore.hpp
-    Utils/VirtualMqttClient.cpp
-    Utils/VirtualMqttClient.hpp
-    Utils/VirtualFtpsClient.cpp
-    Utils/VirtualFtpsClient.hpp
     Utils/MKS.hpp
     Utils/MKS.cpp
     Utils/CpuMemory.cpp
@@ -716,6 +699,38 @@ target_include_directories(libslic3r_gui PRIVATE Utils)
 if (WIN32)
     target_include_directories(libslic3r_gui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../deps/WebView2/include)
 endif()
+
+# ---- Bambu Bridge — slicer integration -------------------------------------
+# All bridge-related sources (BridgeBootstrap, BridgeOnly*, BridgeStorageBackend,
+# MediaUrlBuilder, NetworkAgentPluginAdapter, embedded Virtual* client) live
+# under this gate so they do not affect the upstream build. Unlike
+# bambu-virtual-shared (which consumes Virtual* via the bambu_virtual_client
+# submodule), bridge-asio embeds Virtual* directly in src/slic3r/Utils/ and
+# src/slic3r/GUI/Printer/.
+if (BAMBU_BRIDGE)
+    target_sources(libslic3r_gui PRIVATE
+        GUI/BridgeBootstrap.cpp
+        GUI/BridgeBootstrap.hpp
+        GUI/BridgeOnlyFlag.hpp
+        GUI/BridgeOnlyConsoleApp.cpp
+        GUI/BridgeOnlyConsoleApp.hpp
+        GUI/Printer/BridgeStorageBackend.cpp
+        GUI/Printer/BridgeStorageBackend.hpp
+        GUI/Printer/MediaUrlBuilder.cpp
+        GUI/Printer/MediaUrlBuilder.hpp
+        GUI/Printer/VirtualBambuTunnel.cpp
+        GUI/Printer/VirtualBambuTunnel.hpp
+        Utils/NetworkAgentPluginAdapter.cpp
+        Utils/NetworkAgentPluginAdapter.hpp
+        Utils/VirtualLanPrinterStore.cpp
+        Utils/VirtualLanPrinterStore.hpp
+        Utils/VirtualMqttClient.cpp
+        Utils/VirtualMqttClient.hpp
+        Utils/VirtualFtpsClient.cpp
+        Utils/VirtualFtpsClient.hpp
+    )
+endif()
+
 
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SLIC3R_GUI_SOURCES})
 
