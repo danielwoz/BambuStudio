@@ -6,10 +6,6 @@ include(PrecompiledHeader)
 set(SLIC3R_GUI_SOURCES
     pchheader.cpp
     pchheader.hpp
-    GUI/Printer/BridgeStorageBackend.cpp
-    GUI/Printer/BridgeStorageBackend.hpp
-    GUI/Printer/MediaUrlBuilder.cpp
-    GUI/Printer/MediaUrlBuilder.hpp
     GUI/Printer/PrinterFileSystem.cpp
     GUI/Printer/PrinterFileSystem.h
     GUI/Widgets/AnimaController.hpp
@@ -214,9 +210,6 @@ set(SLIC3R_GUI_SOURCES
     GUI/GUI_Preview.hpp
     GUI/GUI_App.cpp
     GUI/GUI_App.hpp
-    GUI/BridgeOnlyFlag.hpp
-    GUI/BridgeOnlyConsoleApp.cpp
-    GUI/BridgeOnlyConsoleApp.hpp
     GUI/GUI_Utils.cpp
     GUI/GUI_Utils.hpp
     GUI/I18N.cpp
@@ -613,8 +606,6 @@ set(SLIC3R_GUI_SOURCES
     Utils/PrintHost.cpp
     Utils/NetworkAgent.cpp
     Utils/NetworkAgent.hpp
-    Utils/NetworkAgentPluginAdapter.cpp
-    Utils/NetworkAgentPluginAdapter.hpp
     Utils/MKS.hpp
     Utils/MKS.cpp
     Utils/CpuMemory.cpp
@@ -709,31 +700,51 @@ if (WIN32)
     target_include_directories(libslic3r_gui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../deps/WebView2/include)
 endif()
 
-# ---- Shared virtual-printer client (git submodule) -------------------------
-# The client-side virtual-printer wire layer (MQTT/FTPS/Tunnel) lives in the
-# bambu-virtual-client repo, consumed here as a git submodule at
-# Utils/bambu_virtual_client/. The same submodule is consumed by
-# OrcaSlicer-bridge. Server-side code (bambu_bridge/...) does NOT live in the
-# submodule by design.
-set(BAMBU_VIRTUAL_CLIENT_SLIC3R_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}
-    CACHE PATH "src/slic3r path for bambu_virtual_client" FORCE)
-set(BAMBU_VIRTUAL_CLIENT_SLICER_SRC_DIR     ${CMAKE_CURRENT_SOURCE_DIR}/..
-    CACHE PATH "src path for bambu_virtual_client" FORCE)
-set(BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR   ${CMAKE_CURRENT_SOURCE_DIR}/..
-    CACHE PATH "nlohmann/json include dir for bambu_virtual_client" FORCE)
-set(BAMBU_VIRTUAL_CLIENT_BOOST_INCLUDE_DIR  ${Boost_INCLUDE_DIRS}
-    CACHE PATH "Boost include dir for bambu_virtual_client" FORCE)
-# wx include dirs — VirtualSsdpDiscovery.cpp uses wxGetApp/CallAfter,
-# and slicer headers it pulls in transitively #include <wx/setup.h>.
-set(BAMBU_VIRTUAL_CLIENT_WX_INCLUDE_DIRS    "${wxWidgets_INCLUDE_DIRS}"
-    CACHE STRING "wxWidgets include dirs for bambu_virtual_client" FORCE)
-set(BAMBU_VIRTUAL_CLIENT_EXTRA_INCLUDE_DIRS
-    "${CMAKE_BINARY_DIR}/src/libslic3r;${CMAKE_BINARY_DIR}/src/slic3r;${CMAKE_BINARY_DIR}/src/platform;${CMAKE_SOURCE_DIR}/src/eigen;${CMAKE_SOURCE_DIR}/src/libigl;${CMAKE_SOURCE_DIR}/src/hidapi/include;${CMAKE_SOURCE_DIR}/src/libnest2d/include;${CMAKE_SOURCE_DIR}/src/miniz;${CMAKE_SOURCE_DIR}/src/glu-libtess/include;${CMAKE_SOURCE_DIR}/src/clipper2/Clipper2Lib/include;${CMAKE_SOURCE_DIR}/src/minilzo;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include/opencascade"
-    CACHE STRING "extra include dirs (generated headers) for bambu_virtual_client" FORCE)
-set(BAMBU_VIRTUAL_CLIENT_BUILD_CLI OFF CACHE BOOL "" FORCE)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/Utils/bambu_virtual_client
-                 ${CMAKE_BINARY_DIR}/bambu_virtual_client)
-target_link_libraries(libslic3r_gui bambu_virtual_client)
+# ---- Bambu Bridge — slicer integration -------------------------------------
+# All bridge-related sources (BridgeBootstrap, BridgeOnly*, BridgeStorageBackend,
+# MediaUrlBuilder, NetworkAgentPluginAdapter) and the bambu-virtual-client
+# submodule live under this gate so they do not affect the upstream build.
+if (BAMBU_BRIDGE)
+    target_sources(libslic3r_gui PRIVATE
+        GUI/BridgeBootstrap.cpp
+        GUI/BridgeBootstrap.hpp
+        GUI/BridgeOnlyFlag.hpp
+        GUI/BridgeOnlyConsoleApp.cpp
+        GUI/BridgeOnlyConsoleApp.hpp
+        GUI/Printer/BridgeStorageBackend.cpp
+        GUI/Printer/BridgeStorageBackend.hpp
+        GUI/Printer/MediaUrlBuilder.cpp
+        GUI/Printer/MediaUrlBuilder.hpp
+        Utils/NetworkAgentPluginAdapter.cpp
+        Utils/NetworkAgentPluginAdapter.hpp
+    )
+
+    # Shared virtual-printer client (git submodule). The client-side
+    # virtual-printer wire layer (MQTT/FTPS/Tunnel) lives in the
+    # bambu-virtual-client repo, consumed here as a git submodule at
+    # Utils/bambu_virtual_client/. The same submodule is consumed by
+    # OrcaSlicer-bridge. Server-side code (bambu_bridge/...) does NOT live
+    # in the submodule by design.
+    set(BAMBU_VIRTUAL_CLIENT_SLIC3R_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}
+        CACHE PATH "src/slic3r path for bambu_virtual_client" FORCE)
+    set(BAMBU_VIRTUAL_CLIENT_SLICER_SRC_DIR     ${CMAKE_CURRENT_SOURCE_DIR}/..
+        CACHE PATH "src path for bambu_virtual_client" FORCE)
+    set(BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR   ${CMAKE_CURRENT_SOURCE_DIR}/..
+        CACHE PATH "nlohmann/json include dir for bambu_virtual_client" FORCE)
+    set(BAMBU_VIRTUAL_CLIENT_BOOST_INCLUDE_DIR  ${Boost_INCLUDE_DIRS}
+        CACHE PATH "Boost include dir for bambu_virtual_client" FORCE)
+    # wx include dirs — VirtualSsdpDiscovery.cpp uses wxGetApp/CallAfter,
+    # and slicer headers it pulls in transitively #include <wx/setup.h>.
+    set(BAMBU_VIRTUAL_CLIENT_WX_INCLUDE_DIRS    "${wxWidgets_INCLUDE_DIRS}"
+        CACHE STRING "wxWidgets include dirs for bambu_virtual_client" FORCE)
+    set(BAMBU_VIRTUAL_CLIENT_EXTRA_INCLUDE_DIRS
+        "${CMAKE_BINARY_DIR}/src/libslic3r;${CMAKE_BINARY_DIR}/src/slic3r;${CMAKE_BINARY_DIR}/src/platform;${CMAKE_SOURCE_DIR}/src/eigen;${CMAKE_SOURCE_DIR}/src/libigl;${CMAKE_SOURCE_DIR}/src/hidapi/include;${CMAKE_SOURCE_DIR}/src/libnest2d/include;${CMAKE_SOURCE_DIR}/src/miniz;${CMAKE_SOURCE_DIR}/src/glu-libtess/include;${CMAKE_SOURCE_DIR}/src/clipper2/Clipper2Lib/include;${CMAKE_SOURCE_DIR}/src/minilzo;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include/opencascade"
+        CACHE STRING "extra include dirs (generated headers) for bambu_virtual_client" FORCE)
+    set(BAMBU_VIRTUAL_CLIENT_BUILD_CLI OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/Utils/bambu_virtual_client
+                     ${CMAKE_BINARY_DIR}/bambu_virtual_client)
+    target_link_libraries(libslic3r_gui bambu_virtual_client)
+endif()
 
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SLIC3R_GUI_SOURCES})
 
