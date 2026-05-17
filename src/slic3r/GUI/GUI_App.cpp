@@ -7,7 +7,6 @@
 #include "slic3r/GUI/UserManager.hpp"
 #include "slic3r/GUI/TaskManager.hpp"
 #include "slic3r/GUI/OpenGLManager.hpp"
-#include "slic3r/GUI/Printer/MediaUrlBuilder.hpp"
 #include "format.hpp"
 
 // Localization headers: include libslic3r version first so everything in this file
@@ -119,17 +118,7 @@
 #include "BBLUtil.hpp"
 
 #if defined(BAMBU_BRIDGE)
-#include "bambu_bridge/headless/BridgeApp.hpp"
-#include "bambu_bridge/headless/SignalHandler.hpp"
-#include "slic3r/GUI/BridgeOnlyFlag.hpp"
-#include "slic3r/GUI/BridgeOnlyConsoleApp.hpp"
-#include "slic3r/GUI/Printer/BridgeStorageBackend.hpp"
-#include "slic3r/Utils/NetworkAgentPluginAdapter.hpp"
-#include "slic3r/Utils/VirtualLanPrinterStore.hpp"
-#include "slic3r/Utils/VirtualMqttClient.hpp"
-#include <cstring>
-#include <csignal>
-#include <unistd.h>
+#include "slic3r/GUI/BridgeBootstrap.hpp"
 #endif
 
 //#ifdef WIN32
@@ -1429,121 +1418,43 @@ wxDEFINE_EVENT(EVT_ENTER_FORCE_UPGRADE, wxCommandEvent);
 wxDEFINE_EVENT(EVT_SHOW_NO_NEW_VERSION, wxCommandEvent);
 wxDEFINE_EVENT(EVT_SHOW_DIALOG, wxCommandEvent);
 wxDEFINE_EVENT(EVT_CONNECT_LAN_MODE_PRINT, wxCommandEvent);
-
-// We expand IMPLEMENT_APP(GUI_App) by hand so we can substitute our own
-// `wxCreateApp()` that dispatches between GUI_App (the normal slicer)
-// and BridgeOnlyConsoleApp (the headless --bridge-only mode that
-// avoids any GTK init — see BridgeOnlyConsoleApp.{hpp,cpp}).
-//
-// IMPLEMENT_APP normally expands to:
-//   wxIMPLEMENT_WX_THEME_SUPPORT   // empty on non-Universal
-//   wxIMPLEMENT_WXWIN_MAIN         // int main(){ return wxEntry(...); }
-//   wxIMPLEMENT_APP_NO_MAIN(appname):
-//     appname& wxGetApp()      // returns the typed app instance
-//     wxAppConsole* wxCreateApp(){ return new appname; }
-//     wxAppInitializer wxTheAppInitializer((...) wxCreateApp);
-//
-// We keep wxIMPLEMENT_WX_THEME_SUPPORT + wxIMPLEMENT_WXWIN_MAIN +
-// `wxGetApp()` from the macro, but we DROP the macro's `wxCreateApp`
-// and `wxTheAppInitializer` so we can supply our own factory below.
-// `wxGetApp()` still returns `GUI_App&` because every caller of it in
-// the slicer is a GUI-only code path; the bridge headless TU uses
-// `wxTheApp` (the wxAppConsole-typed accessor) instead.
-//
-// All of this stays inside `namespace Slic3r::GUI` to match how the
-// IMPLEMENT_APP macro originally expanded (it was emitted inside the
-// namespace, and the resulting symbols — including `main` — are
-// effectively private; wx only ever consults `wxTheAppInitializer`'s
-// static ctor to look up the factory function pointer, regardless of
-// which namespace it lives in).
-wxIMPLEMENT_WX_THEME_SUPPORT
-wxIMPLEMENT_WXWIN_MAIN
-GUI_App& wxGetApp() { return *static_cast<GUI_App*>(wxApp::GetInstance()); }
-
 #if defined(BAMBU_BRIDGE)
-// Custom factory: when the CLI prepass set `g_bridge_only`, return a
-// wxAppConsole subclass so wxEntry's `wxApp::Initialize` never runs
-// and GTK is never initialised (gtk_init lives behind wxApp's
-// constructor path). Otherwise behave exactly like the default
-// IMPLEMENT_APP-emitted factory.
-static wxAppConsole* slic3r_create_app()
-{
-    wxAppConsole::CheckBuildOptions(WX_BUILD_OPTIONS_SIGNATURE,
-                                    "BambuStudio");
-    // --bridge-only mode now runs as a normal GUI_App that returns
-    // early in on_init_inner() via init_bridge_only_headless(). This
-    // requires X11/GTK for wxApp::Initialize even though we never
-    // create a MainFrame. Run on monitor-less servers via
-    //   xvfb-run -a bambu-studio --bridge-only
-    // or
-    //   Xvfb :99 -screen 0 1x1x8 & DISPLAY=:99 bambu-studio --bridge-only
-    // The former wxAppConsole path (BridgeOnlyConsoleApp) was removed
-    // because DeviceManager hard-depends on wxGetApp() being a GUI_App
-    // (parse_user_print_info touches app_config etc).
-    return new Slic3r::GUI::GUI_App();
-}
-static wxAppInitializer
-    slic3r_app_initializer(reinterpret_cast<wxAppInitializerFunction>(slic3r_create_app));
+// In the bridge build, BridgeBootstrap.cpp emits the wxIMPLEMENT_*
+// scaffolding + a custom factory that lets --bridge-only dispatch into
+// a different app type if needed. See BridgeBootstrap::register_app_factory.
 #else
-// Non-bridge build: keep the default factory.
-static wxAppConsole* slic3r_create_app()
-{
-    wxAppConsole::CheckBuildOptions(WX_BUILD_OPTIONS_SIGNATURE,
-                                    "BambuStudio");
-    return new Slic3r::GUI::GUI_App();
-}
-static wxAppInitializer
-    slic3r_app_initializer(reinterpret_cast<wxAppInitializerFunction>(slic3r_create_app));
+IMPLEMENT_APP(GUI_App)
 #endif
 
 //BBS: remove GCodeViewer as seperate APP logic
 //GUI_App::GUI_App(EAppMode mode)
+#if defined(BAMBU_BRIDGE)
+// Bridge-only mode skips all GUI-only ctor work (ImGui/HMSQuery/etc.).
+// See BridgeBootstrap::is_bridge_only.
+#define BRIDGE_SKIP_GUI_CTOR ::Slic3r::GUI::BridgeBootstrap::is_bridge_only()
+#else
+#define BRIDGE_SKIP_GUI_CTOR false
+#endif
 GUI_App::GUI_App()
     : wxApp()
     //, m_app_mode(mode)
     , m_app_mode(EAppMode::Editor)
     , m_em_unit(10)
-#if defined(BAMBU_BRIDGE)
-    // Bridge-only mode skips all GUI-only ctor work: ImGui is only used
-    // by the 3D scene overlays, HMSQuery curls the cloud HMS catalog for
-    // dialog tooltips, the removable-drive manager polls USB/SD storage
-    // for the Export-G dialog, and OtherInstanceMessageHandler hooks the
-    // socket the other-instance dialog uses. None of these touch the
-    // NetworkAgent / DeviceManager / BridgeApp data path; leaving them
-    // null keeps `wxGetApp().imgui()` etc. crashy if some GUI code ever
-    // gets executed accidentally, which is the safest failure mode.
-    , m_imgui(g_bridge_only ? nullptr : new ImGuiWrapper())
-    , hms_query(g_bridge_only ? nullptr : new HMSQuery())
-    , m_removable_drive_manager(g_bridge_only ? nullptr : std::make_unique<RemovableDriveManager>())
-    , m_other_instance_message_handler(g_bridge_only ? nullptr : std::make_unique<OtherInstanceMessageHandler>())
-#else
-    , m_imgui(new ImGuiWrapper())
-    , hms_query(new HMSQuery())
-    , m_removable_drive_manager(std::make_unique<RemovableDriveManager>())
-    , m_other_instance_message_handler(std::make_unique<OtherInstanceMessageHandler>())
-#endif
+    , m_imgui(BRIDGE_SKIP_GUI_CTOR ? nullptr : new ImGuiWrapper())
+    , hms_query(BRIDGE_SKIP_GUI_CTOR ? nullptr : new HMSQuery())
+    , m_removable_drive_manager(BRIDGE_SKIP_GUI_CTOR ? nullptr : std::make_unique<RemovableDriveManager>())
+    , m_other_instance_message_handler(BRIDGE_SKIP_GUI_CTOR ? nullptr : std::make_unique<OtherInstanceMessageHandler>())
 {
 	//app config initializes early becasuse it is used in instance checking in BambuStudio.cpp
     this->init_app_config();
-#if defined(BAMBU_BRIDGE)
-    // Label::initSysFont populates static wxFont objects (Head_*, Body_*)
-    // consumed by widgets we never construct in bridge-only mode. On
-    // Linux it also AddPrivateFont's HarmonyOS TTFs when invoked with
-    // load_font_resource=true (we always pass false here, so that branch
-    // is dormant); the remaining sysFont() calls still spin up wxGTK's
-    // font caches. Skip the whole thing when no widget will ever read
-    // those statics.
-    const bool bridge_only_ctor = g_bridge_only;
-#else
-    constexpr bool bridge_only_ctor = false;
-#endif
-    if (app_config && !bridge_only_ctor) {
+    if (app_config && !BRIDGE_SKIP_GUI_CTOR) {
         ::Label::initSysFont(app_config->get_language_code(), false);
     }
     this->init_download_path();
 
     reset_to_active();
 }
+#undef BRIDGE_SKIP_GUI_CTOR
 
 void GUI_App::shutdown()
 {
@@ -2390,54 +2301,6 @@ void GUI_App::init_networking_callbacks()
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": exit, m_agent=%1%")%m_agent;
 }
 
-#if defined(BAMBU_BRIDGE)
-void GUI_App::init_networking_callbacks_bridge_only()
-{
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": enter (bridge-only)";
-    if (!m_agent) return;
-
-    // Cloud-side push_status fanout. NetworkAgent::set_on_message_fn
-    // wraps our fn with the BridgeMessageTap forwarder (set by
-    // NetworkAgentPluginAdapter on the plugin handle), so as long as
-    // SOME message_fn is installed in the plugin, the bridge will
-    // see inbound printer reports. Inside the wrapper our fn runs
-    // first; we use it to keep DeviceManager fresh (so the 5s push
-    // pump has accurate VirtualPrinter entries). No plater / sidebar
-    // / dialog work — those belong to the full GUI path.
-    m_agent->set_on_message_fn([this](std::string dev_id, std::string msg) {
-        if (is_closing()) return;
-        CallAfter([this, dev_id, msg] {
-            if (is_closing()) return;
-            if (!m_device_manager) return;
-            if (MachineObject* obj = m_device_manager->get_my_machine(dev_id)) {
-                obj->parse_json("cloud", msg);
-            }
-        });
-    });
-
-    // Same idea for LAN push_status (real LAN printers, plus cloud
-    // local-tunnelled). Bridge tap wraps this too.
-    m_agent->set_on_local_message_fn([this](std::string dev_id, std::string msg) {
-        if (is_closing()) return;
-        CallAfter([this, dev_id, msg] {
-            if (is_closing()) return;
-            if (!m_device_manager) return;
-            if (MachineObject* obj = m_device_manager->get_my_machine(dev_id)) {
-                obj->parse_json("lan", msg);
-            }
-        });
-    });
-
-    // The agent uses this to hop work back to the wx main thread
-    // (e.g. tutk callbacks). CallAfter is the standard route.
-    m_agent->set_queue_on_main_fn([this](std::function<void()> callback) {
-        CallAfter(callback);
-    });
-
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": exit (bridge-only)";
-}
-#endif
-
 GUI_App::~GUI_App()
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": enter");
@@ -2877,29 +2740,12 @@ void GUI_App::UnRegisterMacPowerCallBack()
 }
 #endif
 
+#if defined(BAMBU_BRIDGE)
 int GUI_App::FilterEvent(wxEvent& event)
 {
-    // Log left-button DOWN events with the target widget. Useful for
-    // human-in-the-loop testing — pair each "[click] ..." line with the
-    // bridge MQTT relay activity that follows. Skip wxEVT_LEFT_UP to
-    // halve the noise; the DOWN is enough to locate the widget.
-    const wxEventType t = event.GetEventType();
-    if (t == wxEVT_LEFT_DOWN) {
-        wxObject* obj = event.GetEventObject();
-        const auto* w = wxDynamicCast(obj, wxWindow);
-        wxString label = w ? w->GetLabel()    : wxString();
-        wxString name  = w ? w->GetName()     : wxString();
-        wxClassInfo* ci = w ? w->GetClassInfo() : nullptr;
-        wxString klass = ci ? wxString(ci->GetClassName()) : wxString("?");
-        wxPoint pos    = w ? w->GetScreenPosition() : wxPoint(-1, -1);
-        wxSize  sz     = w ? w->GetSize()           : wxSize(0, 0);
-        // wxMouseEvent inherits from wxEvent; cast for click coords.
-        wxPoint mp(-1, -1);
-        if (auto* me = wxDynamicCast(&event, wxMouseEvent))
-            mp = me->GetPosition();
-    }
-    return -1; // continue normal dispatch
+    return ::Slic3r::GUI::BridgeBootstrap::on_filter_event(event);
 }
+#endif
 
 bool GUI_App::OnInit()
 {
@@ -2978,48 +2824,11 @@ int GUI_App::OnExit()
         app_config->save();
 
 #if defined(BAMBU_BRIDGE)
-    if (m_bridge_push_timer) {
-        m_bridge_push_timer->Stop();
-        m_bridge_push_timer.reset();
-    }
-    // Order matters: shut the storage backend down BEFORE BridgeApp
-    // tears its VirtualTunnelServer down. The vtun holds a borrowed
-    // pointer to the backend and any in-flight reply callbacks need
-    // PFS' recv threads still around to finish unwinding.
-    if (m_bridge_storage) {
-        m_bridge_storage->shutdown();
-    }
-    if (m_bridge_app) {
-        // Drop the resolver before BridgeApp dies; it captured a raw
-        // pointer to m_bridge_app.
-        Slic3r::VirtualMqttClient::instance().set_port_resolver(nullptr);
-        m_bridge_app->shutdown();
-    }
-    if (m_bridge_thread && m_bridge_thread->joinable()) {
-        m_bridge_thread->join();
-    }
-    // m_bridge_storage destructs with GUI_App; explicit reset would
-    // run on the wx main thread anyway, so we let unique_ptr handle it.
-
-    // In bridge-only mode the worker has reported rc=0 by this point;
-    // the bridge servers are torn down, MQTT/FTPS/RTSP/vtun sockets
-    // closed, LAN uplink disconnected, push pump stopped. Everything
-    // the supervisor cares about is durably persisted (app_config
-    // already saved above). The remaining work is just C++ destructor
-    // unwind for ~50+ static objects across libslic3r/libBambuSource/
-    // the network plugin — and at least one of those static dtors
-    // double-frees somewhere, fatally aborting glibc malloc with
-    // `mismatching next->prev_size`. Diagnosing the root cause needs
-    // a debug build of the proprietary plugin we don't have source
-    // for; in the meantime _Exit(0) gives systemd/runit/etc. the
-    // clean exit code they want without exposing the crash.
-    if (g_bridge_only) {
-        std::fflush(stderr);
-        std::fflush(stdout);
-        std::_Exit(0);
-    }
+    // Tears down BridgeApp / storage / push timer / worker thread, and
+    // (in --bridge-only mode) short-circuits with _Exit(0). See
+    // BridgeBootstrap::shutdown_hooks for the rationale.
+    ::Slic3r::GUI::BridgeBootstrap::shutdown_hooks(this);
 #endif
-
 
     return wxApp::OnExit();
 }
@@ -3092,222 +2901,6 @@ std::string get_system_info()
     return out.str();
 }
 
-#if defined(BAMBU_BRIDGE)
-// Headless --bridge-only OnInit branch. Mirrors the in-GUI bridge
-// bootstrap at the bottom of on_init_inner() so the bridge runs on the
-// EXACT same code path as the GUI worker thread (BridgeStorageBackend
-// delegating to PrinterFileSystem, NetworkAgentPluginAdapter wrapping
-// the slicer's NetworkAgent, the wxTimer push pump feeding DeviceManager
-// snapshots into BridgeApp::set_virtual_printers). The only deltas vs.
-// the GUI path are: no MainFrame, ExitOnFrameDelete=false (so the loop
-// stays up with zero windows), SIGINT/SIGTERM route to ExitMainLoop.
-//
-// Returns true on success so wxEntry runs ProcessEvent; on failure
-// returns false and OnExit unwinds whatever was built.
-bool GUI_App::init_bridge_only_headless()
-{
-    BOOST_LOG_TRIVIAL(info)
-        << "GUI_App::init_bridge_only_headless: starting headless --bridge-only";
-
-    // Without a top-level frame, wxApp would normally exit the moment
-    // OnInit returns. Suppress that — our SignalHandler controls the
-    // exit.
-    SetExitOnFrameDelete(false);
-
-    // The slicer normally seeds Slic3r::Http's extra headers from
-    // get_extra_header() inside on_init_inner before the network agent
-    // is created. Mirror that so the agent's own curl session, and any
-    // other Slic3r::Http callers, see the same X-BBL-* fingerprint the
-    // GUI uses.
-    {
-        std::map<std::string, std::string> extra_headers = get_extra_header();
-        Slic3r::Http::set_extra_headers(extra_headers);
-    }
-
-    // Bring up NetworkAgent + DeviceManager exactly like the GUI does.
-    // Skips dialogs because mainframe is null and the dialog hooks are
-    // only installed via init_networking_callbacks (not called here).
-    copy_network_if_available();
-    if (!on_init_network()) {
-        BOOST_LOG_TRIVIAL(error)
-            << "init_bridge_only_headless: on_init_network() failed";
-        return false;
-    }
-
-    // Bridge bootstrap — identical to the GUI block in on_init_inner.
-    // Differences vs. the GUI path:
-    //   * cfg is seeded from the parsed CLI in g_bridge_only_cfg (not
-    //     a default-constructed BridgeAppConfig).
-    //   * No DeviceManager-side dialog hooks; headless trusts the agent
-    //     to come up with cached tokens (or run logged-out and just
-    //     advertise nothing until a follow-up adds a login flow).
-    try {
-        Slic3r::bridge::headless::BridgeAppConfig cfg = g_bridge_only_cfg;
-
-        // Slicer-identity fields baked into the storage tunnel URL —
-        // libBambuSource refuses to advance Bambu_StartStreamEx for
-        // storage without them. Always source from the live agent /
-        // app_config so they match the GUI even if the CLI didn't
-        // pass overrides.
-        cfg.slicer_net_ver = Slic3r::NetworkAgent::get_version();
-        if (app_config)
-            cfg.slicer_cli_id = app_config->get("slicer_uuid");
-        cfg.slicer_cli_ver = std::string(SLIC3R_VERSION);
-
-        m_bridge_storage = std::make_unique<Slic3r::bridge::BridgeStorageBackend>();
-        m_bridge_app     = std::make_unique<Slic3r::bridge::headless::BridgeApp>(cfg);
-
-        // The slicer's VirtualMqttClient needs to dial the per-printer
-        // MQTT port the bridge bound (mqtt_port_base + index). Without
-        // this resolver the client falls back to 8883 — which only the
-        // first virtual printer is listening on — and every other
-        // printer's CONNECT lands on the wrong device and fails auth.
-        {
-            auto* bridge_raw = m_bridge_app.get();
-            Slic3r::VirtualMqttClient::instance().set_port_resolver(
-                [bridge_raw](const std::string& dev_id) -> uint16_t {
-                    return bridge_raw ? bridge_raw->mqtt_port_for_dev_id(dev_id) : 0;
-                });
-        }
-
-        auto* storage_raw = m_bridge_storage.get();
-        m_bridge_app->attach_storage_delegate(
-            [storage_raw](const std::string& real_dev_id,
-                          const std::string& real_lan_ip,
-                          const std::string& access_code,
-                          const std::string& dev_ver,
-                          const std::string& net_ver,
-                          const std::string& cli_id,
-                          const std::string& cli_ver,
-                          int                cmdtype,
-                          std::string        request_body_json,
-                          std::function<void(int, std::string)> reply_cb) {
-                if (!storage_raw) {
-                    if (reply_cb) reply_cb(/*ERROR_PIPE*/3, "{}");
-                    return;
-                }
-                nlohmann::json req_body;
-                try {
-                    req_body = request_body_json.empty()
-                        ? nlohmann::json::object()
-                        : nlohmann::json::parse(request_body_json);
-                } catch (const std::exception& ex) {
-                    BOOST_LOG_TRIVIAL(error)
-                        << "bridge-storage: bad request JSON: " << ex.what();
-                    if (reply_cb) reply_cb(/*ERROR_JSON*/2, "{}");
-                    return;
-                }
-                auto wrapped_cb = [reply_cb = std::move(reply_cb)]
-                                  (int rc, nlohmann::json reply) {
-                    if (!reply_cb) return;
-                    reply_cb(rc, reply.dump());
-                };
-                storage_raw->send_request(
-                    real_dev_id, real_lan_ip, access_code,
-                    dev_ver, net_ver, cli_id, cli_ver,
-                    cmdtype, std::move(req_body),
-                    std::move(wrapped_cb));
-            },
-            // PFS' wxEvtHandler unwind still needs to happen on the wx
-            // main thread even in headless mode (there is one — wx is
-            // running OnInit on it).
-            [this](const std::string& dev_id) {
-                if (!m_bridge_storage) return;
-                auto* backend = m_bridge_storage.get();
-                CallAfter([backend, dev_id] { backend->release(dev_id); });
-            });
-
-        if (m_agent) {
-            auto adapter =
-                std::make_shared<Slic3r::NetworkAgentPluginAdapter>(m_agent);
-            m_bridge_app->attach_plugin_handle(std::move(adapter));
-        } else {
-            BOOST_LOG_TRIVIAL(warning)
-                << "init_bridge_only_headless: NetworkAgent missing — "
-                   "bridge will advertise nothing until login is wired";
-        }
-
-        m_bridge_thread = std::make_unique<std::thread>([this]() {
-            try {
-                const int rc = m_bridge_app->run();
-                BOOST_LOG_TRIVIAL(info)
-                    << "Bambu Bridge worker exited rc=" << rc;
-            } catch (const std::exception& e) {
-                BOOST_LOG_TRIVIAL(error)
-                    << "Bambu Bridge worker crashed: " << e.what();
-            }
-        });
-
-        // Push pump: feed DeviceManager snapshots into BridgeApp every
-        // 5s, on the wx main thread (the same thread that mutates
-        // DeviceManager — race-free by construction).
-        m_bridge_push_timer = std::make_unique<wxTimer>(this);
-        Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
-            if (!m_bridge_app)     return;
-            if (!m_device_manager) return;
-            if (!m_agent || !m_agent->is_user_login()) return;
-            std::vector<Slic3r::bridge::headless::VirtualPrinter> snap;
-            for (const auto& kv : m_device_manager->get_user_machinelist()) {
-                MachineObject* mo = kv.second;
-                if (!mo) continue;
-                std::string id = mo->get_dev_id();
-                if (id.empty()) continue;
-                Slic3r::bridge::headless::VirtualPrinter p;
-                p.dev_id      = std::move(id);
-                p.dev_name    = mo->get_dev_name();
-                p.lan_ip      = mo->get_dev_ip();
-                p.access_code = mo->get_access_code();
-                p.model       = mo->printer_type;
-                p.firmware    = mo->get_ota_version();
-                // Resolve the live-view URL through the same helper
-                // MediaPlayCtrl uses. We only capture the LAN-direct
-                // branch synchronously; the TUTK branch's HTTP fetch
-                // would arrive too late for this tick (and the bridge's
-                // CloudCameraSource has its own get_camera_url path that
-                // handles it). Empty p.camera_url tells the bridge's
-                // sources to fall back to their built-in URL builders.
-                Slic3r::GUI::build_media_live_url(mo,
-                    [&p](std::string url, Slic3r::GUI::MediaUrlError err) {
-                        if (err == Slic3r::GUI::MediaUrlError::Ok)
-                            p.camera_url = std::move(url);
-                    });
-                snap.push_back(std::move(p));
-            }
-            if (snap.empty()) return;
-            m_bridge_app->set_virtual_printers(std::move(snap));
-        }, m_bridge_push_timer->GetId());
-        m_bridge_push_timer->Start(5000);
-
-        BOOST_LOG_TRIVIAL(info)
-            << "Bambu Bridge --bridge-only started; DeviceManager push "
-               "every 5s, NetworkAgent " << (m_agent ? "attached" : "missing");
-    } catch (const std::exception& e) {
-        BOOST_LOG_TRIVIAL(error)
-            << "Failed to start --bridge-only bridge: " << e.what();
-        return false;
-    }
-
-    // SIGINT/SIGTERM trampoline. The signal arrives on some thread the
-    // OS picks; we just hand the wx main loop a "please quit" via
-    // CallAfter so wx's ExitMainLoop runs on its own thread.
-    //
-    // RAII-owned by GUI_App for the lifetime of the wxApp; OnExit's
-    // bridge teardown will run after ExitMainLoop unwinds.
-    static std::unique_ptr<Slic3r::bridge::headless::SignalHandler> s_signals;
-    s_signals = std::make_unique<Slic3r::bridge::headless::SignalHandler>(
-        [this] {
-            CallAfter([this] {
-                BOOST_LOG_TRIVIAL(info)
-                    << "--bridge-only: signal received, exiting wx loop";
-                ExitMainLoop();
-            });
-        });
-
-    m_initialized = true;
-    return true;
-}
-#endif // BAMBU_BRIDGE
-
 bool GUI_App::on_init_inner()
 {
     wxLog::SetActiveTarget(new wxBoostLog());
@@ -3326,8 +2919,8 @@ bool GUI_App::on_init_inner()
 #endif
 
 #if defined(BAMBU_BRIDGE)
-    if (g_bridge_only)
-        return init_bridge_only_headless();
+    if (::Slic3r::GUI::BridgeBootstrap::is_bridge_only())
+        return ::Slic3r::GUI::BridgeBootstrap::run_headless(this);
 #endif
 
 #if defined(_WIN32) && ! defined(_WIN64)
@@ -3879,202 +3472,10 @@ bool GUI_App::on_init_inner()
 #if defined(BAMBU_BRIDGE)
     // Bambu Bridge — GUI worker thread. Runs in the same process so other
     // slicers on the LAN see this BambuStudio's cloud-bound printers as
-    // virtual LAN devices for the lifetime of the session.
-    //
-    // The bridge is opt-out: set BAMBU_BRIDGE_GUI_DISABLED=1 in the
-    // environment to skip startup (useful for users who only want the
-    // slicer side without the network exposure). The same
-    // $BAMBU_BRIDGE_PLUGIN_PATH the headless daemon reads applies here.
-    if (const char* disabled = std::getenv("BAMBU_BRIDGE_GUI_DISABLED");
-        disabled && *disabled && std::strcmp(disabled, "0") != 0) {
-        BOOST_LOG_TRIVIAL(info)
-            << "Bambu Bridge skipped (BAMBU_BRIDGE_GUI_DISABLED set).";
-    } else {
-        try {
-            // host_drives_inventory defaults to TRUE — the bridge does
-            // NOT construct its own plugin handle. The slicer's
-            // NetworkAgent (owned by this GUI_App) is the (one and only)
-            // plugin consumer in this process. A wxTimer further down
-            // pushes DeviceManager snapshots into the bridge from the
-            // main thread (the same thread that mutates DeviceManager),
-            // so we never need a thread-safe accessor on the
-            // DeviceManager side.
-            Slic3r::bridge::headless::BridgeAppConfig cfg;
-            // inventory_poll is irrelevant in push mode (reconcile_once
-            // early-returns when neither printer_source nor m_inventory
-            // are wired). Leaving the default 60s so the poll thread
-            // stays alive for shutdown-via-stop-flag plumbing.
-
-            // Slicer-identity fields baked into the storage tunnel URL.
-            // Without these, libBambuSource refuses to advance
-            // Bambu_StartStreamEx past would_block — observed during
-            // virtual-storage testing. Use the same values the
-            // slicer's own non-virtual MediaFilePanel path embeds.
-            cfg.slicer_net_ver =
-                Slic3r::NetworkAgent::get_version();
-            cfg.slicer_cli_id  =
-                app_config->get("slicer_uuid");
-            cfg.slicer_cli_ver = std::string(SLIC3R_VERSION);
-
-            // Storage delegator: bridge JSON-RPC -> PrinterFileSystem ->
-            // libBambuSource. Constructed BEFORE the BridgeApp so we can
-            // wire it through `attach_storage_delegate` right after.
-            m_bridge_storage = std::make_unique<Slic3r::bridge::BridgeStorageBackend>();
-
-            m_bridge_app = std::make_unique<Slic3r::bridge::headless::BridgeApp>(cfg);
-
-            // Resolver for the slicer's VirtualMqttClient — see the
-            // matching block in init_bridge_only_headless for the
-            // rationale. Without this every virtual printer except the
-            // one on port 8883 hits "auth fail" because the slicer
-            // would otherwise dial 8883 for all of them.
-            {
-                auto* bridge_raw = m_bridge_app.get();
-                Slic3r::VirtualMqttClient::instance().set_port_resolver(
-                    [bridge_raw](const std::string& dev_id) -> uint16_t {
-                        return bridge_raw ? bridge_raw->mqtt_port_for_dev_id(dev_id) : 0;
-                    });
-            }
-
-            // Bind the backend to a std::function so the bridge module
-            // doesn't need to link the GUI library (tests only pull in
-            // bambu_bridge). The lambda captures the raw backend
-            // pointer; lifetime is brokered by GUI_App owning both.
-            // JSON is passed as string across the boundary because the
-            // bridge and the GUI vendor different nlohmann/json
-            // versions (different inline namespaces => different
-            // mangled types in function signatures).
-            auto* storage_raw = m_bridge_storage.get();
-            m_bridge_app->attach_storage_delegate(
-                [storage_raw](const std::string& real_dev_id,
-                              const std::string& real_lan_ip,
-                              const std::string& access_code,
-                              const std::string& dev_ver,
-                              const std::string& net_ver,
-                              const std::string& cli_id,
-                              const std::string& cli_ver,
-                              int                cmdtype,
-                              std::string        request_body_json,
-                              std::function<void(int, std::string)> reply_cb) {
-                    if (!storage_raw) {
-                        if (reply_cb) reply_cb(/*ERROR_PIPE*/3, "{}");
-                        return;
-                    }
-                    nlohmann::json req_body;
-                    try {
-                        req_body = request_body_json.empty()
-                            ? nlohmann::json::object()
-                            : nlohmann::json::parse(request_body_json);
-                    } catch (const std::exception& ex) {
-                        BOOST_LOG_TRIVIAL(error)
-                            << "bridge-storage: bad request JSON: "
-                            << ex.what();
-                        if (reply_cb) reply_cb(/*ERROR_JSON*/2, "{}");
-                        return;
-                    }
-                    // Re-wrap the reply callback so it serializes back
-                    // to JSON for the wire.
-                    auto wrapped_cb = [reply_cb = std::move(reply_cb)]
-                                      (int rc, nlohmann::json reply) {
-                        if (!reply_cb) return;
-                        reply_cb(rc, reply.dump());
-                    };
-                    storage_raw->send_request(
-                        real_dev_id, real_lan_ip, access_code,
-                        dev_ver, net_ver, cli_id, cli_ver,
-                        cmdtype, std::move(req_body),
-                        std::move(wrapped_cb));
-                },
-                // Release callback: hop to the wx main thread (PFS'
-                // wxEvtHandler unwind needs to happen there).
-                [this](const std::string& dev_id) {
-                    if (!m_bridge_storage) return;
-                    auto* backend = m_bridge_storage.get();
-                    CallAfter([backend, dev_id] { backend->release(dev_id); });
-                });
-
-            // Hand the bridge an adapter wrapping the slicer's
-            // NetworkAgent. This is what flips the in-GUI bridge from
-            // SSDP-advertise-only to a real MQTT/cloud proxy — the
-            // CloudUplink / LanUplink see a non-null plugin handle
-            // (whose is_user_login() / is_server_connected() track
-            // the slicer's session) and stop dropping traffic with
-            // "no healthy uplink".
-            //
-            // Must happen BEFORE run() is invoked on the worker
-            // thread because BridgeApp::initialise() reads the
-            // injected handle exactly once at startup.
-            if (m_agent) {
-                auto adapter =
-                    std::make_shared<Slic3r::NetworkAgentPluginAdapter>(m_agent);
-                m_bridge_app->attach_plugin_handle(std::move(adapter));
-            }
-
-            m_bridge_thread = std::make_unique<std::thread>([this]() {
-                try {
-                    const int rc = m_bridge_app->run();
-                    BOOST_LOG_TRIVIAL(info)
-                        << "Bambu Bridge worker exited rc=" << rc;
-                } catch (const std::exception& e) {
-                    BOOST_LOG_TRIVIAL(error)
-                        << "Bambu Bridge worker crashed: " << e.what();
-                }
-            });
-
-            // Push pump: every 5 s, snapshot the user's cloud-bound
-            // machines from DeviceManager and feed them to the bridge.
-            // Runs on the wx main thread, which is the same thread that
-            // mutates m_device_manager — so iterating its map and
-            // touching MachineObject fields here is race-free.
-            m_bridge_push_timer = std::make_unique<wxTimer>(this);
-            Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
-                if (!m_bridge_app)     return;
-                if (!m_device_manager) return;
-                // Skip pushes while the slicer isn't logged in. DeviceManager
-                // can briefly return an empty user_machinelist around login
-                // boundaries (cloud refresh races, logout, etc.) and
-                // `set_virtual_printers([])` interprets that as "remove every
-                // device" — which kills the bridge's MQTT/FTPS/vtun listeners
-                // and leaves the slicer's own VirtualMqttClient hitting a
-                // closed port a moment later.
-                if (!m_agent || !m_agent->is_user_login()) return;
-                std::vector<Slic3r::bridge::headless::VirtualPrinter> snap;
-                for (const auto& kv : m_device_manager->get_user_machinelist()) {
-                    MachineObject* mo = kv.second;
-                    if (!mo) continue;
-                    std::string id = mo->get_dev_id();
-                    if (id.empty()) continue;
-                    Slic3r::bridge::headless::VirtualPrinter p;
-                    p.dev_id      = std::move(id);
-                    p.dev_name    = mo->get_dev_name();
-                    p.lan_ip      = mo->get_dev_ip();      // empty for cloud-only
-                    p.access_code = mo->get_access_code();
-                    p.model       = mo->printer_type;
-                    // BambuTunnel storage URL requires `dev_ver` (the
-                    // printer's OTA firmware version) to be non-empty
-                    // — without it the printer-side never sends its
-                    // first frame and bambu_start_stream_ex spins on
-                    // would_block forever. Push the live value.
-                    p.firmware    = mo->get_ota_version();
-                    snap.push_back(std::move(p));
-                }
-                // Same logic at the snapshot level: an empty list from a
-                // logged-in DeviceManager is almost always a transient
-                // refresh, not a real "all printers gone" event.
-                if (snap.empty()) return;
-                m_bridge_app->set_virtual_printers(std::move(snap));
-            }, m_bridge_push_timer->GetId());
-            m_bridge_push_timer->Start(5000);
-
-            BOOST_LOG_TRIVIAL(info)
-                << "Bambu Bridge started in GUI worker thread "
-                   "(DeviceManager push every 5s); set "
-                   "BAMBU_BRIDGE_GUI_DISABLED=1 to skip.";
-        } catch (const std::exception& e) {
-            BOOST_LOG_TRIVIAL(error)
-                << "Failed to start Bambu Bridge: " << e.what();
-        }
-    }
+    // virtual LAN devices for the lifetime of the session. Opt out via
+    // BAMBU_BRIDGE_GUI_DISABLED=1. No-op in --bridge-only mode (the
+    // headless branch already started the worker).
+    ::Slic3r::GUI::BridgeBootstrap::install_gui_worker(this);
 #endif
 
     return true;
@@ -4194,25 +3595,9 @@ __retry:
         else
             m_device_manager->set_agent(m_agent);
 
-        // Re-hydrate any virtual LAN printers the user has previously
-        // added so they don't have to re-enter the access code every
-        // session. The store only contains FFFF-prefix dev_ids; real
-        // LAN printers keep their existing access_code-only persistence
-        // in app_config. See VirtualLanPrinterStore.hpp for the format.
-        {
-            Slic3r::VirtualLanPrinterStore store;
-            for (const auto& e : store.load()) {
-                if (!Slic3r::NetworkAgent::is_virtual_dev_id(e.dev_id))
-                    continue;
-                auto* obj = m_device_manager->insert_local_device(
-                    e.dev_name, e.dev_id, e.lan_ip,
-                    /*connection_type=*/"lan",
-                    /*bind_state=*/"free",
-                    /*version=*/std::string(),
-                    e.access_code, e.printer_type);
-                if (obj) obj->set_user_access_code(e.access_code);
-            }
-        }
+#if defined(BAMBU_BRIDGE)
+        ::Slic3r::GUI::BridgeBootstrap::rehydrate_virtual_lan_printers(this);
+#endif
 
         if (!m_user_manager)
             m_user_manager = new Slic3r::UserManager(m_agent);
@@ -4247,13 +3632,10 @@ __retry:
 
         if (m_agent) {
 #if defined(BAMBU_BRIDGE)
-            if (g_bridge_only) {
-                init_networking_callbacks_bridge_only();
-            } else
+            ::Slic3r::GUI::BridgeBootstrap::install_networking_callbacks(this);
+#else
+            init_networking_callbacks();
 #endif
-            {
-                init_networking_callbacks();
-            }
             std::string country_code = app_config->get_country_code();
             m_agent->set_country_code(country_code);
             m_agent->start();
