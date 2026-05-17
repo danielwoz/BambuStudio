@@ -76,12 +76,13 @@ class BridgeApp;
 }
 }
 namespace GUI {
+class GUI_App;
 namespace BridgeBootstrap {
-    bool run_headless(class GUI_App* app);
-    void install_gui_worker(class GUI_App* app);
-    void rehydrate_virtual_lan_printers(class GUI_App* app);
-    void install_networking_callbacks(class GUI_App* app);
-    void shutdown_hooks(class GUI_App* app);
+    bool run_headless(GUI_App* app);
+    void install_gui_worker(GUI_App* app);
+    void rehydrate_virtual_lan_printers(GUI_App* app);
+    void install_networking_callbacks(GUI_App* app);
+    void shutdown_hooks(GUI_App* app);
 }
 }
 }

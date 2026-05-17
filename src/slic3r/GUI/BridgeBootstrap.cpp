@@ -592,9 +592,17 @@ void rehydrate_virtual_lan_printers(GUI_App* app)
 // full GUI_App::init_networking_callbacks with all dialog hooks.
 // ============================================================================
 
-static void init_networking_callbacks_bridge_only(GUI_App* app)
+void install_networking_callbacks(GUI_App* app)
 {
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": enter (bridge-only)";
+    if (!g_bridge_only) {
+        app->init_networking_callbacks();
+        return;
+    }
+
+    // ---- bridge-only minimal callbacks (inlined here so this function's
+    // friend grant covers the private-member access below). ----
+    BOOST_LOG_TRIVIAL(info)
+        << "install_networking_callbacks: enter (bridge-only)";
     if (!app || !app->m_agent) return;
 
     // Cloud-side push_status fanout. NetworkAgent::set_on_message_fn
@@ -635,16 +643,8 @@ static void init_networking_callbacks_bridge_only(GUI_App* app)
         app->CallAfter(callback);
     });
 
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": exit (bridge-only)";
-}
-
-void install_networking_callbacks(GUI_App* app)
-{
-    if (g_bridge_only) {
-        init_networking_callbacks_bridge_only(app);
-    } else {
-        app->init_networking_callbacks();
-    }
+    BOOST_LOG_TRIVIAL(info)
+        << "install_networking_callbacks: exit (bridge-only)";
 }
 
 // ============================================================================
