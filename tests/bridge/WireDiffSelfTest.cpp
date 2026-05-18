@@ -181,9 +181,17 @@ int main() {
               "SSDP: identity diff exits 0");
 
         // Normalisable mutation: change LAN IP in LOCATION + DevSignal.
+        // The reference fixture uses the bare-IP LOCATION shape the bridge
+        // actually emits (see SsdpResponder.cpp's build_search_response_headers).
+        // The normaliser also accepts the legacy URL form, so this test
+        // continues to assert that LAN-IP differences get masked.
         std::string body = slurp(fx);
-        check(replace_once(body, "192.168.1.209:80", "127.0.0.42:8080"),
+        check(replace_once(body, "LOCATION: 127.0.0.1",
+                                 "LOCATION: 192.168.1.42"),
               "SSDP: LOCATION mutation point present in fixture");
+        // DevSignal is no longer emitted in M-SEARCH responses (the A1-derived
+        // NOTIFY emits the bare integer; M-SEARCH omits it). This replace is
+        // a no-op on the current fixture and intentionally tolerant.
         replace_once(body, "-50dBm", "-72dBm");
         const std::string mutated = (workdir / "ssdp_lan_ip_mutated.txt").string();
         check(dump(mutated, body), "SSDP: wrote LAN-IP-mutated tmp");

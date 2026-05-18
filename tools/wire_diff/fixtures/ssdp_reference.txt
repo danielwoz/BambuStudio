@@ -1,17 +1,15 @@
 HTTP/1.1 200 OK
 CACHE-CONTROL: max-age=1800
 EXT:
-LOCATION: http://192.168.1.209:80/upnp/desc.xml
-SERVER: Bambu Lab/H2S/01.02.00.00
+LOCATION: 127.0.0.1
+SERVER: UPnP/1.0
 ST: urn:bambulab-com:device:3dprinter:1
 USN: 0938BC582502312
-DevName.bambu.com: My H2S
 DevModel.bambu.com: H2S
-DevVersion.bambu.com: 01.02.00.00
+DevName.bambu.com: My H2S
 DevConnect.bambu.com: lan
 DevBind.bambu.com: occupied
 Devseclink.bambu.com: secure
-DevSecure.bambu.com: 1
-DevSignal.bambu.com: -50dBm
+DevVersion.bambu.com: 01.02.00.00
 DevCap.bambu.com: 1
 
