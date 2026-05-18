@@ -715,6 +715,8 @@ if (BAMBU_BRIDGE)
         GUI/Printer/BridgeStorageBackend.hpp
         GUI/Printer/MediaUrlBuilder.cpp
         GUI/Printer/MediaUrlBuilder.hpp
+        GUI/Printer/PrinterFileSystemBridge.cpp
+        GUI/Printer/PrinterFileSystemBridge.hpp
         Utils/NetworkAgentPluginAdapter.cpp
         Utils/NetworkAgentPluginAdapter.hpp
         Utils/NetworkAgentBridgeHooks.cpp
