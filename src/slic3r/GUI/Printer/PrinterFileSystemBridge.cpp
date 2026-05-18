@@ -5,7 +5,7 @@
 
 #if defined(BAMBU_BRIDGE)
 
-#include "../../Utils/bambu_virtual_client/VirtualBambuTunnel.hpp"
+#include "VirtualBambuTunnel.hpp"
 
 #include <cstdint>
 
