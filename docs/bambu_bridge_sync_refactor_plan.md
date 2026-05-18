@@ -181,5 +181,60 @@ Pre-Phase-3 invariants confirmed:
 - Every refactor commit in Phase 3 will be the only thing the next sync has
   to reconcile — best window for invasive cleanup.
 
-Phase 3 sub-task tracking lives in the task list (Phase 3a / 3b / 3c
-decisions are made just-in-time when each lands).
+## Phase 3 outcome (executed 2026-05-17/18)
+
+All three sub-phases (3a / 3b / 3c) landed across all three BambuStudio-bridge
+branches. 3d (`DeviceManager`) was a deliberate skip — its inline FFFF
+conditional is small and already correct.
+
+### Aggregate diff reduction on `bambu-virtual-shared` (canonical)
+
+| File | Before (LoC vs upstream) | After | Reduction |
+|---|---:|---:|---:|
+| `src/slic3r/GUI/GUI_App.cpp` | 1062 | 155 | **85%** |
+| `src/slic3r/Utils/NetworkAgent.cpp` (bridge-only portion) | 134 | 52 | **61%** |
+| `src/slic3r/GUI/Printer/PrinterFileSystem.cpp` | 241 | 25 | **90%** |
+| **Combined upstream-touching diff** | **1437** | **232** | **84%** |
+
+New self-contained files (live alongside upstream code, gated by
+`#ifdef BAMBU_BRIDGE`):
+
+- `src/slic3r/GUI/BridgeBootstrap.{hpp,cpp}` (≈863 LoC)
+- `src/slic3r/Utils/NetworkAgentBridgeHooks.{hpp,cpp}` (≈750 LoC)
+- `src/slic3r/GUI/Printer/PrinterFileSystemBridge.{hpp,cpp}` (small)
+
+### Final branch heads (pushed to `github.com/danielwoz/BambuStudio`)
+
+- `bridge-necessary` @ `b42e72ae6`
+- `bridge-asio` @ `02b4ab8ba`
+- `bambu-virtual-shared` @ `3ef11b1a9` *(canonical)*
+
+### Notable findings during Phase 3
+
+- **Two real correctness bugs** in the canonical 3a were caught only when
+  bridge-necessary's propagation agent ran `clang -fsyntax-only`. The
+  canonical's own build used stale `.o` files that masked them. Fixes:
+  (i) `class Foo*` in fwd-decls had been introducing local
+  `BridgeBootstrap::GUI_App` types, breaking friend matches — replaced with
+  a real `class GUI_App;` fwd-decl in the enclosing namespace. (ii) A
+  TU-static helper accessed private members without a friend grant —
+  inlined into the friended public function.
+- **Stale-worktree hazard during submodule bump:** the post-rebase
+  `bambu-virtual-shared` ref was updated by the rebase agent's worktree, but
+  the main worktree's files were still pre-rebase. A naive
+  `git add submodule && git commit` then included ~58k LoC of accidental
+  reverts. Caught + force-with-leased away the same turn. Lesson: after a
+  worktree-based rebase, `git reset --hard <branch>` in the main worktree
+  before doing any further commits.
+- **3c propagation to bridge-asio** doesn't reach the canonical's 25 LoC
+  floor because bridge-asio retains its own diagnostic `fprintf` overlay
+  (BS_TRACE, loop_tick, Reconnect URL waits). The Phase 3c contract — extract
+  the 11-lambda dispatch block — is fully achieved; the residual 185 LoC is
+  orthogonal diagnostic-only diff out of phase scope.
+
+### Phase 3 is the upstream-PR-ready milestone
+
+Every future upstream sync now touches one or two files in one place each,
+not hundreds of lines scattered across `GUI_App.cpp`. The canonical
+`bambu-virtual-shared` diff is small enough to consider as a real PR to
+`bambulab/BambuStudio` — decision deferred to Phase 4.
