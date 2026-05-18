@@ -619,6 +619,8 @@ set(SLIC3R_GUI_SOURCES
     Utils/NetworkAgent.hpp
     Utils/NetworkAgentPluginAdapter.cpp
     Utils/NetworkAgentPluginAdapter.hpp
+    Utils/NetworkAgentBridgeHooks.cpp
+    Utils/NetworkAgentBridgeHooks.hpp
     Utils/VirtualLanPrinterStore.cpp
     Utils/VirtualLanPrinterStore.hpp
     Utils/VirtualMqttClient.cpp
