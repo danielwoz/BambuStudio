@@ -156,6 +156,17 @@ bool run_headless(GUI_App* app)
     // Bring up NetworkAgent + DeviceManager exactly like the GUI does.
     // Skips dialogs because mainframe is null and the dialog hooks are
     // only installed via init_networking_callbacks (not called here).
+    //
+    // Precondition: the slicer's cloud session must already be cached
+    // in `~/.config/BambuStudio/` (BambuStudio.conf +
+    // BambuNetworkEngine.conf). Without a cached session the plugin
+    // loads but `is_user_login()` returns false and the cloud inventory
+    // walk yields zero printers — the bridge stays alive but no
+    // per-printer MQTT mirror gets bound. To prime the session: run
+    // `bambu-studio` (no `--bridge-only`) once interactively and log
+    // in via the User panel, then close. The plugin persists the
+    // session token in BambuNetworkEngine.conf for subsequent headless
+    // launches.
     app->copy_network_if_available();
     if (!app->on_init_network()) {
         BOOST_LOG_TRIVIAL(error)
