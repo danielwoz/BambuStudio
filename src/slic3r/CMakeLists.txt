@@ -717,6 +717,8 @@ if (BAMBU_BRIDGE)
         GUI/Printer/MediaUrlBuilder.hpp
         Utils/NetworkAgentPluginAdapter.cpp
         Utils/NetworkAgentPluginAdapter.hpp
+        Utils/NetworkAgentBridgeHooks.cpp
+        Utils/NetworkAgentBridgeHooks.hpp
     )
 
     # Shared virtual-printer client (git submodule). The client-side
