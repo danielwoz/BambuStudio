@@ -119,6 +119,15 @@
 
 #if defined(BAMBU_BRIDGE)
 #include "slic3r/GUI/BridgeBootstrap.hpp"
+// Full type definitions for the unique_ptr<BridgeApp> +
+// unique_ptr<BridgeStorageBackend> members declared in GUI_App.hpp. Required
+// at the point where ~GUI_App() is implicitly defined here so the
+// std::unique_ptr destructors can apply sizeof()/call ~T(). Forward decls
+// in the header are intentional (avoids dragging these into every includer
+// of GUI_App.hpp); the full types only need to be visible at the dtor's
+// definition point, which is this TU.
+#include "bambu_bridge/headless/BridgeApp.hpp"
+#include "slic3r/GUI/Printer/BridgeStorageBackend.hpp"
 #endif
 
 //#ifdef WIN32
