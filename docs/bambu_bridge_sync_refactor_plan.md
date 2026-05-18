@@ -246,3 +246,38 @@ Every future upstream sync now touches one or two files in one place each,
 not hundreds of lines scattered across `GUI_App.cpp`. The canonical
 `bambu-virtual-shared` diff is small enough to consider as a real PR to
 `bambulab/BambuStudio` — decision deferred to Phase 4.
+
+## Phase 3.5 — Windows portability audit (2026-05-18)
+
+After Phase 3 landed, ran a static Windows-portability audit of the new
+bridge files (`BridgeBootstrap`, `NetworkAgentBridgeHooks`,
+`PrinterFileSystemBridge`) and the bambu-virtual-client submodule
+(`VirtualMqttClient`, `VirtualFtpsClient`, `VirtualLanPrinterStore`,
+`VirtualSsdpAliveJson`, `VirtualSsdpDiscovery`).
+
+### Verdict: ~90% Windows-ready
+
+0 MUST-FIX. 4 CONCERNS fixed defensively:
+
+| Fix | File | Why |
+|---|---|---|
+| `sigaction` POSIX-gate | `VirtualMqttCli.cpp` | unconditional sigaction would block Windows configure |
+| Explicit `<arpa/inet.h>` | `VirtualFtpsClient.cpp` | was relying on boost::asio transitive include for `INET_ADDRSTRLEN` |
+| `boost::nowide::{i,o}fstream` | `VirtualLanPrinterStore.cpp`, `VirtualFtpsClient.cpp` | non-ASCII paths (data_dir, user-picked .3mf) work on Windows |
+| `WIN32 → ws2_32 + crypt32` link | `bambu-virtual-client/CMakeLists.txt`, `src/bambu_bridge/CMakeLists.txt` | defensive link list — slicer pipeline picks these up transitively today but standalone Windows CI would otherwise fail with unresolved winsock symbols |
+
+Landed:
+- `bambu-virtual-client` `main` @ `98776df`
+- `BambuStudio-bridge` `bambu-virtual-shared` @ `0bf618039` (submodule bump + bridge CMakeLists fix)
+- `OrcaSlicer-bridge` `bambu-virtual-shared` @ `29e08e08` (submodule bump)
+
+### Deferred concerns
+
+- `VirtualSsdpDiscovery` UDP multicast — no explicit `WSAStartup`; relies on boost::asio's first `io_context` ctor doing it on Windows. Worth verifying once a real Windows compile is wired.
+- **Server-side bambu_bridge** (SsdpListener, FtpsServer, RtspServer, MqttBroker, VirtualTunnelServer) uses ungated POSIX sockets — **Linux-only by design today**. Any future Windows server port is a larger job than the client-side audit suggests.
+
+## Build verification blocker (2026-05-18)
+
+Attempted incremental rebuild on `bambu-virtual-shared` post-Phase-3 to verify no regressions. **Blocked at configure stage**: missing `assimp` cmake config (deps tree never built assimp; system has no `libassimp-dev`). Real-printer e2e verification therefore deferred until the deps tree is rebuilt or assimp is installed. The May 12 `build/bambu-studio` binary predates Phase 3 and is no longer representative.
+
+Bambu-virtual-client standalone tests continue to pass 5/5 across all changes (Phase 1 + Phase 3.5).
