@@ -718,6 +718,8 @@ if (BAMBU_BRIDGE)
         GUI/Printer/BridgeStorageBackend.hpp
         GUI/Printer/MediaUrlBuilder.cpp
         GUI/Printer/MediaUrlBuilder.hpp
+        GUI/Printer/PrinterFileSystemBridge.cpp
+        GUI/Printer/PrinterFileSystemBridge.hpp
         GUI/Printer/VirtualBambuTunnel.cpp
         GUI/Printer/VirtualBambuTunnel.hpp
         Utils/NetworkAgentPluginAdapter.cpp
