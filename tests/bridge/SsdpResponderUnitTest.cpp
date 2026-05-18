@@ -41,66 +41,86 @@ SsdpVirtualDevice fixture_device() {
     return d;
 }
 
+// Expected wire-format strings.
+//
+// These pin the exact bytes the SsdpResponder emits, which were derived
+// from an actual A1 firmware 01.08.00.00 multicast capture (see the
+// build_search_response_headers / build_notify_headers comments in
+// SsdpResponder.cpp for rationale on each non-spec-RFC choice).
+//
+// Why this differs from the textbook UPnP / spec'd-Bambu format:
+//   * `LOCATION` is a plain IP, NOT `http://<ip>:<port>/upnp/desc.xml`.
+//     Slicers that treat LOCATION as a UPnP-spec URL (Orca being the
+//     canonical offender) will HTTP-GET the value; with a URL there
+//     they'd land on our MQTT-over-TLS port and trigger
+//     ssl3_get_record:http request. Plain IP makes them skip the
+//     descriptor fetch and go straight to MQTT-over-TLS on 8883.
+//   * `SERVER: UPnP/1.0` literal — real A1 firmware does NOT include
+//     a Bambu-versioned Server string.
+//   * No `DevSecure.bambu.com:` / `DevSignal.bambu.com:` in the search
+//     response. NOTIFY adds `DevSignal.bambu.com: -60` (literal -60,
+//     no `dBm` suffix; mirrors A1 emission).
+//   * NOTIFY uses mixed-case header names (`Server:`, `Location:`,
+//     `Cache-Control:`) — real A1 firmware does too.
+//   * NOTIFY field order: USN → Cache-Control → DevModel → DevName →
+//     DevSignal → DevConnect → DevBind → Devseclink → DevVersion →
+//     DevCap. Matches A1 exactly.
+//   * Search-response header order: DevModel → DevName → DevConnect →
+//     DevBind → Devseclink → DevVersion → DevCap. (M-SEARCH replies
+//     are mostly vestigial — real printers don't reply to M-SEARCH —
+//     but we keep this path for generic UPnP scanners.)
 const char* kExpectedResponse =
     "HTTP/1.1 200 OK\r\n"
     "CACHE-CONTROL: max-age=1800\r\n"
     "EXT:\r\n"
-    "LOCATION: http://192.168.1.42:80/upnp/desc.xml\r\n"
-    "SERVER: Bambu Lab/H2S/01.02.00.00\r\n"
+    "LOCATION: 192.168.1.42\r\n"
+    "SERVER: UPnP/1.0\r\n"
     "ST: urn:bambulab-com:device:3dprinter:1\r\n"
     "USN: TESTSER0001\r\n"
-    "DevName.bambu.com: Test\r\n"
     "DevModel.bambu.com: H2S\r\n"
-    "DevVersion.bambu.com: 01.02.00.00\r\n"
+    "DevName.bambu.com: Test\r\n"
     "DevConnect.bambu.com: lan\r\n"
     "DevBind.bambu.com: occupied\r\n"
     "Devseclink.bambu.com: secure\r\n"
-    "DevSecure.bambu.com: 1\r\n"
-    "DevSignal.bambu.com: -50dBm\r\n"
+    "DevVersion.bambu.com: 01.02.00.00\r\n"
     "DevCap.bambu.com: 1\r\n"
     "\r\n";
 
 const char* kExpectedNotifyAlive =
     "NOTIFY * HTTP/1.1\r\n"
     "HOST: 239.255.255.250:1900\r\n"
+    "Server: UPnP/1.0\r\n"
+    "Location: 192.168.1.42\r\n"
     "NT: urn:bambulab-com:device:3dprinter:1\r\n"
     "NTS: ssdp:alive\r\n"
-    "CACHE-CONTROL: max-age=1800\r\n"
-    "EXT:\r\n"
-    "LOCATION: http://192.168.1.42:80/upnp/desc.xml\r\n"
-    "SERVER: Bambu Lab/H2S/01.02.00.00\r\n"
-    "ST: urn:bambulab-com:device:3dprinter:1\r\n"
     "USN: TESTSER0001\r\n"
-    "DevName.bambu.com: Test\r\n"
+    "Cache-Control: max-age=1800\r\n"
     "DevModel.bambu.com: H2S\r\n"
-    "DevVersion.bambu.com: 01.02.00.00\r\n"
+    "DevName.bambu.com: Test\r\n"
+    "DevSignal.bambu.com: -60\r\n"
     "DevConnect.bambu.com: lan\r\n"
     "DevBind.bambu.com: occupied\r\n"
     "Devseclink.bambu.com: secure\r\n"
-    "DevSecure.bambu.com: 1\r\n"
-    "DevSignal.bambu.com: -50dBm\r\n"
+    "DevVersion.bambu.com: 01.02.00.00\r\n"
     "DevCap.bambu.com: 1\r\n"
     "\r\n";
 
 const char* kExpectedNotifyByebye =
     "NOTIFY * HTTP/1.1\r\n"
     "HOST: 239.255.255.250:1900\r\n"
+    "Server: UPnP/1.0\r\n"
+    "Location: 192.168.1.42\r\n"
     "NT: urn:bambulab-com:device:3dprinter:1\r\n"
     "NTS: ssdp:byebye\r\n"
-    "CACHE-CONTROL: max-age=1800\r\n"
-    "EXT:\r\n"
-    "LOCATION: http://192.168.1.42:80/upnp/desc.xml\r\n"
-    "SERVER: Bambu Lab/H2S/01.02.00.00\r\n"
-    "ST: urn:bambulab-com:device:3dprinter:1\r\n"
     "USN: TESTSER0001\r\n"
-    "DevName.bambu.com: Test\r\n"
+    "Cache-Control: max-age=1800\r\n"
     "DevModel.bambu.com: H2S\r\n"
-    "DevVersion.bambu.com: 01.02.00.00\r\n"
+    "DevName.bambu.com: Test\r\n"
+    "DevSignal.bambu.com: -60\r\n"
     "DevConnect.bambu.com: lan\r\n"
     "DevBind.bambu.com: occupied\r\n"
     "Devseclink.bambu.com: secure\r\n"
-    "DevSecure.bambu.com: 1\r\n"
-    "DevSignal.bambu.com: -50dBm\r\n"
+    "DevVersion.bambu.com: 01.02.00.00\r\n"
     "DevCap.bambu.com: 1\r\n"
     "\r\n";
 
@@ -145,8 +165,12 @@ int main() {
         }
     }
 
-    // (4) bound=false, secure=false flips the DevBind / Devseclink / DevSecure
-    //     headers without touching anything else.
+    // (4) bound=false, secure=false flips the DevBind / Devseclink headers
+    //     without touching anything else. (The impl does not emit
+    //     DevSecure.bambu.com in the M-SEARCH path; the A1-capture-derived
+    //     NOTIFY also omits it. If a future capture from another firmware
+    //     ever shows DevSecure being emitted on the wire, re-add the
+    //     coverage here.)
     {
         SsdpVirtualDevice unbound = dev;
         unbound.bound  = false;
@@ -156,8 +180,6 @@ int main() {
                "expected DevBind: free for unbound device");
         EXPECT(s.find("Devseclink.bambu.com: free")  != std::string::npos,
                "expected Devseclink: free for insecure device");
-        EXPECT(s.find("DevSecure.bambu.com: 0")      != std::string::npos,
-               "expected DevSecure: 0 for insecure device");
         EXPECT(s.find("DevBind.bambu.com: occupied") == std::string::npos,
                "leaked occupied for unbound device");
     }

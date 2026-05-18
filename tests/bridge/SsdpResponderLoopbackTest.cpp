@@ -165,7 +165,11 @@ int main() {
     must_contain("DevName.bambu.com: Loopback");
     must_contain("DevModel.bambu.com: H2S");
     must_contain("DevVersion.bambu.com: 01.02.00.00");
-    must_contain("LOCATION: http://127.0.0.1:8080/upnp/desc.xml");
+    // Plain-IP LOCATION (not the UPnP-spec URL form). See
+    // SsdpResponder.cpp's build_notify_headers comment — emitting a URL
+    // here causes Orca to HTTP-GET it and trip ssl3_get_record on the
+    // MQTT port. The bridge intentionally mimics the A1-firmware shape.
+    must_contain("LOCATION: 127.0.0.1");
     must_contain("ST: urn:bambulab-com:device:3dprinter:1");
     must_contain("Devseclink.bambu.com: secure");
 
