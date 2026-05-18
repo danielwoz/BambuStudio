@@ -276,8 +276,48 @@ Landed:
 - `VirtualSsdpDiscovery` UDP multicast — no explicit `WSAStartup`; relies on boost::asio's first `io_context` ctor doing it on Windows. Worth verifying once a real Windows compile is wired.
 - **Server-side bambu_bridge** (SsdpListener, FtpsServer, RtspServer, MqttBroker, VirtualTunnelServer) uses ungated POSIX sockets — **Linux-only by design today**. Any future Windows server port is a larger job than the client-side audit suggests.
 
-## Build verification blocker (2026-05-18)
+## Build verification (2026-05-18, second attempt)
 
-Attempted incremental rebuild on `bambu-virtual-shared` post-Phase-3 to verify no regressions. **Blocked at configure stage**: missing `assimp` cmake config (deps tree never built assimp; system has no `libassimp-dev`). Real-printer e2e verification therefore deferred until the deps tree is rebuilt or assimp is installed. The May 12 `build/bambu-studio` binary predates Phase 3 and is no longer representative.
+The first rebuild attempt failed at configure on missing assimp. The fix turned out to be simpler than installing the package: the next `cmake --build build` automatically re-resolved against the already-populated deps tree. Build then ran 644 objects + linking.
 
-Bambu-virtual-client standalone tests continue to pass 5/5 across all changes (Phase 1 + Phase 3.5).
+**Real regression caught by the build:** Phase 3a's BridgeBootstrap extraction
+removed the `#include "bambu_bridge/headless/BridgeApp.hpp"` and `#include
+"slic3r/GUI/Printer/BridgeStorageBackend.hpp"` from `GUI_App.cpp` (those
+includes had only been there because the inline bridge code used the types).
+GUI_App.hpp still forward-declares those classes, and the `std::unique_ptr<>`
+members at the end of GUI_App need them complete at the point of
+`~GUI_App()` definition (line 2314). The earlier `clang -fsyntax-only` audits
+on individual files happened to use include orders that didn't trigger
+unique_ptr destructor instantiation, so the bug slipped through Phase 3a's
+verification.
+
+Fix: re-add the two `#include`s inside the `#ifdef BAMBU_BRIDGE` block at
+top of `GUI_App.cpp`. Forward decls in the header stay — this is the
+standard "complete-type-at-dtor-definition" pattern. Back-ported to
+`bridge-asio` (`2779d8f45`) and `bridge-necessary` (`dc7b30aac`).
+
+### Final post-Phase-3 build state (2026-05-18)
+
+| Branch | HEAD | bambu-studio binary | Bridge ctests |
+|---|---|---|---|
+| bambu-virtual-shared | `5f985e040` | ✓ 138 MB @ 13:56 | 29/32 (3 pre-existing SSDP fails) |
+| bridge-asio | `2779d8f45` | rebuild deferred | — |
+| bridge-necessary | `dc7b30aac` | rebuild deferred | — |
+
+### Pre-existing SSDP test failures
+
+`SsdpResponderUnitTest`, `SsdpResponderLoopbackTest`, and the SSDP arm of
+`WireDiffBridgeTest` fail with a clear format mismatch — the bridge emits
+`LOCATION: 192.168.1.42` + `SERVER: UPnP/1.0` + reordered/dropped device
+keys, but the fixtures expect `LOCATION: http://192.168.1.42:80/upnp/desc.xml`
++ `SERVER: Bambu Lab/H2S/01.02.00.00` + the full key set.
+
+Verified pre-existing: diffing `SsdpResponder.cpp`, `SsdpResponder.hpp`,
+`SsdpResponderUnitTest.cpp` between `pre-sync-2026-05-17-bambu-virtual-shared`
+and current HEAD shows **byte-identical** content. These would have failed
+on the May 12 baseline too if anyone had run them. Filing TODO for
+follow-up: either refresh the fixture against current SsdpResponder
+output, or restore the SsdpResponder format the fixture pinned.
+
+Bambu-virtual-client standalone tests continue to pass 5/5 across all
+changes (Phase 1 + Phase 3.5 + Phase 4 build catch).
