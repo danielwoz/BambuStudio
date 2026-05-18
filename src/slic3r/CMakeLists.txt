@@ -12,6 +12,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Printer/MediaUrlBuilder.hpp
     GUI/Printer/PrinterFileSystem.cpp
     GUI/Printer/PrinterFileSystem.h
+    GUI/Printer/PrinterFileSystemBridge.cpp
+    GUI/Printer/PrinterFileSystemBridge.hpp
     GUI/Printer/VirtualBambuTunnel.cpp
     GUI/Printer/VirtualBambuTunnel.hpp
     GUI/Widgets/AnimaController.hpp
