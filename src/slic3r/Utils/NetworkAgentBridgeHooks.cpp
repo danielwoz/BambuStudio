@@ -1,8 +1,8 @@
 #include "NetworkAgentBridgeHooks.hpp"
 
 #include "NetworkAgent.hpp"
-#include "bambu_virtual_client/VirtualMqttClient.hpp"
-#include "bambu_virtual_client/VirtualFtpsClient.hpp"
+#include "VirtualMqttClient.hpp"
+#include "VirtualFtpsClient.hpp"
 
 #include <mutex>
 #include <utility>
