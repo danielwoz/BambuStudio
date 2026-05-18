@@ -159,15 +159,23 @@ All three BambuStudio-bridge branches rebased onto upstream HEAD `e8c7dc1b8`:
 OrcaSlicer-bridge `bambu-virtual-shared` was a no-op rebase (0 behind) +
 submodule bump to `f6c34e5` (commit `fcba1cdf`, local-only).
 
-### Upstream-side observation (TODO)
+### Upstream-side observation (filed)
 
 During the rebases, **upstream PR #10106 by `maziggy` shipped a stale API call
 in `AMSMaterialsSetting.cpp`**: `obj->get_extruder_id_by_ams_id()` — that
-method no longer exists on `MachineObject`. Every other callsite in the tree
+method does not exist on `MachineObject`. Every other callsite in the tree
 uses `obj->GetFilaSystem()->GetExtruderIdByAmsId()`. Our rebased branches
-kept the working version + the `if (ext_id > 0)` guard. This is a small
-upstream bug worth a dedicated PR to `bambulab/BambuStudio` once we file
-larger ones; capture for now and revisit.
+kept the working version + the `if (ext_id > 0)` guard.
+
+**Filed as upstream PR 2026-05-18:**
+[bambulab/BambuStudio#10768](https://github.com/bambulab/BambuStudio/pull/10768).
+The fix re-applies xin.zhang's own post-fix commit `33b62edc1` (2026-05-07),
+which had successfully fixed the bug but was then clobbered by a duplicate
+cherry-pick of #10106 (`01781493c`, same author + author-date as `b29fe53fe`).
+Both the current `master` HEAD and the release tag `v02.07.00.55` (published
+2026-05-14) still contain the broken line — confirmed via exhaustive grep,
+no preprocessor gate, no macro definition, no inheritance shenanigans.
+How upstream CI compiles this without errors remains unexplained.
 
 ---
 
