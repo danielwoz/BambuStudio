@@ -136,6 +136,15 @@ if (Threads_FOUND)
     target_link_libraries(bambu_bridge PUBLIC Threads::Threads)
 endif ()
 
+# Defensive Windows-side link list. The bridge server's sockets/SSDP/MQTT
+# layers go through boost::asio so the slicer pipeline picks ws2_32 +
+# crypt32 up transitively from libcurl/wxWidgets today, but anyone
+# building bambu_bridge standalone on Windows otherwise hits unresolved
+# winsock symbols.
+if (WIN32)
+    target_link_libraries(bambu_bridge PUBLIC ws2_32 crypt32)
+endif ()
+
 # ---- bridge_cli executable ----------------------------------------------
 #
 # Tiny TSV-emitter for headless inspection of the cloud inventory. The
