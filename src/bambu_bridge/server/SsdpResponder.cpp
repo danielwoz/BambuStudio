@@ -51,7 +51,8 @@ std::string build_search_response_headers(const SsdpVirtualDevice& dev) {
        << "DevBind.bambu.com: "    << (dev.bound  ? "occupied" : "free")  << "\r\n"
        << "Devseclink.bambu.com: " << (dev.secure ? "secure"   : "free")  << "\r\n"
        << "DevVersion.bambu.com: " << dev.firmware  << "\r\n"
-       << "DevCap.bambu.com: 1\r\n";
+       << "DevCap.bambu.com: 1\r\n"
+       << "Bambu-Mqtt-Port: "      << dev.http_port << "\r\n";
     return os.str();
 }
 
@@ -86,7 +87,8 @@ std::string build_notify_headers(const SsdpVirtualDevice& dev, bool alive) {
        << "DevBind.bambu.com: "    << (dev.bound  ? "occupied" : "free")  << "\r\n"
        << "Devseclink.bambu.com: " << (dev.secure ? "secure"   : "free")  << "\r\n"
        << "DevVersion.bambu.com: " << dev.firmware  << "\r\n"
-       << "DevCap.bambu.com: 1\r\n";
+       << "DevCap.bambu.com: 1\r\n"
+       << "Bambu-Mqtt-Port: "      << dev.http_port << "\r\n";
     return os.str();
 }
 

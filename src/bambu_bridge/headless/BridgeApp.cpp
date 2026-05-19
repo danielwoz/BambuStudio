@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -539,6 +540,31 @@ void BridgeApp::reconcile_once() {
 }
 
 void BridgeApp::set_virtual_printers(std::vector<VirtualPrinter> printers) {
+    // BAMBU_BRIDGE_PRINTER_ORDER (comma-separated dev_ids) forces the
+    // index assignment order, which in turn fixes the per-printer MQTT
+    // / FTPS / RTSP / vtun port assignments (port = base + index).
+    // Useful when a slicer-side client hardcodes the legacy port_base
+    // and you want a specific printer served there. Devices not named
+    // in the list keep their relative order and are appended after.
+    if (const char* env = std::getenv("BAMBU_BRIDGE_PRINTER_ORDER"); env && *env) {
+        std::vector<std::string> want;
+        const std::string s = env;
+        size_t pos = 0;
+        while (pos <= s.size()) {
+            const size_t comma = s.find(',', pos);
+            const size_t end = (comma == std::string::npos) ? s.size() : comma;
+            if (end > pos) want.emplace_back(s.substr(pos, end - pos));
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+        std::stable_sort(printers.begin(), printers.end(),
+            [&want](const VirtualPrinter& a, const VirtualPrinter& b) {
+                const auto ia = std::find(want.begin(), want.end(), a.dev_id);
+                const auto ib = std::find(want.begin(), want.end(), b.dev_id);
+                return ia < ib;
+            });
+    }
+
     std::lock_guard<std::mutex> lk(m_devices_mu);
 
     // Snapshot is the source of truth for device EXISTENCE; lan_ip is
