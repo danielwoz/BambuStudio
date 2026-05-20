@@ -565,6 +565,32 @@ void BridgeApp::set_virtual_printers(std::vector<VirtualPrinter> printers) {
             });
     }
 
+    // BAMBU_BRIDGE_TARGET_DEV (comma-separated dev_ids) restricts the
+    // snapshot to just those printers. Pins a --bridge-only child
+    // process to one (or a few) device(s) — the basis for the
+    // multi-process launcher where each child owns a single real
+    // printer (and therefore its own plugin LAN slot, since the
+    // proprietary plugin only supports one active LAN connection per
+    // process). Empty / unset = keep all (default behaviour).
+    if (const char* env = std::getenv("BAMBU_BRIDGE_TARGET_DEV"); env && *env) {
+        std::vector<std::string> keep;
+        const std::string s = env;
+        size_t pos = 0;
+        while (pos <= s.size()) {
+            const size_t comma = s.find(',', pos);
+            const size_t end = (comma == std::string::npos) ? s.size() : comma;
+            if (end > pos) keep.emplace_back(s.substr(pos, end - pos));
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+        printers.erase(
+            std::remove_if(printers.begin(), printers.end(),
+                [&keep](const VirtualPrinter& p) {
+                    return std::find(keep.begin(), keep.end(), p.dev_id) == keep.end();
+                }),
+            printers.end());
+    }
+
     std::lock_guard<std::mutex> lk(m_devices_mu);
 
     // Snapshot is the source of truth for device EXISTENCE; lan_ip is
