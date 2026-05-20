@@ -9,6 +9,7 @@
 
 #include "../BambuNetworkingPluginHandle.hpp"
 
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -198,14 +199,51 @@ bool LanUplink::is_connected(const std::string& dev_id) const {
 }
 
 void LanUplink::on_subscribe(const std::string& dev_id, std::string topic) {
-    // The plugin's LAN broker auto-pushes `device/<dev_id>/report` once
-    // `connect_printer` succeeds; no explicit subscribe is needed. We
-    // still refcount slicer-side requests for hygiene (so cleanup logic
-    // doesn't double-fire) but we never call into the plugin here.
-    std::lock_guard<std::mutex> lk(m_impl->mu);
-    auto* d = m_impl->find_locked(dev_id);
-    if (!d) return;
-    ++d->topic_refs[topic];
+    // The plugin only holds ONE active LAN connection at a time. When a
+    // slicer subscribes to a device that isn't currently the plugin's
+    // active dev_id, we have to swap — otherwise the plugin's
+    // local-message receiver only fires for the previous device and
+    // the slicer sees no push_status.
+    //
+    // We still refcount slicer-side topic subscribes for cleanup
+    // hygiene (attach_downstream + on_disconnect coordinate against it).
+    std::shared_ptr<BambuNetworkingPluginHandle> h;
+    bool need_swap = false;
+    bool found = false;
+    std::string dev_ip;
+    std::string access_code;
+    bool use_ssl = true;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->mu);
+        auto* d = m_impl->find_locked(dev_id);
+        found = (d != nullptr);
+        if (d) {
+            ++d->topic_refs[topic];
+            if (m_impl->current_connected_dev_id != dev_id) {
+                need_swap   = true;
+                dev_ip      = d->cfg.printer_ip;
+                access_code = d->cfg.access_code;
+                use_ssl     = d->cfg.use_ssl;
+                h           = m_impl->handle;
+            }
+        }
+    }
+    if (!found) return;
+    if (need_swap && h) {
+        std::fprintf(stderr,
+            "[lan-uplink] SWAP active dev → %s (ip=%s) on slicer subscribe %s\n",
+            dev_id.c_str(), dev_ip.c_str(), topic.c_str());
+        std::fflush(stderr);
+        int rc = h->connect_printer(dev_id, dev_ip, "bblp", access_code, use_ssl);
+        if (rc == 0) {
+            std::lock_guard<std::mutex> lk(m_impl->mu);
+            m_impl->current_connected_dev_id = dev_id;
+        } else {
+            std::fprintf(stderr,
+                "[lan-uplink] SWAP failed rc=%d for dev=%s\n", rc, dev_id.c_str());
+            std::fflush(stderr);
+        }
+    }
 }
 
 void LanUplink::on_publish(const std::string& dev_id, std::string topic,

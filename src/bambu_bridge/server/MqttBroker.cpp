@@ -662,6 +662,13 @@ void session_io_loop(MqttBroker::Device* dev,
         (dev->spec.access_code.empty() ||
          secure_streq(supplied_pass, dev->spec.access_code));
     if (!auth_ok) {
+        std::fprintf(stderr,
+            "[mqtt-broker] CONNECT auth fail dev_id=%s client_id=%s user='%s' pass_len=%zu expected_len=%zu\n",
+            dev->spec.dev_id.c_str(), con.client_id.c_str(),
+            (con.has_username ? con.username.c_str() : "-"),
+            (con.has_password ? supplied_pass.size() : 0),
+            dev->spec.access_code.size());
+        std::fflush(stderr);
         auto pkt = encode_connack(ConnackReturnCode::NotAuthorized);
         SSL_write(sess->ssl, pkt.data(), static_cast<int>(pkt.size()));
         return;
