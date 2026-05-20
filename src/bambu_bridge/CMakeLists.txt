@@ -104,6 +104,8 @@ add_library(bambu_bridge STATIC
     headless/BridgeApp.hpp
     headless/BridgeAppCliArgs.cpp
     headless/BridgeAppCliArgs.hpp
+    headless/BridgeLauncher.cpp
+    headless/BridgeLauncher.hpp
     headless/SignalHandler.cpp
     headless/SignalHandler.hpp
 )

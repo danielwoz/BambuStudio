@@ -1485,6 +1485,7 @@ static void load_downward_settings_list_from_config(std::string config_file, std
 #if defined(BAMBU_BRIDGE)
 #include "bambu_bridge/headless/BridgeApp.hpp"
 #include "bambu_bridge/headless/BridgeAppCliArgs.hpp"
+#include "bambu_bridge/headless/BridgeLauncher.hpp"
 #include "slic3r/GUI/BridgeOnlyFlag.hpp"
 #include "slic3r/GUI/GUI_Init.hpp"
 #include <cstdio>
@@ -1515,6 +1516,14 @@ int CLI::run(int argc, char **argv)
     // `bambu-bridge-daemon ...` accept identical argument grammars.
 #if defined(BAMBU_BRIDGE)
     {
+        // --bridge-multi: supervise-mode launcher. Forks one
+        // `BambuStudio --bridge-only --only-dev-id <X>` child per real
+        // printer so each child holds its own plugin LAN slot. Must be
+        // checked before --bridge-only so a child re-exec'd from the
+        // launcher takes the --bridge-only branch below.
+        if (Slic3r::bridge::headless::is_bridge_multi(argc, argv)) {
+            std::_Exit(Slic3r::bridge::headless::run_bridge_multi(argc, argv));
+        }
         bool bridge_only = false;
         for (int i = 1; i < argc; ++i) {
             if (argv[i] && std::strcmp(argv[i], "--bridge-only") == 0) {
