@@ -749,6 +749,36 @@ void session_io_loop(MqttBroker::Device* dev,
             // observed in `LanMqttSession` use QoS 0 for /report and a
             // mix of 0/1 for /request — the broker handles both.
             if (uplink) {
+                // Rewrite virtual_sn → real_sn in the JSON payload. The
+                // slicer's MachineObject is keyed on the FFFF-mangled
+                // dev_id and embeds that virtual SN throughout its
+                // command JSON ("dev_id", "user_id", target identifiers,
+                // etc.). Real Bambu printer firmware rejects commands
+                // whose payload SN doesn't match the printer's own
+                // serial — which is why AMS/filament/print commands
+                // appear to do nothing even though the topic + plugin
+                // routing is fine. SNs are 15-char ASCII, so this is a
+                // length-preserving rewrite — safe to do in-place
+                // without re-allocating.
+                const std::string& real_sn    = dev->spec.dev_id;
+                const std::string& virtual_sn = dev->spec.virtual_dev_id;
+                if (!virtual_sn.empty()
+                    && virtual_sn != real_sn
+                    && virtual_sn.size() == real_sn.size()) {
+                    auto& buf = pk->publish.payload;
+                    if (buf.size() >= virtual_sn.size()) {
+                        const uint8_t* needle =
+                            reinterpret_cast<const uint8_t*>(virtual_sn.data());
+                        const size_t   nlen   = virtual_sn.size();
+                        for (size_t i = 0; i + nlen <= buf.size(); ++i) {
+                            if (std::memcmp(buf.data() + i, needle, nlen) == 0) {
+                                std::memcpy(buf.data() + i,
+                                            real_sn.data(), nlen);
+                                i += nlen - 1;
+                            }
+                        }
+                    }
+                }
                 uplink->on_publish(dev->spec.dev_id, pk->publish.topic,
                                    std::move(pk->publish.payload),
                                    pk->publish.qos);

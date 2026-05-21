@@ -61,6 +61,7 @@ std::string render_usage(const std::string& program_name) {
         "  --mqtt-port-base N     Per-device MQTT port base (default 38883).\n"
         "  --ftps-port-base N     Per-device FTPS port base (default 39990).\n"
         "  --rtsp-port-base N     Per-device RTSP port base (default 38322).\n"
+        "  --vtun-port-base N     Per-device virtual-tunnel port base (default 39998).\n"
         "  --cert-cache-dir <p>   Directory for per-device certs (default:\n"
         "                         $XDG_CONFIG_HOME/BambuStudio/bridge/certs).\n"
         "\n"
@@ -156,6 +157,14 @@ ParseResult parse_cli_args(const std::string& program_name,
                 result.exit_code = 2;
                 result.error_message =
                     program_name + ": --rtsp-port-base requires an integer 0..65535, got '" + v + "'";
+                return result;
+            }
+        } else if (a == "--vtun-port-base") {
+            auto v = take_value(i, "--vtun-port-base"); if (!v) return result;
+            if (!parse_uint16(v, &cfg.vtun_port_base)) {
+                result.exit_code = 2;
+                result.error_message =
+                    program_name + ": --vtun-port-base requires an integer 0..65535, got '" + v + "'";
                 return result;
             }
         } else if (a == "--cert-cache-dir") {

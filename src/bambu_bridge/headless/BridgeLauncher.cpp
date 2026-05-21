@@ -136,7 +136,8 @@ ChildArgs build_child_args(const std::string& self_path,
                            const std::string& dev_id,
                            uint16_t           mqtt_base,
                            uint16_t           ftps_base,
-                           uint16_t           rtsp_base) {
+                           uint16_t           rtsp_base,
+                           uint16_t           vtun_base) {
     ChildArgs c;
     c.storage = {
         self_path,
@@ -145,6 +146,7 @@ ChildArgs build_child_args(const std::string& self_path,
         "--mqtt-port-base",  std::to_string(mqtt_base),
         "--ftps-port-base",  std::to_string(ftps_base),
         "--rtsp-port-base",  std::to_string(rtsp_base),
+        "--vtun-port-base",  std::to_string(vtun_base),
     };
     for (auto& s : c.storage) c.argv.push_back(const_cast<char*>(s.c_str()));
     c.argv.push_back(nullptr);
@@ -201,6 +203,7 @@ int run_bridge_multi(int argc, char** argv) {
     const uint16_t mqtt_base = parse_u16(get_arg(argc, argv, "mqtt-port-base"), 8883);
     const uint16_t ftps_base = parse_u16(get_arg(argc, argv, "ftps-port-base"), 39990);
     const uint16_t rtsp_base = parse_u16(get_arg(argc, argv, "rtsp-port-base"), 38322);
+    const uint16_t vtun_base = parse_u16(get_arg(argc, argv, "vtun-port-base"), 39998);
 
     const std::string self_path = (argc > 0 && argv[0]) ? argv[0] : "BambuStudio";
 
@@ -212,7 +215,8 @@ int run_bridge_multi(int argc, char** argv) {
             self_path, printers[i],
             static_cast<uint16_t>(mqtt_base + i),
             static_cast<uint16_t>(ftps_base + i),
-            static_cast<uint16_t>(rtsp_base + i));
+            static_cast<uint16_t>(rtsp_base + i),
+            static_cast<uint16_t>(vtun_base + i));
         pid_t pid = ::fork();
         if (pid < 0) {
             std::fprintf(stderr,
@@ -235,11 +239,12 @@ int run_bridge_multi(int argc, char** argv) {
         }
         g_children[i] = pid;
         std::fprintf(stderr,
-            "[bridge-multi] spawned pid=%d for %s (mqtt=%u ftps=%u rtsp=%u)\n",
+            "[bridge-multi] spawned pid=%d for %s (mqtt=%u ftps=%u rtsp=%u vtun=%u)\n",
             int(pid), printers[i].c_str(),
             unsigned(mqtt_base + i),
             unsigned(ftps_base + i),
-            unsigned(rtsp_base + i));
+            unsigned(rtsp_base + i),
+            unsigned(vtun_base + i));
     }
     std::fflush(stderr);
 
