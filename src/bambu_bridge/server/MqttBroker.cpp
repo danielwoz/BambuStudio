@@ -749,6 +749,31 @@ void session_io_loop(MqttBroker::Device* dev,
             // observed in `LanMqttSession` use QoS 0 for /report and a
             // mix of 0/1 for /request — the broker handles both.
             if (uplink) {
+                // Diagnostic: log every slicer→printer PUBLISH so we can
+                // confirm filament/print/AMS commands are reaching the
+                // bridge at all + whether the SN rewrite fired.
+                {
+                    const std::string& v = dev->spec.virtual_dev_id;
+                    size_t rewrite_hits = 0;
+                    if (!v.empty() && v != dev->spec.dev_id
+                        && v.size() == dev->spec.dev_id.size()) {
+                        const auto& buf = pk->publish.payload;
+                        const uint8_t* needle = reinterpret_cast<const uint8_t*>(v.data());
+                        const size_t   nlen   = v.size();
+                        for (size_t i = 0; i + nlen <= buf.size(); ++i) {
+                            if (std::memcmp(buf.data() + i, needle, nlen) == 0) {
+                                ++rewrite_hits;
+                                i += nlen - 1;
+                            }
+                        }
+                    }
+                    std::fprintf(stderr,
+                        "[mqtt-broker] UPSTREAM dev=%s topic=%s qos=%u bytes=%zu virtual_sn_hits=%zu\n",
+                        dev->spec.dev_id.c_str(), pk->publish.topic.c_str(),
+                        unsigned(pk->publish.qos), pk->publish.payload.size(),
+                        rewrite_hits);
+                    std::fflush(stderr);
+                }
                 // Rewrite virtual_sn → real_sn in the JSON payload. The
                 // slicer's MachineObject is keyed on the FFFF-mangled
                 // dev_id and embeds that virtual SN throughout its
