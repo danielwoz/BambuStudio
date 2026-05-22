@@ -96,6 +96,12 @@ public:
     // started). Cheap; safe to poll.
     virtual bool agent_ready() const;
 
+    // Plugin's self-reported version string. Mirrors
+    // `NetworkAgent::get_version()` — returns "00.00.00.00" when the
+    // plugin isn't loaded or the symbol is missing. The GUI embeds this
+    // as the `&net_ver=` query param on `bambu_create` URLs.
+    virtual std::string plugin_version() const;
+
     // True iff the plugin reports the user is currently logged in. False
     // when the plugin isn't loaded.
     virtual bool is_user_login() const;

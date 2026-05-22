@@ -84,30 +84,65 @@ bool CloudCameraSource::open() {
     }
 
     if (!plugin || !plugin->agent_ready()) {
+        std::fprintf(stderr,
+            "[cloud-camera] open dev=%s FAIL: plugin not ready (plugin=%p agent_ready=%d)\n",
+            m_cfg.dev_id.c_str(), (void*)plugin.get(),
+            plugin ? int(plugin->agent_ready()) : -1);
+        std::fflush(stderr);
         return false;
     }
     if (!source) {
+        std::fprintf(stderr,
+            "[cloud-camera] open dev=%s FAIL: no BambuSource attached\n",
+            m_cfg.dev_id.c_str());
+        std::fflush(stderr);
         return false;
     }
     if (!source->library_ready()) source->init();
     if (!source->library_ready()) {
+        std::fprintf(stderr,
+            "[cloud-camera] open dev=%s FAIL: BambuSource library_ready() false\n",
+            m_cfg.dev_id.c_str());
+        std::fflush(stderr);
         return false;
     }
 
     std::string url;
     int rc = 0;
     if (!m_cfg.url_override.empty()) {
-        // GUI host pre-resolved the URL via the shared
-        // build_media_live_url helper — use it verbatim instead of
-        // hitting the plugin's get_camera_url endpoint again.
         url = m_cfg.url_override;
     } else {
         const int timeout_ms = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 m_cfg.connect_timeout).count());
-        rc = plugin->get_camera_url(m_cfg.dev_id, &url, timeout_ms);
+        // Mirror MediaPlayCtrl.cpp:374 — pass `<dev_id>|<dev_ver>|<protocols>`
+        // not just `<dev_id>`. Without dev_ver and protocols the plugin
+        // doesn't know whether the caller can accept tutk/agora and may
+        // return an empty URL.
+        const std::string protocols = "\"tutk\",\"agora\"";
+        std::string ask = m_cfg.dev_id + "|" + m_cfg.dev_ver
+                        + "|" + protocols;
+        rc = plugin->get_camera_url(ask, &url, timeout_ms);
+        std::fprintf(stderr,
+            "[cloud-camera] get_camera_url dev=%s rc=%d url=%s\n",
+            m_cfg.dev_id.c_str(), rc, url.c_str());
+        std::fflush(stderr);
         if (rc != 0 || url.empty()) {
             return false;
+        }
+        // MediaPlayCtrl.cpp:381-385 — when the URL starts with bambu:///
+        // the GUI appends `&device=&net_ver=&dev_ver=&refresh_url=
+        // &cli_id=&cli_ver=`. The proprietary plugin fingerprints these.
+        if (url.compare(0, 9, "bambu:///") == 0) {
+            url += "&device=";  url += m_cfg.dev_id;
+            url += "&net_ver="; url += m_cfg.net_ver;
+            url += "&dev_ver="; url += m_cfg.dev_ver;
+            url += "&cli_id=";  url += m_cfg.cli_id;
+            url += "&cli_ver="; url += m_cfg.cli_ver;
+            std::fprintf(stderr,
+                "[cloud-camera] augmented url dev=%s url=%s\n",
+                m_cfg.dev_id.c_str(), url.c_str());
+            std::fflush(stderr);
         }
     }
 
@@ -119,10 +154,31 @@ bool CloudCameraSource::open() {
     void* tunnel = nullptr;
     rc = source->bambu_create(&tunnel, url);
     if (rc != 0 || !tunnel) {
+        std::fprintf(stderr,
+            "[cloud-camera] open dev=%s FAIL: bambu_create rc=%d tunnel=%p\n",
+            m_cfg.dev_id.c_str(), rc, tunnel);
+        std::fflush(stderr);
         return false;
     }
+    // Mirror wxMediaCtrl3.cpp:288 — install logger BETWEEN Create and Open.
+    struct LogCtx { std::string dev_id; };
+    static thread_local LogCtx s_cloud_log_ctx;
+    s_cloud_log_ctx.dev_id = m_cfg.dev_id;
+    source->bambu_set_logger(tunnel,
+        +[](void* ctx, int level, const char* msg) {
+            auto* lc = static_cast<LogCtx*>(ctx);
+            std::fprintf(stderr,
+                "[cloud-camera] bambu-log dev=%s lvl=%d %s\n",
+                lc ? lc->dev_id.c_str() : "?", level, msg ? msg : "");
+            std::fflush(stderr);
+        },
+        &s_cloud_log_ctx);
     rc = source->bambu_open(tunnel);
     if (rc != 0) {
+        std::fprintf(stderr,
+            "[cloud-camera] open dev=%s FAIL: bambu_open rc=%d\n",
+            m_cfg.dev_id.c_str(), rc);
+        std::fflush(stderr);
         source->bambu_destroy(tunnel);
         return false;
     }
@@ -143,10 +199,17 @@ bool CloudCameraSource::open() {
         }
     }
     if (rc != 0) {
+        std::fprintf(stderr,
+            "[cloud-camera] open dev=%s FAIL: bambu_start_stream rc=%d\n",
+            m_cfg.dev_id.c_str(), rc);
+        std::fflush(stderr);
         source->bambu_close(tunnel);
         source->bambu_destroy(tunnel);
         return false;
     }
+    std::fprintf(stderr,
+        "[cloud-camera] open dev=%s OK\n", m_cfg.dev_id.c_str());
+    std::fflush(stderr);
 
     server::ICameraSource::StreamInfo si;
     si.fps = 30;

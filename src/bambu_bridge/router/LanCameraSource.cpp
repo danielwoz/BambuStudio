@@ -83,13 +83,18 @@ std::string LanCameraSource::build_url() const {
     // we've tested headless.
     if (!m_cfg.url_override.empty()) return m_cfg.url_override;
 
-    // Format mirrors `~/BambuStudio/src/slic3r/GUI/MediaPlayCtrl.cpp:322`:
-    //   "bambu:///rtsps___" + user + ":" + pw + "@" + ip +
-    //   "/streaming/live/1?proto=rtsps"
+    // Format mirrors `~/BambuStudio/src/slic3r/GUI/MediaPlayCtrl.cpp:322-329`
+    // byte-for-byte. The proprietary plugin fingerprints the URL — any
+    // missing query param can make `bambu_start_stream` reject with
+    // `rc=-107`. Always emit all 5 params, even when individual fields
+    // are empty (the GUI also emits empty `&dev_ver=` etc. before its
+    // get_version reply arrives).
     //
     // Note: TRIPLE underscore between `rtsps` and the credentials.
     std::string url;
-    url.reserve(64 + m_cfg.printer_ip.size() + m_cfg.access_code.size());
+    url.reserve(256 + m_cfg.printer_ip.size() + m_cfg.access_code.size()
+                + m_cfg.dev_id.size() + m_cfg.slicer_net_ver.size()
+                + m_cfg.slicer_cli_id.size() + m_cfg.slicer_cli_ver.size());
     url += "bambu:///rtsps___";
     url += m_cfg.username;
     url += ':';
@@ -97,6 +102,11 @@ std::string LanCameraSource::build_url() const {
     url += '@';
     url += m_cfg.printer_ip;
     url += "/streaming/live/1?proto=rtsps";
+    url += "&device=";  url += m_cfg.dev_id;
+    url += "&net_ver="; url += m_cfg.slicer_net_ver;
+    url += "&dev_ver="; url += m_cfg.slicer_dev_ver;
+    url += "&cli_id=";  url += m_cfg.slicer_cli_id;
+    url += "&cli_ver="; url += m_cfg.slicer_cli_ver;
     return url;
 }
 
@@ -108,23 +118,61 @@ bool LanCameraSource::open() {
     }
 
     if (!handle) {
+        std::fprintf(stderr,
+            "[lan-camera] open dev=%s FAIL: no plugin handle attached\n",
+            m_cfg.dev_id.c_str());
+        std::fflush(stderr);
         return false;
     }
     // Idempotent init() — BambuSourceHandle guards with a once_flag.
     if (!handle->library_ready()) handle->init();
     if (!handle->library_ready()) {
+        std::fprintf(stderr,
+            "[lan-camera] open dev=%s FAIL: BambuSource library_ready() false after init\n",
+            m_cfg.dev_id.c_str());
+        std::fflush(stderr);
         return false;
     }
 
     const std::string u = build_url();
+    std::fprintf(stderr,
+        "[lan-camera] open dev=%s url=%s\n",
+        m_cfg.dev_id.c_str(), u.c_str());
+    std::fflush(stderr);
 
     void* tunnel = nullptr;
     int rc = handle->bambu_create(&tunnel, u);
     if (rc != 0 || !tunnel) {
+        std::fprintf(stderr,
+            "[lan-camera] open dev=%s FAIL: bambu_create rc=%d tunnel=%p\n",
+            m_cfg.dev_id.c_str(), rc, tunnel);
+        std::fflush(stderr);
         return false;
     }
+    // The GUI (wxMediaCtrl3.cpp:288) sets a logger BETWEEN Create and
+    // Open. Without it the plugin appears to fingerprint the caller as
+    // unauthenticated and `Bambu_StartStream` later returns -107.
+    // Mirror byte-for-byte: install a plain C-callback that tags each
+    // line with the dev_id this LanCameraSource owns (passed via the
+    // void* ctx). C-ABI signature matches BambuTunnel.h `Logger`.
+    struct LogCtx { std::string dev_id; };
+    static thread_local LogCtx s_log_ctx;
+    s_log_ctx.dev_id = m_cfg.dev_id;
+    handle->bambu_set_logger(tunnel,
+        +[](void* ctx, int level, const char* msg) {
+            auto* lc = static_cast<LogCtx*>(ctx);
+            std::fprintf(stderr,
+                "[lan-camera] bambu-log dev=%s lvl=%d %s\n",
+                lc ? lc->dev_id.c_str() : "?", level, msg ? msg : "");
+            std::fflush(stderr);
+        },
+        &s_log_ctx);
     rc = handle->bambu_open(tunnel);
     if (rc != 0) {
+        std::fprintf(stderr,
+            "[lan-camera] open dev=%s FAIL: bambu_open rc=%d\n",
+            m_cfg.dev_id.c_str(), rc);
+        std::fflush(stderr);
         handle->bambu_destroy(tunnel);
         return false;
     }
@@ -134,24 +182,30 @@ bool LanCameraSource::open() {
     // loop in Reconnect(); mirror that here. Without the loop the
     // first-attempt liveview always fails on the H2S/H2D, even though
     // the printer is perfectly happy to stream once primed.
+    int start_loops = 0;
     {
         const auto start = std::chrono::steady_clock::now();
         const auto timeout = std::chrono::seconds(3);
-        int loops = 0;
         do {
             rc = handle->bambu_start_stream(tunnel, /*video=*/true);
             if (rc != kBambuWouldBlock) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            ++loops;
+            ++start_loops;
         } while (std::chrono::steady_clock::now() - start < timeout);
-        if (loops > 0) {
-        }
     }
     if (rc != 0) {
+        std::fprintf(stderr,
+            "[lan-camera] open dev=%s FAIL: bambu_start_stream rc=%d (after %d would_block retries)\n",
+            m_cfg.dev_id.c_str(), rc, start_loops);
+        std::fflush(stderr);
         handle->bambu_close(tunnel);
         handle->bambu_destroy(tunnel);
         return false;
     }
+    std::fprintf(stderr,
+        "[lan-camera] open dev=%s OK (bambu_start_stream succeeded after %d would_block retries)\n",
+        m_cfg.dev_id.c_str(), start_loops);
+    std::fflush(stderr);
 
     // Pull stream info for the SDP advertising. Find the first VIDEO
     // stream and cache its dimensions / fps. The `format_buffer` holds

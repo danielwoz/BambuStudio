@@ -41,6 +41,17 @@ struct CloudCameraSourceConfig {
     std::string          dev_id;
     std::chrono::seconds connect_timeout{10};
 
+    // Slicer-identity fields the GUI embeds in the cloud-camera URL
+    // (`~/BambuStudio/src/slic3r/GUI/MediaPlayCtrl.cpp:374-385`). The
+    // first three are concatenated as `<dev_id>|<dev_ver>|<protocols>`
+    // and passed to `bambu_network_get_camera_url`; the rest are
+    // appended as query params to the URL the plugin returns. Mirror
+    // the GUI exactly — the plugin fingerprints them.
+    std::string          dev_ver;      // printer firmware version
+    std::string          net_ver;      // NetworkAgent::get_version()
+    std::string          cli_id;       // app_config slicer_uuid
+    std::string          cli_ver;      // SLIC3R_VERSION
+
     // Optional pre-resolved camera URL — set by the GUI host via the
     // shared `Slic3r::GUI::build_media_live_url` helper. When non-empty
     // the source skips agent->get_camera_url and uses this URL

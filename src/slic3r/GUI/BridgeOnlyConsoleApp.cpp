@@ -203,13 +203,45 @@ bool BridgeOnlyConsoleApp::bring_up_network_agent()
     }
 
     m_agent->set_country_code(m_app_config->get_country_code());
+
+    // Mirror GUI_App: the plugin fires the user-login callback once it
+    // notices the cached OAuth token in BambuNetworkEngine.conf. The
+    // GUI's handler then calls connect_server. Without this callback
+    // the bridge calls connect_server before the plugin has fully
+    // recognised the login → the cloud TCP dial is a silent no-op and
+    // `is_server_connected()` stays false. Any "control" command
+    // (ams_filament_setting, ams_control, etc.) then fails with -4
+    // because the plugin requires an active cloud session.
+    auto* agent_ptr = m_agent;
+    m_agent->set_on_user_login_fn(
+        [agent_ptr](int /*online_login*/, bool login_succeeded) {
+            std::fprintf(stderr,
+                "[bridge-only] on_user_login fired login_succeeded=%d; "
+                "calling connect_server\n",
+                int(login_succeeded));
+            std::fflush(stderr);
+            if (login_succeeded && agent_ptr) {
+                int rc = agent_ptr->connect_server();
+                std::fprintf(stderr,
+                    "[bridge-only] connect_server rc=%d post-call "
+                    "is_user_login=%d is_server_connected=%d\n",
+                    rc, int(agent_ptr->is_user_login()),
+                    int(agent_ptr->is_server_connected()));
+                std::fflush(stderr);
+            }
+        });
+
     m_agent->start();
-    // No connect_server here: it triggers a login flow that pops dialogs
-    // in the GUI path. For the headless architectural step, we let the
-    // agent come up with whatever cached tokens it has on disk; if the
-    // session is expired the bridge will advertise zero devices, which
-    // is acceptable for this commit.
-    m_agent->connect_server();
+    // Also try connect_server synchronously — if the plugin already
+    // recognised the login by `start()` time the callback won't fire
+    // a second time. Belt-and-braces.
+    int rc = m_agent->connect_server();
+    std::fprintf(stderr,
+        "[bridge-only] connect_server (sync) rc=%d "
+        "is_user_login=%d is_server_connected=%d\n",
+        rc, int(m_agent->is_user_login()),
+        int(m_agent->is_server_connected()));
+    std::fflush(stderr);
     return true;
 }
 

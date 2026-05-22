@@ -91,17 +91,16 @@ bool CameraSourceRouter::open() {
         dev_id = m_dev_id;
     }
 
-    bool lan_ok   = false;
-    bool cloud_ok = false;
-    if (health) {
-        auto snap = health->snapshot(dev_id);
-        lan_ok    = snap.lan_connected;
-        cloud_ok  = snap.cloud_connected;
-    } else {
-        // No health monitor → assume available iff the source pointer is set.
-        lan_ok   = static_cast<bool>(lan);
-        cloud_ok = static_cast<bool>(cloud);
-    }
+    // Always attempt every configured source, in preference order.
+    // The health monitor's `lan_connected` / `cloud_connected` reflect
+    // the MQTT session status — useful for routing MQTT traffic, but
+    // not the right gate for camera. For camera, the printer can have
+    // RTSPS disabled and TUTK disabled (newer firmware default) yet
+    // still serve frames via cloud relay. Let each source's open()
+    // decide for itself; we just fall through on failure.
+    const bool lan_ok   = static_cast<bool>(lan);
+    const bool cloud_ok = static_cast<bool>(cloud);
+    (void)health;
 
     // Build the preference order.
     Choice order[3] = { Choice::None, Choice::None, Choice::None };

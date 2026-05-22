@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -125,6 +126,77 @@ uint16_t parse_u16(const std::string& s, uint16_t def) {
     catch (...) { return def; }
 }
 
+// Per-child plugin config directory. Each child gets its own
+// `<parent>/bridge-multi/<dev_id>/`. Subdirs/files in the parent config
+// dir are symlinked into the child dir, EXCEPT the plugin's mutable
+// state files (`BambuNetworkEngine.conf`, `BambuStudio.conf`) which are
+// copied so the two children don't race on the same fd.
+// Returns the child dir path, or empty on failure.
+std::string prepare_child_config_dir(const std::string& dev_id) {
+    namespace fs = std::filesystem;
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) {
+        if (struct passwd* pw = ::getpwuid(::getuid()); pw && pw->pw_dir)
+            home = pw->pw_dir;
+    }
+    if (!home || !*home) return {};
+    fs::path parent = fs::path(home) / ".config" / "BambuStudio";
+    fs::path child  = parent / "bridge-multi" / dev_id;
+    std::error_code ec;
+    fs::create_directories(child, ec);
+    if (ec) {
+        std::fprintf(stderr,
+            "[bridge-multi] could not create %s: %s\n",
+            child.c_str(), ec.message().c_str());
+        return {};
+    }
+
+    // Mutable per-process plugin state: must be a copy so each child
+    // owns its own writable file. Re-seed every spawn so we start from
+    // the parent's latest known-good state — the plugin will overwrite
+    // it with child-specific changes as it runs.
+    static const char* kMutableFiles[] = {
+        "BambuNetworkEngine.conf",
+        "BambuStudio.conf",
+    };
+    for (const char* name : kMutableFiles) {
+        fs::path src = parent / name;
+        fs::path dst = child  / name;
+        if (!fs::exists(src, ec)) continue;
+        fs::remove(dst, ec); // overwrite any prior copy
+        fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            std::fprintf(stderr,
+                "[bridge-multi] copy %s → %s failed: %s\n",
+                src.c_str(), dst.c_str(), ec.message().c_str());
+            ec.clear();
+        }
+    }
+
+    // Everything else: symlink so the child sees the same plugins/,
+    // bridge/certs/, system/, printers/, etc. Skip the mutable files
+    // above and skip our own bridge-multi/ subdir to avoid loops.
+    for (const auto& entry : fs::directory_iterator(parent, ec)) {
+        if (ec) break;
+        const std::string name = entry.path().filename().string();
+        if (name == "bridge-multi") continue;
+        bool is_mutable = false;
+        for (const char* m : kMutableFiles) if (name == m) { is_mutable = true; break; }
+        if (is_mutable) continue;
+        fs::path link = child / name;
+        fs::remove(link, ec); // remove stale symlink/file
+        ec.clear();
+        fs::create_symlink(entry.path(), link, ec);
+        if (ec) {
+            std::fprintf(stderr,
+                "[bridge-multi] symlink %s → %s failed: %s\n",
+                entry.path().c_str(), link.c_str(), ec.message().c_str());
+            ec.clear();
+        }
+    }
+    return child.string();
+}
+
 // Build the argv for one child. Caller must keep the returned strings
 // alive for the duration of execv() (we stash them in a vector here and
 // return as char* pointers into it via vector<string>).
@@ -137,7 +209,8 @@ ChildArgs build_child_args(const std::string& self_path,
                            uint16_t           mqtt_base,
                            uint16_t           ftps_base,
                            uint16_t           rtsp_base,
-                           uint16_t           vtun_base) {
+                           uint16_t           vtun_base,
+                           const std::string& config_dir) {
     ChildArgs c;
     c.storage = {
         self_path,
@@ -148,6 +221,10 @@ ChildArgs build_child_args(const std::string& self_path,
         "--rtsp-port-base",  std::to_string(rtsp_base),
         "--vtun-port-base",  std::to_string(vtun_base),
     };
+    if (!config_dir.empty()) {
+        c.storage.emplace_back("--config-dir");
+        c.storage.emplace_back(config_dir);
+    }
     for (auto& s : c.storage) c.argv.push_back(const_cast<char*>(s.c_str()));
     c.argv.push_back(nullptr);
     return c;
@@ -211,12 +288,14 @@ int run_bridge_multi(int argc, char** argv) {
     g_children.assign(printers.size(), 0);
 
     for (size_t i = 0; i < printers.size(); ++i) {
+        std::string cdir = prepare_child_config_dir(printers[i]);
         auto child = build_child_args(
             self_path, printers[i],
             static_cast<uint16_t>(mqtt_base + i),
             static_cast<uint16_t>(ftps_base + i),
             static_cast<uint16_t>(rtsp_base + i),
-            static_cast<uint16_t>(vtun_base + i));
+            static_cast<uint16_t>(vtun_base + i),
+            cdir);
         pid_t pid = ::fork();
         if (pid < 0) {
             std::fprintf(stderr,
@@ -239,12 +318,13 @@ int run_bridge_multi(int argc, char** argv) {
         }
         g_children[i] = pid;
         std::fprintf(stderr,
-            "[bridge-multi] spawned pid=%d for %s (mqtt=%u ftps=%u rtsp=%u vtun=%u)\n",
+            "[bridge-multi] spawned pid=%d for %s (mqtt=%u ftps=%u rtsp=%u vtun=%u config=%s)\n",
             int(pid), printers[i].c_str(),
             unsigned(mqtt_base + i),
             unsigned(ftps_base + i),
             unsigned(rtsp_base + i),
-            unsigned(vtun_base + i));
+            unsigned(vtun_base + i),
+            cdir.empty() ? "<default>" : cdir.c_str());
     }
     std::fflush(stderr);
 

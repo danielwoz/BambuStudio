@@ -32,6 +32,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -41,6 +45,69 @@
 namespace Slic3r {
 namespace bridge {
 namespace headless {
+
+// Per-printer mTLS cert+key resolution for the cert-bypass control-
+// command publish path. `install_device_cert()` extracts the leaf cert
+// and matching RSA key from the slicer's plugin heap; we cache them
+// on disk in a well-known directory and look them up by dev_id suffix.
+//
+// Layout (well-known across all bridge installs as of 2026-05-22):
+//   /tmp/bbl_capture/mtls.fresh/paired/<TAG>_<dev_id>_chain.pem
+//   /tmp/bbl_capture/mtls.fresh/paired/<TAG>_<dev_id>_key.pem
+// where <TAG> is the human model name ("H2S", "A1", "H2D"). Files are
+// matched on the `_<dev_id>_chain.pem` / `_<dev_id>_key.pem` suffix so
+// the bridge doesn't need a model→tag map.
+//
+// Override via BBL_BRIDGE_MTLS_DIR=/path. Empty = use default.
+//
+// Returns {cert_path, key_path}; both empty if no files found. Empty
+// values cause `LanUplink::on_publish` to fall back to the plugin path
+// for print.* publishes (which silently drops them — but at least the
+// non-control path stays operational).
+static std::pair<std::string, std::string>
+resolve_mtls_paths(const std::string& dev_id) {
+    std::string dir = "/tmp/bbl_capture/mtls.fresh/paired";
+    if (const char* env = std::getenv("BBL_BRIDGE_MTLS_DIR");
+        env && *env) {
+        dir = env;
+    }
+    // Allow explicit per-dev override:
+    //   BBL_BRIDGE_MTLS_CERT_<dev_id>=/abs/path/chain.pem
+    //   BBL_BRIDGE_MTLS_KEY_<dev_id>=/abs/path/key.pem
+    std::string cert_env_key = "BBL_BRIDGE_MTLS_CERT_" + dev_id;
+    std::string key_env_key  = "BBL_BRIDGE_MTLS_KEY_"  + dev_id;
+    const char* ec = std::getenv(cert_env_key.c_str());
+    const char* ek = std::getenv(key_env_key.c_str());
+    if (ec && *ec && ek && *ek) {
+        struct stat st;
+        if (::stat(ec, &st) == 0 && ::stat(ek, &st) == 0) {
+            return {ec, ek};
+        }
+    }
+    // Scan the directory for files ending in
+    // `_<dev_id>_chain.pem` / `_<dev_id>_key.pem`.
+    DIR* d = ::opendir(dir.c_str());
+    if (!d) return {{}, {}};
+    std::string cert_path, key_path;
+    const std::string chain_suffix = "_" + dev_id + "_chain.pem";
+    const std::string key_suffix   = "_" + dev_id + "_key.pem";
+    while (struct dirent* e = ::readdir(d)) {
+        std::string name = e->d_name;
+        auto ends_with = [&](const std::string& suf) {
+            return name.size() >= suf.size() &&
+                   name.compare(name.size() - suf.size(),
+                                suf.size(), suf) == 0;
+        };
+        if (cert_path.empty() && ends_with(chain_suffix)) {
+            cert_path = dir + "/" + name;
+        } else if (key_path.empty() && ends_with(key_suffix)) {
+            key_path = dir + "/" + name;
+        }
+        if (!cert_path.empty() && !key_path.empty()) break;
+    }
+    ::closedir(d);
+    return {cert_path, key_path};
+}
 
 // Walks the host's network interfaces and returns the first non-loopback
 // IPv4 address as a dotted string. Used to fill the SSDP NOTIFY's
@@ -785,15 +852,30 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
     if (m_lan_uplink) {
         state.cam_router = std::make_shared<router::CameraSourceRouter>(dev_id);
         router::LanCameraSourceConfig lc;
-        lc.dev_id        = dev_id;
-        lc.printer_ip    = lan_ip;
-        lc.access_code   = access_code;
-        lc.url_override  = vp.camera_url;
+        lc.dev_id         = dev_id;
+        lc.printer_ip     = lan_ip;
+        lc.access_code    = access_code;
+        lc.url_override   = vp.camera_url;
+        lc.slicer_net_ver = m_cfg.slicer_net_ver;
+        // dev_ver: the GUI's `m_dev_ver` reflects the `ota` module's
+        // `sw_ver` from the printer's get_version reply. We don't have
+        // per-printer MQTT tracking wired up yet, so default to the
+        // bridge's `ssdp_default_firmware` which already matches the
+        // real H2S `ota` sw_ver (`01.02.00.00`). The plugin appears to
+        // fingerprint the URL — an empty `&dev_ver=` triggers
+        // `bambu_start_stream rc=-107`.
+        lc.slicer_dev_ver = m_cfg.ssdp_default_firmware;
+        lc.slicer_cli_id  = m_cfg.slicer_cli_id;
+        lc.slicer_cli_ver = m_cfg.slicer_cli_ver;
         state.lan_cam  = std::make_shared<router::LanCameraSource>(lc);
         state.lan_cam->attach_source_handle(m_bambu_source);
         router::CloudCameraSourceConfig cc;
         cc.dev_id        = dev_id;
         cc.url_override  = vp.camera_url;
+        cc.dev_ver       = m_cfg.ssdp_default_firmware;
+        cc.net_ver       = m_cfg.slicer_net_ver;
+        cc.cli_id        = m_cfg.slicer_cli_id;
+        cc.cli_ver       = m_cfg.slicer_cli_ver;
         state.cloud_cam = std::make_shared<router::CloudCameraSource>(cc);
         state.cloud_cam->attach_plugin(m_plugin);
         state.cloud_cam->attach_source_handle(m_bambu_source);
@@ -824,6 +906,27 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
             u.dev_id      = dev_id;
             u.printer_ip  = lan_ip;
             u.access_code = access_code;
+            // Per-printer mTLS material so LanUplink can bypass the
+            // plugin gate for `print.command=*` payloads. See
+            // resolve_mtls_paths() comments above.
+            auto mtls = resolve_mtls_paths(dev_id);
+            u.mtls_cert_path = mtls.first;
+            u.mtls_key_path  = mtls.second;
+            if (!u.mtls_cert_path.empty()) {
+                std::fprintf(stderr,
+                    "[bridge-app] dev=%s mtls cert=%s key=%s\n",
+                    dev_id.c_str(),
+                    u.mtls_cert_path.c_str(),
+                    u.mtls_key_path.c_str());
+                std::fflush(stderr);
+            } else {
+                std::fprintf(stderr,
+                    "[bridge-app] dev=%s NO mtls cert found in "
+                    "/tmp/bbl_capture/mtls.fresh/paired — print.* publishes "
+                    "will fall back to plugin (and likely drop)\n",
+                    dev_id.c_str());
+                std::fflush(stderr);
+            }
             m_lan_uplink->add_device(u);
 
             router::LanUploadSinkDevice s;
@@ -873,6 +976,15 @@ void BridgeApp::update_lan_ip_locked(DeviceState&       state,
         u.dev_id      = state.dev_id;
         u.printer_ip  = lan_ip;
         u.access_code = state.access_code;
+        auto mtls = resolve_mtls_paths(state.dev_id);
+        u.mtls_cert_path = mtls.first;
+        u.mtls_key_path  = mtls.second;
+        std::fprintf(stderr,
+            "[bridge-app] (update_lan_ip) dev=%s mtls_cert=%s mtls_key=%s\n",
+            state.dev_id.c_str(),
+            u.mtls_cert_path.empty() ? "<missing>" : u.mtls_cert_path.c_str(),
+            u.mtls_key_path.empty()  ? "<missing>" : u.mtls_key_path.c_str());
+        std::fflush(stderr);
         m_lan_uplink->add_device(u);
 
         router::LanUploadSinkDevice s;
@@ -898,9 +1010,13 @@ void BridgeApp::update_lan_ip_locked(DeviceState&       state,
     // is sticky on the currently-chosen source for the lifetime of one
     // open(), so an in-flight stream stays put.
     router::LanCameraSourceConfig lc;
-    lc.dev_id      = state.dev_id;
-    lc.printer_ip  = lan_ip;
-    lc.access_code = state.access_code;
+    lc.dev_id         = state.dev_id;
+    lc.printer_ip     = lan_ip;
+    lc.access_code    = state.access_code;
+    lc.slicer_net_ver = m_cfg.slicer_net_ver;
+    lc.slicer_dev_ver = m_cfg.ssdp_default_firmware; // see ctor-site comment in connect path
+    lc.slicer_cli_id  = m_cfg.slicer_cli_id;
+    lc.slicer_cli_ver = m_cfg.slicer_cli_ver;
     state.lan_cam  = std::make_shared<router::LanCameraSource>(lc);
     state.lan_cam->attach_source_handle(m_bambu_source);
     if (state.cam_router) state.cam_router->set_lan_source(state.lan_cam);

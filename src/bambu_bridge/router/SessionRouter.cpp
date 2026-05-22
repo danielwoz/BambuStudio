@@ -77,18 +77,15 @@ SessionRouter::Route SessionRouter::pick_route(const std::string& dev_id) const 
         }
     }
 
-    // Sample health (may take its own locks; do it outside m_mu).
-    bool lan_ok   = false;
-    bool cloud_ok = false;
-    if (health) {
-        auto snap = health->snapshot(dev_id);
-        lan_ok    = snap.lan_connected;
-        cloud_ok  = snap.cloud_connected;
-    } else {
-        // Fallback: poll each sub-uplink directly.
-        if (lan)   lan_ok   = lan  ->is_connected(dev_id);
-        if (cloud) cloud_ok = cloud->is_connected(dev_id);
-    }
+    // Health monitor is unreliable for the embedded-bridge case (LAN's
+    // is_connected is true iff the plugin's connect_printer has been
+    // swapped to this dev_id, but the swap-on-subscribe path doesn't
+    // run for headless probes). Fall back to "uplink exists -> route
+    // available" — let each sub-uplink reject if it can't actually
+    // deliver. Same pattern as CameraSourceRouter.
+    const bool lan_ok   = static_cast<bool>(lan);
+    const bool cloud_ok = static_cast<bool>(cloud);
+    (void)health;
 
     Route chosen = Route::None;
     if (policy.prefer_lan) {

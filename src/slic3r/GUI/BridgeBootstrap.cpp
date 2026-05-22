@@ -174,6 +174,116 @@ bool run_headless(GUI_App* app)
         return false;
     }
 
+    // The GUI only calls connect_server in the EVT_USER_LOGIN_HANDLE
+    // handler (GUI_App::on_user_login_handle:5249), which is queued by
+    // request_user_login_handle — and nothing in the bridge-only path
+    // ever calls that. Without connect_server the plugin loads the
+    // cached login (is_user_login()==true) but the cloud MQTT socket
+    // never gets opened, so is_server_connected()==false. The
+    // proprietary plugin then rejects any "control" send_message
+    // (ams_filament_setting, ams_control, extrusion_cali_set, …) with
+    // BAMBU_NETWORK_ERR_SEND_MSG_FAILED (-4) because those need an
+    // active cloud session. Mirror the GUI's post-login sequence:
+    // connect_server → start_subscribe("app") → get_user_print_info,
+    // all in a background thread so the wx event loop can keep
+    // pumping while the plugin does its HTTPS+MQTT dance.
+    if (app->m_agent) {
+        std::thread([app]{
+            using namespace std::chrono_literals;
+            auto* ag = app->m_agent;
+            std::fprintf(stderr,
+                "[bridge] cloud-bringup: start login=%d server=%d\n",
+                int(ag->is_user_login()), int(ag->is_server_connected()));
+            std::fflush(stderr);
+            ag->enable_multi_machine(true);
+            std::fprintf(stderr,
+                "[bridge] enable_multi_machine(true)\n");
+            std::fflush(stderr);
+            int rc = ag->connect_server();
+            std::fprintf(stderr,
+                "[bridge] connect_server rc=%d (post login=%d server=%d)\n",
+                rc, int(ag->is_user_login()), int(ag->is_server_connected()));
+            std::fflush(stderr);
+            // Subscribe to the "app" topic — the GUI does this after
+            // login. Without it the plugin's cloud-side reactor has
+            // no work to do and may keep the MQTT socket idle.
+            int sub_rc = ag->start_subscribe("app");
+            std::fprintf(stderr,
+                "[bridge] start_subscribe(\"app\") rc=%d\n", sub_rc);
+            std::fflush(stderr);
+            // (reverted: add_subscribe per dev_id broke cloud-camera)
+            // HTTP REST validates auth + wakes the plugin's cloud
+            // state machine. The GUI does this in a background
+            // thread inside on_user_login_handle.
+            unsigned int http_code = 0;
+            std::string  body;
+            int rc2 = ag->get_user_print_info(&http_code, &body);
+            std::fprintf(stderr,
+                "[bridge] get_user_print_info rc=%d http=%u body_len=%zu\n",
+                rc2, http_code, body.size());
+            std::fflush(stderr);
+            // NOTE: parse_user_print_info crashes the bridge child with
+            // SIGSEGV — it dives into GUI code that expects parts of
+            // GUI_App we haven't initialised. Skipping.
+            // Poll is_server_connected for up to 20s.
+            bool server_ok = false;
+            for (int i = 0; i < 40; ++i) {
+                if (ag->is_server_connected()) {
+                    std::fprintf(stderr,
+                        "[bridge] is_server_connected -> true after %d ticks\n",
+                        i);
+                    std::fflush(stderr);
+                    server_ok = true;
+                    break;
+                }
+                std::this_thread::sleep_for(500ms);
+            }
+            if (!server_ok) {
+                std::fprintf(stderr,
+                    "[bridge] is_server_connected stayed false after 20s\n");
+                std::fflush(stderr);
+                return;
+            }
+            // Now that the cloud MQTT is up, subscribe to our owned
+            // dev_ids. Plugin's `bambu_network_send_message` (cloud)
+            // rejects with -2 INVALID_HANDLE when the dev_id isn't
+            // in the cloud-subscribed set; that's the failure we see
+            // for ams_filament_setting / ams_control / etc.
+            std::vector<std::string> dev_ids = g_bridge_only_cfg.only_dev_ids;
+            if (!dev_ids.empty()) {
+                int add_rc = ag->add_subscribe(dev_ids);
+                std::fprintf(stderr,
+                    "[bridge] add_subscribe(%zu dev_ids) rc=%d ids=%s\n",
+                    dev_ids.size(), add_rc, dev_ids[0].c_str());
+                std::fflush(stderr);
+                // The plugin's cloud send_message rejects with -2 for
+                // any dev_id that isn't the "user-selected" one. The
+                // GUI calls this when the user clicks a cloud-bound
+                // printer (DevManager.cpp:504). Each bridge child
+                // owns exactly one printer, so just select it.
+                int sel_rc = ag->set_user_selected_machine(dev_ids[0]);
+                std::fprintf(stderr,
+                    "[bridge] set_user_selected_machine(%s) rc=%d\n",
+                    dev_ids[0].c_str(), sel_rc);
+                std::fflush(stderr);
+                // install_device_cert is what the slicer does for every
+                // owned printer after MachineObject::connect (GUI_App.cpp:2121,
+                // 5455 and DevManager.cpp:913). For cloud-bound printers
+                // (lan_only=false) this likely installs the device's cert
+                // into the plugin's trust store so the plugin can sign
+                // outgoing control-command publishes. Without this, the
+                // plugin's send_message rejects with -2 SEND_MSG_FAILED.
+                for (const auto& d : dev_ids) {
+                    ag->install_device_cert(d, /*lan_only=*/false);
+                    std::fprintf(stderr,
+                        "[bridge] install_device_cert(%s, lan_only=false)\n",
+                        d.c_str());
+                    std::fflush(stderr);
+                }
+            }
+        }).detach();
+    }
+
     // Bridge bootstrap — identical to install_gui_worker except:
     //   * cfg is seeded from the parsed CLI in g_bridge_only_cfg (not
     //     a default-constructed BridgeAppConfig).
@@ -560,6 +670,131 @@ void install_gui_worker(GUI_App* app)
             << "Bambu Bridge started in GUI worker thread "
                "(DeviceManager push every 5s); set "
                "BAMBU_BRIDGE_GUI_DISABLED=1 to skip.";
+
+        // The GUI normally only triggers the post-login cascade
+        // (connect_server → update_user_machine_list_info →
+        // parse_user_print_info → populate DeviceManager) when the
+        // OAuth flow completes interactively. When BambuStudio comes
+        // up with cached tokens (the usual case for headless / xvfb
+        // bridge launches), nobody fires that event, so the bridge
+        // sits with an empty DeviceManager and the slicer's own UI
+        // shows only the previously-cached "last selected" printer.
+        // Force the post-login cascade once the plugin reports a
+        // logged-in user.
+        if (app->m_agent) {
+            std::thread([app]{
+                using namespace std::chrono_literals;
+                bool login_fired = false;
+                for (int i = 0; i < 60; ++i) {
+                    if (app->m_agent && app->m_agent->is_user_login()) {
+                        app->CallAfter([app]{
+                            std::fprintf(stderr,
+                                "[bridge-gui] firing request_user_login_handle"
+                                " for cached login\n");
+                            std::fflush(stderr);
+                            app->request_user_handle(1);
+                        });
+                        login_fired = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(500ms);
+                }
+                if (!login_fired) {
+                    std::fprintf(stderr,
+                        "[bridge-gui] timed out waiting for is_user_login\n");
+                    std::fflush(stderr);
+                    return;
+                }
+                // After on_user_login_handle fires (queued), the slicer
+                // runs `update_user_machine_list_info` in a boost::thread
+                // which calls parse_user_print_info and populates the
+                // DeviceManager.userMachineList. Wait for that, then do
+                // per-printer setup: set_user_selected_machine +
+                // add_subscribe + install_device_cert — same calls the
+                // slicer makes when the user clicks a printer in the
+                // Device tab.
+                for (int i = 0; i < 30; ++i) {
+                    std::this_thread::sleep_for(1000ms);
+                    if (!app->m_device_manager) continue;
+                    auto list = app->m_device_manager->get_user_machinelist();
+                    if (list.empty()) continue;
+                    std::vector<std::string> dev_ids;
+                    for (const auto& kv : list)
+                        if (!kv.first.empty()) dev_ids.push_back(kv.first);
+                    std::fprintf(stderr,
+                        "[bridge-gui] cascade ready, %zu owned dev_ids; "
+                        "wiring per-printer plugin setup\n",
+                        dev_ids.size());
+                    std::fflush(stderr);
+                    auto* ag = app->m_agent;
+                    if (!dev_ids.empty()) {
+                        int add_rc = ag->add_subscribe(dev_ids);
+                        std::fprintf(stderr,
+                            "[bridge-gui] add_subscribe(%zu) rc=%d\n",
+                            dev_ids.size(), add_rc);
+                        std::fflush(stderr);
+                    }
+                    for (const auto& d : dev_ids) {
+                        int sel_rc = ag->set_user_selected_machine(d);
+                        ag->install_device_cert(d, /*lan_only=*/false);
+                        std::fprintf(stderr,
+                            "[bridge-gui] set_user_selected_machine(%s) "
+                            "rc=%d + install_device_cert(lan_only=false)\n",
+                            d.c_str(), sel_rc);
+                        std::fflush(stderr);
+                    }
+
+                    // Previous experiment showed: a bulk refire of
+                    // install_device_cert after LAN sessions come up
+                    // opens the gate ONLY for the LAST printer the
+                    // plugin connected to (i.e. the currently-active
+                    // session). The plugin keeps multiple TCP/TLS
+                    // sockets open but routes the enc_msg cert_report
+                    // only on the just-selected device. So cycle per
+                    // dev_id: set_user_selected_machine → install_cert
+                    // → wait for the cert_report MQTT round-trip while
+                    // this device is the active one → move to next.
+                    std::this_thread::sleep_for(15s);
+                    std::fprintf(stderr,
+                        "[bridge-gui] post-LAN cycle: select + install_cert "
+                        "+ wait, per dev_id\n");
+                    std::fflush(stderr);
+                    for (const auto& d : dev_ids) {
+                        int sel_rc2 = ag->set_user_selected_machine(d);
+                        ag->install_device_cert(d, /*lan_only=*/false);
+                        std::fprintf(stderr,
+                            "[bridge-gui] (cycle) dev=%s "
+                            "set_user_selected_machine rc=%d + "
+                            "install_device_cert; waiting 3s for cert_report\n",
+                            d.c_str(), sel_rc2);
+                        std::fflush(stderr);
+                        std::this_thread::sleep_for(3s);
+                    }
+
+                    // Probe each dev_id to see which gates opened.
+                    // Benign print.* payload (gcode_line with a comment)
+                    // so even if it reaches the firmware it's a no-op.
+                    for (const auto& d : dev_ids) {
+                        const std::string probe_payload =
+                            R"({"print":{"command":"gcode_line","sequence_id":"probe","param":"; bridge probe\n"}})";
+                        int rc_cloud = ag->send_message(d, probe_payload, 1, 0);
+                        int rc_lan   = ag->send_message_to_printer(
+                                            d, probe_payload, 1, 0);
+                        std::fprintf(stderr,
+                            "[bridge-gui] (probe) dev=%s print.* "
+                            "send_message(cloud) rc=%d  "
+                            "send_message_to_printer(lan) rc=%d\n",
+                            d.c_str(), rc_cloud, rc_lan);
+                        std::fflush(stderr);
+                    }
+                    return;
+                }
+                std::fprintf(stderr,
+                    "[bridge-gui] cascade waited 30s but userMachineList "
+                    "stayed empty\n");
+                std::fflush(stderr);
+            }).detach();
+        }
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(error)
             << "Failed to start Bambu Bridge: " << e.what();

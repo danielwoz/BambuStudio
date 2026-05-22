@@ -62,6 +62,18 @@ struct LanUplinkConfig {
     uint16_t                printer_port = 8883;
     std::chrono::seconds    connect_timeout{10};
     std::chrono::seconds    keepalive{30};
+
+    // Per-printer mTLS material extracted from the slicer/plugin heap
+    // by `install_device_cert()`. When both are non-empty,
+    // `LanUplink::on_publish` bypasses the plugin path for
+    // `print.command=*` payloads and spawns the paho-python subprocess
+    // helper (raw_mqtt_publish.py) — the plugin silently drops control
+    // commands from non-UI contexts, but the printer's LAN MQTT
+    // broker accepts any publish that presents a valid client cert in
+    // the TLS handshake. See DISCOVERY-2026-05-22.md for the gate
+    // mechanics.
+    std::string  mtls_cert_path;                  // /path/to/<dev>_chain.pem
+    std::string  mtls_key_path;                   // /path/to/<dev>_key.pem
 };
 
 class LanUplink : public server::IUplink {

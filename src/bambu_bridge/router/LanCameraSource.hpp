@@ -55,6 +55,18 @@ struct LanCameraSourceConfig {
     // MediaPlayCtrl.cpp always uses "bblp"; same default here.
     std::string username = "bblp";
 
+    // Slicer-identity query params the GUI appends to every camera URL
+    // (`~/BambuStudio/src/slic3r/GUI/MediaPlayCtrl.cpp:322-329`). The
+    // proprietary plugin fingerprints the URL — passing only the bare
+    // `bambu:///rtsps___user:pw@ip/...` gets `bambu_start_stream rc=-107`
+    // even though `bambu_create` and `bambu_open` succeed. Mirror all
+    // five params byte-for-byte to keep the call shape identical to the
+    // GUI path. `dev_id` above doubles as `&device=`.
+    std::string slicer_net_ver;   // &net_ver= — plugin's get_version()
+    std::string slicer_dev_ver;   // &dev_ver= — printer firmware version
+    std::string slicer_cli_id;    // &cli_id=  — slicer_uuid
+    std::string slicer_cli_ver;   // &cli_ver= — SLIC3R_VERSION
+
     // Optional pre-resolved camera URL. When non-empty, `build_url`
     // returns this verbatim instead of constructing a
     // `bambu:///rtsps___user:pass@ip/...` URL from the fields above.

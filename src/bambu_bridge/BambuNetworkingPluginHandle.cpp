@@ -39,6 +39,7 @@ namespace {
 extern "C++" {
     using func_create_agent          = void* (*)(std::string log_dir);
     using func_destroy_agent         = int   (*)(void* agent);
+    using func_get_version           = std::string (*)(void);
     using func_init_log              = int   (*)(void* agent);
     using func_set_config_dir        = int   (*)(void* agent, std::string config_dir);
     using func_set_country_code      = int   (*)(void* agent, std::string country_code);
@@ -263,6 +264,7 @@ struct BambuNetworkingPluginHandle::Impl {
     // Resolved entry points (subset we use today).
     func_create_agent          create_agent          = nullptr;
     func_destroy_agent         destroy_agent         = nullptr;
+    func_get_version           get_version           = nullptr;
     func_init_log              init_log              = nullptr;
     func_set_config_dir        set_config_dir        = nullptr;
     func_set_country_code      set_country_code      = nullptr;
@@ -332,6 +334,7 @@ struct BambuNetworkingPluginHandle::Impl {
 
         create_agent          = lib.sym<func_create_agent>         ("bambu_network_create_agent");
         destroy_agent         = lib.sym<func_destroy_agent>        ("bambu_network_destroy_agent");
+        get_version           = lib.sym<func_get_version>          ("bambu_network_get_version");
         init_log              = lib.sym<func_init_log>             ("bambu_network_init_log");
         set_config_dir        = lib.sym<func_set_config_dir>       ("bambu_network_set_config_dir");
         set_country_code      = lib.sym<func_set_country_code>     ("bambu_network_set_country_code");
@@ -341,7 +344,12 @@ struct BambuNetworkingPluginHandle::Impl {
         get_user_print_info   = lib.sym<func_get_user_print_info>  ("bambu_network_get_user_print_info");
         add_subscribe         = lib.sym<func_add_subscribe>        ("bambu_network_add_subscribe");
         del_subscribe         = lib.sym<func_del_subscribe>        ("bambu_network_del_subscribe");
-        send_message_to_print = lib.sym<func_send_message_to_print>("bambu_network_send_message_to_printer");
+        // Mirror NetworkAgent.cpp:313 — slicer resolves the
+        // GENERIC `bambu_network_send_message` (no `_to_printer`
+        // suffix). The `_to_printer` variant exists too but appears to
+        // reject larger non-pushall payloads (rc=-4 for ams_filament_setting).
+        // Use the same symbol the GUI uses so behavior matches.
+        send_message_to_print = lib.sym<func_send_message_to_print>("bambu_network_send_message");
         set_on_message_fn     = lib.sym<func_set_on_message_fn>    ("bambu_network_set_on_message_fn");
         set_on_server_conn_fn = lib.sym<func_set_on_server_conn_fn>("bambu_network_set_on_server_connected_fn");
         set_cert_file         = lib.sym<func_set_cert_file>        ("bambu_network_set_cert_file");
@@ -428,7 +436,13 @@ struct BambuNetworkingPluginHandle::Impl {
         if (set_country_code && !cfg.country_code.empty())
             set_country_code(agent, cfg.country_code);
 
-        if (start) start(agent);
+        int start_rc = start ? start(agent) : -999;
+        std::fprintf(stderr,
+            "[plugin] start rc=%d login=%d server_connected=%d\n",
+            start_rc,
+            is_user_login ? int(is_user_login(agent)) : -1,
+            is_server_connected ? int(is_server_connected(agent)) : -1);
+        std::fflush(stderr);
 
         // Bring the cloud session up. The GUI defers this to
         // on_user_login_handle (a wx event fired by the OAuth flow);
@@ -437,6 +451,12 @@ struct BambuNetworkingPluginHandle::Impl {
         // cached tokens exist.
         if (connect_server) {
             int rc = connect_server(agent);
+            std::fprintf(stderr,
+                "[plugin] connect_server rc=%d (post-call login=%d server_connected=%d)\n",
+                rc,
+                is_user_login ? int(is_user_login(agent)) : -1,
+                is_server_connected ? int(is_server_connected(agent)) : -1);
+            std::fflush(stderr);
         }
 
         started = true;
@@ -458,6 +478,14 @@ bool BambuNetworkingPluginHandle::init() {
 bool BambuNetworkingPluginHandle::agent_ready() const {
     if (m_impl->ready_override.load()) return true;
     return m_impl->agent != nullptr && m_impl->started;
+}
+
+std::string BambuNetworkingPluginHandle::plugin_version() const {
+    // Mirrors NetworkAgent::get_version: the plugin's
+    // `bambu_network_get_version` is agent-less (no `void*` arg) and
+    // returns "00.00.00.00" when the lib is unloaded or unsupported.
+    if (!m_impl->get_version) return "00.00.00.00";
+    return m_impl->get_version();
 }
 
 bool BambuNetworkingPluginHandle::is_user_login() const {

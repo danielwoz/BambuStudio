@@ -2,11 +2,13 @@
 
 #include "NetworkAgent.hpp"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
 #include <utility>
 #include <vector>
+
 
 namespace Slic3r {
 
@@ -117,8 +119,45 @@ int NetworkAgentPluginAdapter::disconnect_printer() {
 
 int NetworkAgentPluginAdapter::send_message_to_printer(
         const std::string& dev_id, const std::string& json_payload, int qos) {
-    if (!m_agent) return -1;
-    return m_agent->send_message_to_printer(dev_id, json_payload, qos, 0);
+    if (!m_agent) {
+        std::fprintf(stderr,
+            "[adapter] send_message_to_printer dev=%s NO AGENT\n",
+            dev_id.c_str());
+        std::fflush(stderr);
+        return -1;
+    }
+    // Mirror MachineObject::publish_json (DeviceManager.cpp:2354): for
+    // cloud-bound printers it routes "print" commands via cloud
+    // (`cloud_publish_json` → `send_message`); only LAN-only printers
+    // use `send_message_to_printer`. The bridge is cloud-authenticated
+    // and owns these dev_ids in the user's account, so cloud is the
+    // right path here. Try cloud first; fall back to LAN MQTT if the
+    // cloud route fails (which happens for LAN-only printers that
+    // have no cloud relay).
+    // Try cloud route first (matches MachineObject::cloud_publish_json
+    // for cloud-bound printers); LAN fallback for LAN-only ones. The
+    // plugin's send_message rejects `print.command=*` (control) payloads
+    // with -2/-4 regardless of every prep we've tried; that's a hard
+    // limit of the proprietary plugin from outside the GUI's
+    // click-driven publish path.
+    int rc_cloud = m_agent->send_message(dev_id, json_payload, qos, 0);
+    if (rc_cloud == 0) {
+        std::fprintf(stderr,
+            "[adapter] send_message(CLOUD) dev=%s qos=%d bytes=%zu rc=0\n",
+            dev_id.c_str(), qos, json_payload.size());
+        std::fflush(stderr);
+        return 0;
+    }
+    int rc_lan = m_agent->send_message_to_printer(dev_id, json_payload, qos, 0);
+    std::fprintf(stderr,
+        "[adapter] send_message_to_printer dev=%s qos=%d bytes=%zu "
+        "rc_cloud=%d rc_lan=%d login=%d server=%d payload_head=%.60s\n",
+        dev_id.c_str(), qos, json_payload.size(), rc_cloud, rc_lan,
+        int(m_agent->is_user_login()),
+        int(m_agent->is_server_connected()),
+        json_payload.c_str());
+    std::fflush(stderr);
+    return rc_lan;
 }
 
 int NetworkAgentPluginAdapter::start_local_print_with_record(
