@@ -102,6 +102,10 @@ add_library(bambu_bridge STATIC
     router/UploadSinkRouter.hpp
     router/CameraSourceRouter.cpp
     router/CameraSourceRouter.hpp
+    router/LocalControlTunnel.cpp
+    router/LocalControlTunnel.hpp
+    router/NativeStorageDelegate.cpp
+    router/NativeStorageDelegate.hpp
     headless/BridgeApp.cpp
     headless/BridgeApp.hpp
     headless/BridgeAppCliArgs.cpp
