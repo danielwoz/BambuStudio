@@ -28,6 +28,7 @@
 #include "../router/UploadSinkRouter.hpp"
 #include "../router/CameraSourceRouter.hpp"
 #include "../router/UplinkHealth.hpp"
+#include "../router/NativeStorageDelegate.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -193,9 +194,24 @@ void BridgeApp::attach_storage_delegate(
     std::function<void(const std::string&)> release_cb) {
     m_storage_delegate   = std::move(delegate);
     m_storage_release_cb = std::move(release_cb);
+
+    // The GUI's delegate is the *fallback* path inside the native router.
+    // Keep the native router's fallback in sync whenever the delegate
+    // changes (so re-attach() updates wiring).
+    if (m_native_storage) {
+        m_native_storage->set_fallback(m_storage_delegate);
+    }
+
     // If the vtun server already exists (initialise() ran), wire it
     // through immediately. Otherwise initialise() will pick it up.
-    if (m_vtun && m_storage_delegate) {
+    // We attach the native router's wrapping delegate (NOT
+    // m_storage_delegate directly) so the model-gate runs first.
+    if (m_vtun && m_native_storage) {
+        m_vtun->attach_storage_delegate(m_native_storage->make_delegate());
+    } else if (m_vtun && m_storage_delegate) {
+        // Native router not yet constructed (e.g. test that calls
+        // attach_storage_delegate before initialise()) — fall back to
+        // the GUI's delegate unwrapped.
         m_vtun->attach_storage_delegate(m_storage_delegate);
     }
 }
@@ -450,14 +466,19 @@ bool BridgeApp::initialise() {
         vcfg.slicer_cli_id  = m_cfg.slicer_cli_id;
         vcfg.slicer_cli_ver = m_cfg.slicer_cli_ver;
         m_vtun = std::make_unique<server::VirtualTunnelServer>(vcfg);
-        // vtun routes every storage JSON-RPC frame through the
-        // StorageDelegate (PrinterFileSystem-via-BridgeStorageBackend
-        // path). Direct libBambuSource access was removed when the
-        // delegate path proved able to handle every case the bridge
-        // serves.
+
+        // Model-aware storage routing: the bridge owns a
+        // NativeStorageDelegate that talks port 6000 directly for
+        // X1C / P1S / P1P / X1E / X1 printers (via LocalControlTunnel),
+        // and falls back to the GUI's PrinterFileSystem-via-plugin
+        // delegate for H2S / H2D / A1 / unknown. The model registry is
+        // populated lazily in add_device_locked as devices arrive.
+        m_native_storage =
+            std::make_shared<router::NativeStorageDelegate>();
         if (m_storage_delegate) {
-            m_vtun->attach_storage_delegate(m_storage_delegate);
+            m_native_storage->set_fallback(m_storage_delegate);
         }
+        m_vtun->attach_storage_delegate(m_native_storage->make_delegate());
     }
 
     // 7) Start each server. Order: SSDP first (it broadcasts), then the
@@ -499,6 +520,9 @@ void BridgeApp::teardown() {
     // RTSP has the most heavyweight per-session threads so we tear it
     // down first to free resources before everything else closes.
     if (m_vtun)          { m_vtun->stop();          m_vtun.reset();          }
+    // Drop the native router AFTER vtun is stopped — any in-flight
+    // session threads were joined inside m_vtun->stop().
+    if (m_native_storage) m_native_storage.reset();
     if (m_rtsp)          { m_rtsp->stop();          m_rtsp.reset();          }
     if (m_ftps)          { m_ftps->stop();          m_ftps.reset();          }
     if (m_mqtt)          { m_mqtt->stop();          m_mqtt.reset();          }
@@ -726,6 +750,7 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
     state.lan_ip       = lan_ip;
     state.firmware_ver = vp.firmware;
     state.camera_url   = vp.camera_url;
+    state.model        = vp.model;
     // If the cloud snapshot supplied a non-empty lan_ip, treat it as
     // freshly-seen so the staleness pass doesn't immediately expire it
     // before the listener has heard the printer's own NOTIFY.
@@ -843,6 +868,14 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         try { m_vtun->add_device(std::move(vdev)); }
         catch (const std::exception& ex) {
         }
+    }
+
+    // Register the device with the native storage router. This is what
+    // emits the "[bridge-app] dev=... model=... -> using ... storage
+    // delegate" log line and picks the native-vs-plugin path for every
+    // subsequent storage JSON-RPC frame from the slicer.
+    if (m_native_storage) {
+        m_native_storage->register_device(dev_id, state.model);
     }
 
     // Proxy-mode-only: camera router + LAN/cloud uplinks + sinks. In
@@ -1039,6 +1072,9 @@ void BridgeApp::remove_device_locked(const std::string& dev_id) {
     if (m_ftps) m_ftps->remove_device(dev_id);
     if (m_rtsp) m_rtsp->remove_device(dev_id);
     if (m_vtun) m_vtun->remove_device(dev_id);
+
+    // Drop native-router state (closes any open LocalControlTunnel).
+    if (m_native_storage) m_native_storage->unregister_device(dev_id);
 
     if (m_lan_uplink)   m_lan_uplink->remove_device(dev_id);
     if (m_cloud_uplink) m_cloud_uplink->remove_device(dev_id);

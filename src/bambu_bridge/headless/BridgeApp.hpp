@@ -93,6 +93,7 @@ namespace router { class SessionRouter;      }
 namespace router { class UploadSinkRouter;   }
 namespace router { class CameraSourceRouter; }
 namespace router { class UplinkHealthMonitor;}
+namespace router { class NativeStorageDelegate; }
 
 namespace headless {
 
@@ -458,6 +459,14 @@ private:
     std::unique_ptr<server::RtspServer>                   m_rtsp;
     std::unique_ptr<server::VirtualTunnelServer>          m_vtun;
 
+    // Model-routing wrapper around the GUI-supplied storage delegate.
+    // Created in initialise(); receives every storage JSON-RPC frame from
+    // vtun. Devices whose vendor model string matches X1/P1 family are
+    // served by the bridge's own LocalControlTunnel to printer:6000;
+    // every other model (H2S, H2D, A1, unknown) falls through to
+    // `m_storage_delegate` (the GUI's PrinterFileSystem-via-plugin).
+    std::shared_ptr<router::NativeStorageDelegate>        m_native_storage;
+
     // Per-device table. The N-th device added (alphabetical by dev_id is
     // NOT guaranteed — it's insertion order) gets ports
     // (mqtt_port_base+N, ftps_port_base+N, rtsp_port_base+N).
@@ -465,6 +474,10 @@ private:
         std::string                                       dev_id;
         std::string                                       lan_ip;
         std::string                                       access_code;
+        // Vendor model string from the cloud inventory ("X1C", "P1S",
+        // "H2S", "A1", "3DPrinter-X1-Carbon", ...). Used by
+        // NativeStorageDelegate to gate the native port-6000 path.
+        std::string                                       model;
         // Printer's OTA firmware version (e.g. "01.08.00.00"). Pushed
         // in via the GUI's wxTimer from MachineObject::get_ota_version().
         // The storage tunnel URL embeds this as `dev_ver=…` and the
