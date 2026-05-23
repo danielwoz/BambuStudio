@@ -744,20 +744,63 @@ void install_gui_worker(GUI_App* app)
                         std::fflush(stderr);
                     }
 
-                    // Previous experiment showed: a bulk refire of
-                    // install_device_cert after LAN sessions come up
-                    // opens the gate ONLY for the LAST printer the
-                    // plugin connected to (i.e. the currently-active
-                    // session). The plugin keeps multiple TCP/TLS
-                    // sockets open but routes the enc_msg cert_report
-                    // only on the just-selected device. So cycle per
-                    // dev_id: set_user_selected_machine → install_cert
-                    // → wait for the cert_report MQTT round-trip while
-                    // this device is the active one → move to next.
+                    // ====================================================
+                    // Post-LAN enc_msg gate-open cycle.
+                    //
+                    // The proprietary plugin's `bambu_network_send_message`
+                    // (LAN path) gates print.* publishes through an
+                    // `apply_enc_msg_gate` check (RVA 0x1fa330 in the
+                    // unpacked .so). The gate reads the per-device public
+                    // key from `device_pub_key_map[dev_id]`, which is
+                    // populated by the `cert_report` MQTT round-trip
+                    // triggered by `install_device_cert` (RVA 0x247d10).
+                    // Until that map entry exists, send_message_to_printer
+                    // returns -4 (SEND_MSG_FAILED) and the publish is
+                    // silently dropped before it reaches the wire.
+                    //
+                    // After LAN sessions come up, a bulk refire of
+                    // install_device_cert opens the gate ONLY for the
+                    // last printer the plugin connected to (the plugin
+                    // keeps multiple TCP/TLS sockets open but only routes
+                    // the cert_report reply for the currently-active dev
+                    // selected via set_user_selected_machine). So we
+                    // cycle per dev_id:
+                    //
+                    //   1. set_user_selected_machine(d) — makes `d` the
+                    //      active LAN session in the plugin (the plugin's
+                    //      cloud send_message gate is also keyed off this).
+                    //   2. install_device_cert(d, false) — triggers a
+                    //      cert_report request on that session; the
+                    //      cert_report reply (printer → plugin) is what
+                    //      populates device_pub_key_map[d].
+                    //   3. Wait for the cert_report reply to land. 5s
+                    //      nominal — Exp A saw the prior 3s wait was
+                    //      flaky (-4 in ~1/3 launches) on H2S; 5s is
+                    //      well within typical LAN round-trip headroom
+                    //      and the cascade only runs once per bridge
+                    //      bring-up.
+                    //
+                    // No silent probe at the end of the wait: the only
+                    // way to probe via the plugin is to actually publish
+                    // a `print.*` payload, which firmware then schema-
+                    // checks and echoes back via `/report` with
+                    // result:"failed". Slicer observers subscribed to
+                    // `/report` would see those echoes. We trust the
+                    // wait window (Exp C/D both validated 3s was
+                    // sufficient when it didn't lose the race; 5s gives
+                    // margin) and only the rc of the install_device_cert
+                    // call is logged. If a downstream publish does
+                    // return -4 from send_message_to_printer, the
+                    // [lan-uplink] log line will surface it.
+                    //
+                    // See /mnt/cephfs/ssd/BambuBridge/EXP-{A..E}-RESULTS.md
+                    // and project_plugin_enc_gate memory for the
+                    // empirical / reverse-engineering paths that led here.
+                    // ====================================================
                     std::this_thread::sleep_for(15s);
                     std::fprintf(stderr,
-                        "[bridge-gui] post-LAN cycle: select + install_cert "
-                        "+ wait, per dev_id\n");
+                        "[bridge-gui] post-LAN enc_msg gate-open cycle: "
+                        "select + install_cert per dev_id\n");
                     std::fflush(stderr);
                     for (const auto& d : dev_ids) {
                         int sel_rc2 = ag->set_user_selected_machine(d);
@@ -765,28 +808,18 @@ void install_gui_worker(GUI_App* app)
                         std::fprintf(stderr,
                             "[bridge-gui] (cycle) dev=%s "
                             "set_user_selected_machine rc=%d + "
-                            "install_device_cert; waiting 3s for cert_report\n",
+                            "install_device_cert; waiting 5s for cert_report\n",
                             d.c_str(), sel_rc2);
                         std::fflush(stderr);
-                        std::this_thread::sleep_for(3s);
+                        std::this_thread::sleep_for(5s);
                     }
 
-                    // Probe each dev_id to see which gates opened.
-                    // Benign print.* payload (gcode_line with a comment)
-                    // so even if it reaches the firmware it's a no-op.
-                    for (const auto& d : dev_ids) {
-                        const std::string probe_payload =
-                            R"({"print":{"command":"gcode_line","sequence_id":"probe","param":"; bridge probe\n"}})";
-                        int rc_cloud = ag->send_message(d, probe_payload, 1, 0);
-                        int rc_lan   = ag->send_message_to_printer(
-                                            d, probe_payload, 1, 0);
-                        std::fprintf(stderr,
-                            "[bridge-gui] (probe) dev=%s print.* "
-                            "send_message(cloud) rc=%d  "
-                            "send_message_to_printer(lan) rc=%d\n",
-                            d.c_str(), rc_cloud, rc_lan);
-                        std::fflush(stderr);
-                    }
+                    std::fprintf(stderr,
+                        "[bridge-gui] cascade ready: enc_msg gate cycle "
+                        "complete for %zu dev_ids; print.* writes will now "
+                        "route through plugin send_message_to_printer\n",
+                        dev_ids.size());
+                    std::fflush(stderr);
                     return;
                 }
                 std::fprintf(stderr,
