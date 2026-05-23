@@ -292,3 +292,8 @@ out-of-scope list, but anyone picking up bridge work should know them:
 - Release notes: `docs/bambu_bridge_release_notes.md`
 - E2E walk-through: `docs/bambu_bridge_e2e_guide.md`
 - Wire-diff: `tools/wire_diff/README.md`
+- Plugin log decryptor (live observability of the proprietary
+  `libbambu_networking.so` spdlog stream): `tools/README.md`
+  - quick start: `tools/tail-plugin-log.sh` while the bridge is running
+  - cipher details (AES-128-ECB, static key): see `RE-LOG-ENCRYPTION.md`
+    in the BambuBridge meta-repo root
