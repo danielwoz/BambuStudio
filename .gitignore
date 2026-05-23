@@ -1,6 +1,13 @@
 Build
 Build.bat
 /build/
+
+# ship-2: bridge maintains its own plaintext cloud session under
+# ~/.config/BambuBridge/session.json. If a developer ever places a
+# scratch copy in-tree make sure we never accidentally commit a real
+# access_token / refresh_token.
+session.json
+**/BambuBridge/session.json
 /build2022/
 deps/build
 MYMETA.json

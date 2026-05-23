@@ -25,6 +25,8 @@
 
 #include "bambu_bridge/headless/BridgeApp.hpp"
 #include "bambu_bridge/headless/SignalHandler.hpp"
+#include "bambu_bridge/CloudSession.hpp"
+#include "bambu_bridge/CloudDeviceList.hpp"
 
 #include "libslic3r/AppConfig.hpp"
 #include "libslic3r_version.h" // SLIC3R_VERSION
@@ -679,40 +681,22 @@ void install_gui_worker(GUI_App* app)
         // bridge launches), nobody fires that event, so the bridge
         // sits with an empty DeviceManager and the slicer's own UI
         // shows only the previously-cached "last selected" printer.
-        // Force the post-login cascade once the plugin reports a
-        // logged-in user.
+        // Force the post-login cascade once we have a session — either
+        // loaded from the native bridge session file (ship-2 native
+        // path) or via the plugin's cached-login (legacy fallback for
+        // users without a bridge session file yet).
+        //
+        // The per-device plugin work (add_subscribe + set_user_selected
+        // _machine + install_device_cert + the post-LAN cycle) still
+        // needs the plugin's agent — ship-2 only replaces the SESSION +
+        // DEVICE-LIST steps, not the enc_msg gate cycle. So both paths
+        // converge into the same finish_cascade() helper below.
         if (app->m_agent) {
-            std::thread([app]{
+            // Inner helper: after the userMachineList is populated by
+            // either path, run the per-dev plugin setup + post-LAN
+            // cycle + probe. Captures `app` from the surrounding scope.
+            auto finish_cascade = [app] {
                 using namespace std::chrono_literals;
-                bool login_fired = false;
-                for (int i = 0; i < 60; ++i) {
-                    if (app->m_agent && app->m_agent->is_user_login()) {
-                        app->CallAfter([app]{
-                            std::fprintf(stderr,
-                                "[bridge-gui] firing request_user_login_handle"
-                                " for cached login\n");
-                            std::fflush(stderr);
-                            app->request_user_handle(1);
-                        });
-                        login_fired = true;
-                        break;
-                    }
-                    std::this_thread::sleep_for(500ms);
-                }
-                if (!login_fired) {
-                    std::fprintf(stderr,
-                        "[bridge-gui] timed out waiting for is_user_login\n");
-                    std::fflush(stderr);
-                    return;
-                }
-                // After on_user_login_handle fires (queued), the slicer
-                // runs `update_user_machine_list_info` in a boost::thread
-                // which calls parse_user_print_info and populates the
-                // DeviceManager.userMachineList. Wait for that, then do
-                // per-printer setup: set_user_selected_machine +
-                // add_subscribe + install_device_cert — same calls the
-                // slicer makes when the user clicks a printer in the
-                // Device tab.
                 for (int i = 0; i < 30; ++i) {
                     std::this_thread::sleep_for(1000ms);
                     if (!app->m_device_manager) continue;
@@ -747,13 +731,7 @@ void install_gui_worker(GUI_App* app)
                     // Previous experiment showed: a bulk refire of
                     // install_device_cert after LAN sessions come up
                     // opens the gate ONLY for the LAST printer the
-                    // plugin connected to (i.e. the currently-active
-                    // session). The plugin keeps multiple TCP/TLS
-                    // sockets open but routes the enc_msg cert_report
-                    // only on the just-selected device. So cycle per
-                    // dev_id: set_user_selected_machine → install_cert
-                    // → wait for the cert_report MQTT round-trip while
-                    // this device is the active one → move to next.
+                    // plugin connected to. Cycle per dev_id.
                     std::this_thread::sleep_for(15s);
                     std::fprintf(stderr,
                         "[bridge-gui] post-LAN cycle: select + install_cert "
@@ -772,8 +750,6 @@ void install_gui_worker(GUI_App* app)
                     }
 
                     // Probe each dev_id to see which gates opened.
-                    // Benign print.* payload (gcode_line with a comment)
-                    // so even if it reaches the firmware it's a no-op.
                     for (const auto& d : dev_ids) {
                         const std::string probe_payload =
                             R"({"print":{"command":"gcode_line","sequence_id":"probe","param":"; bridge probe\n"}})";
@@ -793,6 +769,202 @@ void install_gui_worker(GUI_App* app)
                     "[bridge-gui] cascade waited 30s but userMachineList "
                     "stayed empty\n");
                 std::fflush(stderr);
+            };
+
+            std::thread([app, finish_cascade]{
+                using namespace std::chrono_literals;
+                const auto t0 = std::chrono::steady_clock::now();
+
+                // -- Ship-2: native session path --------------------------
+                // Try loading + refreshing the bridge's own plaintext
+                // session file at ~/.config/BambuBridge/session.json.
+                // If that succeeds AND we can fetch the device list via
+                // the cloud REST API, hand the body to
+                // DeviceManager::parse_user_print_info() ourselves and
+                // skip the plugin's request_user_handle round-trip.
+                bool native_used = false;
+                {
+                    Slic3r::bridge::CloudSession sess;
+                    auto load_rc = sess.load_and_refresh_if_needed(/*slack_seconds=*/300);
+                    if (load_rc.ok) {
+                        Slic3r::bridge::CloudDeviceList lister;
+                        auto dl = lister.fetch(load_rc.data);
+                        if (dl.ok && !dl.body.empty()) {
+                            std::fprintf(stderr,
+                                "[bridge-gui] cache_session_used=true "
+                                "refreshed=%d uid=%lld region=%s "
+                                "device_list_http=%ld body_len=%zu\n",
+                                int(load_rc.refreshed),
+                                (long long) load_rc.data.uid,
+                                load_rc.data.region.c_str(),
+                                dl.http_status, dl.body.size());
+                            std::fflush(stderr);
+
+                            // Plugin's agent still owns MQTT bringup +
+                            // enc_msg cert flow. Bring its cached login
+                            // online so install_device_cert works, but
+                            // we DON'T wait on update_user_machine_list
+                            // _info — we feed the list ourselves.
+                            if (app->m_agent && app->m_agent->is_user_login()) {
+                                // (legacy plugin already loaded cached
+                                // tokens — no extra wakeup needed)
+                            }
+                            // Feed the body into DeviceManager on the
+                            // wx main thread (touches DeviceManager
+                            // mutable state that the timer also pokes).
+                            std::string body = std::move(dl.body);
+                            app->CallAfter([app, body = std::move(body)]() mutable {
+                                if (!app->m_device_manager) return;
+                                try {
+                                    app->m_device_manager->parse_user_print_info(body);
+                                    std::fprintf(stderr,
+                                        "[bridge-gui] native parse_user_print_info"
+                                        " ok, list size=%zu\n",
+                                        app->m_device_manager
+                                            ->get_user_machinelist().size());
+                                    std::fflush(stderr);
+                                } catch (const std::exception& ex) {
+                                    std::fprintf(stderr,
+                                        "[bridge-gui] native parse_user_print_info"
+                                        " threw: %s\n", ex.what());
+                                    std::fflush(stderr);
+                                }
+                            });
+                            native_used = true;
+                        } else {
+                            std::fprintf(stderr,
+                                "[bridge-gui] native session loaded but "
+                                "device-list fetch failed: status=%ld err=%s; "
+                                "falling back to plugin path\n",
+                                dl.http_status, dl.error.c_str());
+                            std::fflush(stderr);
+                        }
+                    } else {
+                        std::fprintf(stderr,
+                            "[bridge-gui] cache_session_used=false "
+                            "reason=%s; falling back to plugin path\n",
+                            load_rc.error.c_str());
+                        std::fflush(stderr);
+                    }
+                }
+
+                // -- Plugin fallback path (legacy) ------------------------
+                if (!native_used) {
+                    bool login_fired = false;
+                    for (int i = 0; i < 60; ++i) {
+                        if (app->m_agent && app->m_agent->is_user_login()) {
+                            app->CallAfter([app]{
+                                std::fprintf(stderr,
+                                    "[bridge-gui] firing request_user_login_handle"
+                                    " for cached login (plugin fallback)\n");
+                                std::fflush(stderr);
+                                app->request_user_handle(1);
+                            });
+                            login_fired = true;
+                            break;
+                        }
+                        std::this_thread::sleep_for(500ms);
+                    }
+                    if (!login_fired) {
+                        std::fprintf(stderr,
+                            "[bridge-gui] timed out waiting for is_user_login\n");
+                        std::fflush(stderr);
+                        return;
+                    }
+                }
+
+                // Common: run the per-device cascade once the list lands.
+                finish_cascade();
+                const auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(stderr,
+                    "[bridge-gui] cascade total elapsed=%lld ms path=%s\n",
+                    (long long) dt_ms, native_used ? "native" : "plugin-fallback");
+                std::fflush(stderr);
+
+                // -- Ship-2: persist the resulting session for next boot --
+                // After the plugin-fallback path succeeds we want next
+                // boot to use the native session. Try
+                // bambu_network_get_my_token (empty ticket) — per RE
+                // doc §5 it returns the in-memory access_token. If we
+                // can extract a non-empty token, save it to the bridge
+                // session file (refresh_token + expiry are not exposed
+                // by the plugin export surface, so we save what we have
+                // and let the refresh round-trip top up expiry on next
+                // boot).
+                if (!native_used && app->m_agent && app->m_agent->is_user_login()) {
+                    unsigned int http = 0;
+                    std::string  body;
+                    int rc = app->m_agent->get_my_token(
+                        /*ticket=*/std::string(), &http, &body);
+                    std::fprintf(stderr,
+                        "[bridge-gui] post-fallback get_my_token rc=%d http=%u "
+                        "body_len=%zu\n", rc, http, body.size());
+                    std::fflush(stderr);
+
+                    Slic3r::bridge::CloudSessionData d;
+                    d.region     = Slic3r::bridge::region_for_bridge();
+                    d.user_email = app->m_agent->get_user_name();
+                    try {
+                        auto uid_str = app->m_agent->get_user_id();
+                        if (!uid_str.empty()) d.uid = std::stoll(uid_str);
+                    } catch (...) {}
+
+                    if (rc == 0 && !body.empty()) {
+                        try {
+                            auto j = nlohmann::json::parse(body);
+                            auto find_str = [&](const char* k) -> std::string {
+                                auto it = j.find(k);
+                                if (it == j.end() || it->is_null()) return {};
+                                if (it->is_string()) return it->get<std::string>();
+                                return {};
+                            };
+                            auto find_int = [&](const char* k) -> int64_t {
+                                auto it = j.find(k);
+                                if (it == j.end() || it->is_null()) return 0;
+                                if (it->is_number()) return (int64_t) it->get<double>();
+                                if (it->is_string()) {
+                                    try { return std::stoll(it->get<std::string>()); }
+                                    catch (...) { return 0; }
+                                }
+                                return 0;
+                            };
+                            d.access_token  = find_str("accessToken");
+                            if (d.access_token.empty()) d.access_token = find_str("access_token");
+                            d.refresh_token = find_str("refreshToken");
+                            if (d.refresh_token.empty()) d.refresh_token = find_str("refresh_token");
+                            int64_t ei = find_int("expiresIn");
+                            int64_t re = find_int("refreshExpiresIn");
+                            if (ei > 0) d.access_expires_at =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count() + ei;
+                            if (re > 0) d.refresh_expires_at =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count() + re;
+                        } catch (const std::exception& ex) {
+                            std::fprintf(stderr,
+                                "[bridge-gui] get_my_token body not JSON: %s\n",
+                                ex.what());
+                            std::fflush(stderr);
+                        }
+                    }
+                    if (!d.access_token.empty() && !d.refresh_token.empty()) {
+                        Slic3r::bridge::CloudSession().save(d);
+                        std::fprintf(stderr,
+                            "[bridge-gui] persisted native session after "
+                            "plugin fallback; next boot will use native path\n");
+                        std::fflush(stderr);
+                    } else {
+                        std::fprintf(stderr,
+                            "[bridge-gui] plugin did not surface usable tokens "
+                            "via get_my_token; native session NOT persisted "
+                            "(access=%s refresh=%s) — next boot will "
+                            "fallback again\n",
+                            d.access_token.empty() ? "empty" : "present",
+                            d.refresh_token.empty() ? "empty" : "present");
+                        std::fflush(stderr);
+                    }
+                }
             }).detach();
         }
     } catch (const std::exception& e) {
