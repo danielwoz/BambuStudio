@@ -8,6 +8,7 @@
 #include "LanUplink.hpp"
 
 #include "../BambuNetworkingPluginHandle.hpp"
+#include "../EncMsgEnvelope.hpp"
 #include "RawMqttPublisher.hpp"
 
 #include <atomic>
@@ -267,6 +268,10 @@ struct LanUplink::Impl {
     };
 
     std::shared_ptr<BambuNetworkingPluginHandle>                  handle;
+    // Ship 7 — optional native enc_msg envelope wrapper. When set,
+    // on_publish wraps print.* payloads before cert+key publish; otherwise
+    // the raw payload is passed through unchanged (legacy path).
+    std::shared_ptr<EncMsgEnvelope>                               enc_msg;
     mutable std::mutex                                            mu;
     std::unordered_map<std::string, std::unique_ptr<DeviceState>> devices;
     std::unordered_map<std::string,
@@ -346,6 +351,16 @@ void LanUplink::attach_plugin(std::shared_ptr<BambuNetworkingPluginHandle> handl
 std::shared_ptr<BambuNetworkingPluginHandle> LanUplink::plugin_handle() const {
     std::lock_guard<std::mutex> lk(m_impl->mu);
     return m_impl->handle;
+}
+
+void LanUplink::attach_enc_msg_envelope(std::shared_ptr<EncMsgEnvelope> envelope) {
+    std::lock_guard<std::mutex> lk(m_impl->mu);
+    m_impl->enc_msg = std::move(envelope);
+}
+
+std::shared_ptr<EncMsgEnvelope> LanUplink::enc_msg_envelope() const {
+    std::lock_guard<std::mutex> lk(m_impl->mu);
+    return m_impl->enc_msg;
 }
 
 void LanUplink::add_device(LanUplinkConfig cfg) {
@@ -487,6 +502,7 @@ void LanUplink::on_subscribe(const std::string& dev_id, std::string topic) {
 void LanUplink::on_publish(const std::string& dev_id, std::string topic,
                            std::vector<uint8_t> payload, uint8_t qos) {
     std::shared_ptr<BambuNetworkingPluginHandle> h;
+    std::shared_ptr<EncMsgEnvelope>              enc;
     bool have_device = false;
     LanUplinkConfig cfg;
     {
@@ -494,7 +510,8 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
         auto it = m_impl->devices.find(dev_id);
         have_device = (it != m_impl->devices.end());
         if (have_device) cfg = it->second->cfg;
-        h = m_impl->handle;
+        h   = m_impl->handle;
+        enc = m_impl->enc_msg;
     }
     if (!have_device) {
         std::fprintf(stderr,
@@ -517,6 +534,38 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
     const bool have_cert = !cfg.mtls_cert_path.empty()
                         && !cfg.mtls_key_path.empty();
     if (is_print && have_cert) {
+        // Ship 7 — if a native enc_msg envelope wrapper is configured,
+        // wrap the print.* payload BEFORE handing it to the cert+key
+        // helper. This produces a plugin-compatible signed envelope so
+        // newer firmware (which validates the enc_msg signature) accepts
+        // the publish. Without an envelope wrapper, the raw payload is
+        // published unsigned (legacy path; works on older firmware that
+        // doesn't enforce enc_msg).
+        bool wrap_ok = true;
+        if (enc) {
+            try {
+                const size_t in_sz = json.size();
+                std::string env = enc->wrap(json);
+                json = std::move(env);
+                payload.assign(json.begin(), json.end());
+                std::fprintf(stderr,
+                    "[lan-uplink] enc_msg wrap dev=%s in=%zuB out=%zuB\n",
+                    dev_id.c_str(), in_sz, payload.size());
+                std::fflush(stderr);
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr,
+                    "[lan-uplink] enc_msg wrap FAILED dev=%s: %s; "
+                    "falling back to plugin path\n",
+                    dev_id.c_str(), ex.what());
+                std::fflush(stderr);
+                wrap_ok = false;
+            }
+        }
+        if (!wrap_ok) {
+            // Skip the cert+key publish (firmware would reject the
+            // unsigned payload) and fall through to the plugin path
+            // by skipping past the cert+key block below.
+        } else {
         const std::string helper = resolve_helper_path_once();
         if (helper.empty()) {
             std::fprintf(stderr,
@@ -558,6 +607,7 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
                 return;
             }
         }
+        }   // end ship-7 wrap_ok branch
     }
 
     if (!h) {

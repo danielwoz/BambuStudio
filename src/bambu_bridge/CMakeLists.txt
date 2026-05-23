@@ -53,6 +53,8 @@ add_library(bambu_bridge STATIC
     BambuSourceHandle.hpp
     CloudInventory.cpp
     CloudInventory.hpp
+    EncMsgEnvelope.cpp
+    EncMsgEnvelope.hpp
     tls/CertFactory.cpp
     tls/CertFactory.hpp
     server/SsdpResponder.cpp
