@@ -75,6 +75,18 @@ set_target_properties(CertFactoryTest PROPERTIES
 )
 add_test(NAME CertFactoryTest COMMAND CertFactoryTest)
 
+add_executable(EncMsgEnvelopeTest EncMsgEnvelopeTest.cpp)
+target_link_libraries(EncMsgEnvelopeTest PRIVATE bambu_bridge OpenSSL::SSL OpenSSL::Crypto)
+target_include_directories(EncMsgEnvelopeTest PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/bambu_bridge/third_party
+)
+set_target_properties(EncMsgEnvelopeTest PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+add_test(NAME EncMsgEnvelopeTest COMMAND EncMsgEnvelopeTest)
+
 add_executable(SsdpResponderUnitTest SsdpResponderUnitTest.cpp)
 target_link_libraries(SsdpResponderUnitTest PRIVATE bambu_bridge)
 set_target_properties(SsdpResponderUnitTest PROPERTIES

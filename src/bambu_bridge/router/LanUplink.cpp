@@ -8,6 +8,7 @@
 #include "LanUplink.hpp"
 
 #include "../BambuNetworkingPluginHandle.hpp"
+#include "../EncMsgEnvelope.hpp"
 #include "RawMqttPublisher.hpp"
 
 #include <atomic>
@@ -54,14 +55,15 @@ bool print_bypass_enabled() {
 }
 
 // Cheap-and-honest check: is the top-level key of this JSON payload
-// literally `"print"`? We don't need a full parse — control payloads are
-// always `{"print":{...}}` with no leading whitespace beyond what the
+// literally `key`? We don't need a full parse — control payloads are
+// always `{"<key>":{...}}` with no leading whitespace beyond what the
 // slicer happens to emit. nlohmann::json::accept + a key probe would
 // also work but parsing the whole document just to look at the first
 // key is wasteful when the slicer publishes 64-bit-deep status frames
 // 10x/sec. Robust enough for the only thing we care about: routing
-// `print.command=*` vs `pushing.*` / `info.*`.
-bool payload_is_print_control(const std::string& json) {
+// per command class (`print.*`, `camera.*`, `xcam.*`, `system.*`,
+// `pushing.*`, `info.*`, etc.).
+bool payload_top_level_key_is(const std::string& json, const char* key) {
     // Skip leading whitespace.
     size_t i = 0;
     while (i < json.size() &&
@@ -74,13 +76,32 @@ bool payload_is_print_control(const std::string& json) {
             json[i] == '\n' || json[i] == '\r')) ++i;
     if (i >= json.size() || json[i] != '"') return false;
     ++i;
-    // Expect literal "print" followed by closing quote.
-    static const char kPrint[] = "print";
-    constexpr size_t  kPlen    = sizeof(kPrint) - 1;
-    if (i + kPlen >= json.size()) return false;
-    if (std::memcmp(json.data() + i, kPrint, kPlen) != 0) return false;
-    if (json[i + kPlen] != '"') return false;
+    const size_t klen = std::strlen(key);
+    if (i + klen >= json.size()) return false;
+    if (std::memcmp(json.data() + i, key, klen) != 0) return false;
+    if (json[i + klen] != '"') return false;
     return true;
+}
+
+bool payload_is_print_control(const std::string& json) {
+    return payload_top_level_key_is(json, "print");
+}
+
+// Tier 2 — per PR #61's per-class auth requirements table, the
+// `camera.*`, `xcam.*`, and `system.*` command surface requires the
+// per-printer mTLS cert+key on the TLS handshake but does NOT need
+// the enc_msg signed envelope wrapper. So these can be published
+// unconditionally via the existing cert+key paho subprocess path —
+// the firmware will accept them as long as the TLS handshake
+// presented a valid client cert.
+//
+// We deliberately do NOT include `upgrade.*` here: those are also
+// unenveloped but they irreversibly change printer state (firmware
+// flashes). Keep ops surface narrow.
+bool payload_is_tier2_no_envelope(const std::string& json) {
+    return payload_top_level_key_is(json, "camera") ||
+           payload_top_level_key_is(json, "xcam")   ||
+           payload_top_level_key_is(json, "system");
 }
 
 // Resolve the path to the python helper. The script lives next to the
@@ -285,6 +306,10 @@ struct LanUplink::Impl {
     };
 
     std::shared_ptr<BambuNetworkingPluginHandle>                  handle;
+    // Ship 7 — optional native enc_msg envelope wrapper. When set,
+    // on_publish wraps print.* payloads before cert+key publish; otherwise
+    // the raw payload is passed through unchanged (legacy path).
+    std::shared_ptr<EncMsgEnvelope>                               enc_msg;
     mutable std::mutex                                            mu;
     std::unordered_map<std::string, std::unique_ptr<DeviceState>> devices;
     std::unordered_map<std::string,
@@ -364,6 +389,16 @@ void LanUplink::attach_plugin(std::shared_ptr<BambuNetworkingPluginHandle> handl
 std::shared_ptr<BambuNetworkingPluginHandle> LanUplink::plugin_handle() const {
     std::lock_guard<std::mutex> lk(m_impl->mu);
     return m_impl->handle;
+}
+
+void LanUplink::attach_enc_msg_envelope(std::shared_ptr<EncMsgEnvelope> envelope) {
+    std::lock_guard<std::mutex> lk(m_impl->mu);
+    m_impl->enc_msg = std::move(envelope);
+}
+
+std::shared_ptr<EncMsgEnvelope> LanUplink::enc_msg_envelope() const {
+    std::lock_guard<std::mutex> lk(m_impl->mu);
+    return m_impl->enc_msg;
 }
 
 void LanUplink::add_device(LanUplinkConfig cfg) {
@@ -505,6 +540,7 @@ void LanUplink::on_subscribe(const std::string& dev_id, std::string topic) {
 void LanUplink::on_publish(const std::string& dev_id, std::string topic,
                            std::vector<uint8_t> payload, uint8_t qos) {
     std::shared_ptr<BambuNetworkingPluginHandle> h;
+    std::shared_ptr<EncMsgEnvelope>              enc;
     bool have_device = false;
     LanUplinkConfig cfg;
     {
@@ -512,7 +548,8 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
         auto it = m_impl->devices.find(dev_id);
         have_device = (it != m_impl->devices.end());
         if (have_device) cfg = it->second->cfg;
-        h = m_impl->handle;
+        h   = m_impl->handle;
+        enc = m_impl->enc_msg;
     }
     if (!have_device) {
         std::fprintf(stderr,
@@ -523,26 +560,134 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
     }
     std::string json(payload.begin(), payload.end());
 
-    // Diagnostic cert+key bypass for `{"print":...}` control commands.
-    // OFF by default — must be enabled with BBL_BRIDGE_ENABLE_PRINT_BYPASS=1.
+    // SHIP-11B INTEGRATION NOTE — Two payload classes route via the
+    // per-printer mTLS cert+key (subprocess to raw_mqtt_publish.py)
+    // instead of through the proprietary plugin:
     //
-    // Production routing for `print.command=*` is the plugin path below
-    // (`send_message_to_printer`). After the bridge's startup cycle
-    // (`set_user_selected_machine` → `install_device_cert` per dev_id) the
-    // plugin's enc_msg gate is open and writes are applied by firmware
-    // (validated end-to-end by Exp C and Exp D).
+    //   * Tier 2 (`camera.*` / `xcam.*` / `system.*`) — Ship 10F. The
+    //     plugin silently drops these from non-UI contexts; the
+    //     printer's LAN broker accepts them when the TLS handshake
+    //     presents a valid client cert. No enc_msg envelope needed.
+    //     AUTO-ENABLED when a cert is installed (new behaviour; no
+    //     regression risk since the plugin path was a silent drop).
     //
-    // The bypass routes the raw payload through raw_mqtt_publish.py with
-    // the per-printer mTLS cert+key extracted from the slicer plugin's
-    // heap (see resolve_mtls_paths in BridgeApp.cpp). The TLS handshake
-    // succeeds, but firmware rejects the publish because it isn't wrapped
-    // in the plugin's enc_msg envelope (Exp E: err_code 0x05024007). Kept
-    // as DIAGNOSTIC-ONLY so observers can emit a known-malformed frame
-    // and see how the printer reacts.
-    const bool is_print  = payload_is_print_control(json);
+    //   * print.* (`{"print":...}` control commands) — Ship 1 / Ship 7.
+    //     Production routing for print.command=* is the plugin path
+    //     below (`send_message_to_printer`). After the bridge startup
+    //     cycle (`set_user_selected_machine` → `install_device_cert`
+    //     per dev_id), the plugin's enc_msg gate is open and writes
+    //     are applied by firmware (Exp C/D). The cert+key bypass
+    //     remains DIAGNOSTIC-ONLY behind BBL_BRIDGE_ENABLE_PRINT_BYPASS=1
+    //     because firmware rejects unwrapped publishes (Exp E:
+    //     err_code 0x05024007). Ship 7 added an optional enc_msg
+    //     wrapper so the bypass can produce plugin-compatible signed
+    //     envelopes, but it stays opt-in until the wrapper is
+    //     validated against newer firmware.
+    //
+    // Other payloads (`pushing.*`, `info.*`) still go through the
+    // plugin so `pushall`, `get_version`, etc. keep using the
+    // persistent plugin session.
+    const bool is_print = payload_is_print_control(json);
+    const bool is_tier2 = payload_is_tier2_no_envelope(json);
     const bool have_cert = !cfg.mtls_cert_path.empty()
                         && !cfg.mtls_key_path.empty();
+
+    // Helper: spawn the paho subprocess for one publish. Returns true
+    // on success (return-via-cert log line emitted on success or
+    // recoverable failure). When this returns true the on_publish
+    // contract is fulfilled — we have committed the publish to the
+    // cert+key path and do NOT fall through to the plugin.
+    auto publish_via_cert = [&](const std::string& label) -> bool {
+        const std::string helper = resolve_helper_path_once();
+        if (helper.empty()) {
+            std::fprintf(stderr,
+                "[%s dev=%s] helper script not found "
+                "(set BBL_BRIDGE_RAW_MQTT_HELPER); falling back to plugin\n",
+                label.c_str(), dev_id.c_str());
+            std::fflush(stderr);
+            return false;
+        }
+        const std::string tmpfile = write_tmp_payload(payload, dev_id);
+        if (tmpfile.empty()) {
+            std::fprintf(stderr,
+                "[%s dev=%s] tmp file write failed; falling back\n",
+                label.c_str(), dev_id.c_str());
+            std::fflush(stderr);
+            return false;
+        }
+        const std::string client_id  = make_client_id();
+        const std::string topic_real =
+            std::string("device/") + dev_id + "/request";
+        int rc = spawn_raw_mqtt_helper(
+            helper,
+            cfg.printer_ip,
+            /*port*/ 8883,
+            cfg.mtls_cert_path,
+            cfg.mtls_key_path,
+            cfg.access_code,
+            client_id,
+            topic_real,
+            qos,
+            tmpfile,
+            dev_id);
+        ::unlink(tmpfile.c_str());
+        std::fprintf(stderr,
+            "[%s] dev=%s topic=%s qos=%u bytes=%zu rc=%d\n",
+            label.c_str(),
+            dev_id.c_str(), topic_real.c_str(),
+            unsigned(qos), payload.size(), rc);
+        std::fflush(stderr);
+        return true;
+    };
+
+    // Tier 2 — no-envelope command class. Publish via cert+key without
+    // the ship-7 enc_msg wrap. If we have no cert, fall through to the
+    // plugin path below (which will quietly drop them on newer firmware,
+    // matching the print.* fall-through behaviour).
+    if (is_tier2 && have_cert) {
+        if (publish_via_cert("tier2-via-cert")) return;
+        // else: fall through to plugin path
+    }
+
+    // print.* — Ship 1 keeps this DIAGNOSTIC-ONLY (gated on
+    // BBL_BRIDGE_ENABLE_PRINT_BYPASS=1). Ship 7 supplies an optional
+    // enc_msg wrap when the bypass IS enabled, so observers can fire a
+    // plugin-compatible signed envelope or a known-malformed raw frame
+    // (see Exp E). Default production path is the plugin
+    // (`send_message_to_printer`) below.
     if (is_print && have_cert && print_bypass_enabled()) {
+        // Ship 7 — if a native enc_msg envelope wrapper is configured,
+        // wrap the print.* payload BEFORE handing it to the cert+key
+        // helper. This produces a plugin-compatible signed envelope so
+        // newer firmware (which validates the enc_msg signature) accepts
+        // the publish. Without an envelope wrapper, the raw payload is
+        // published unsigned (legacy diagnostic path; firmware will
+        // reject with 0x05024007 — useful for observers).
+        bool wrap_ok = true;
+        if (enc) {
+            try {
+                const size_t in_sz = json.size();
+                std::string env = enc->wrap(json);
+                json = std::move(env);
+                payload.assign(json.begin(), json.end());
+                std::fprintf(stderr,
+                    "[lan-uplink] enc_msg wrap dev=%s in=%zuB out=%zuB\n",
+                    dev_id.c_str(), in_sz, payload.size());
+                std::fflush(stderr);
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr,
+                    "[lan-uplink] enc_msg wrap FAILED dev=%s: %s; "
+                    "falling back to plugin path\n",
+                    dev_id.c_str(), ex.what());
+                std::fflush(stderr);
+                wrap_ok = false;
+            }
+        }
+        if (!wrap_ok) {
+            // Skip the cert+key publish (firmware would reject the
+            // unsigned payload) and fall through to the plugin path
+            // by skipping past the cert+key block below.
+        } else {
         const std::string helper = resolve_helper_path_once();
         if (helper.empty()) {
             std::fprintf(stderr,
@@ -584,6 +729,7 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
                 return;
             }
         }
+        }   // end ship-7 wrap_ok branch
     }
 
     if (!h) {

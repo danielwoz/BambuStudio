@@ -26,15 +26,26 @@
 // Exit code: 0 if list-devices completed (even if the list is empty);
 // non-zero only on argument errors or hard plugin-load failure.
 
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <exception>
 #include <iostream>
+#include <random>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "../BambuNetworkingPluginHandle.hpp"
 #include "../BridgeService.hpp"
@@ -50,6 +61,7 @@
 #include "../router/NullUplink.hpp"
 #include "../router/NullUploadSink.hpp"
 #include "../router/SessionRouter.hpp"
+#include "../router/Tier2Commands.hpp"
 #include "../router/UplinkHealth.hpp"
 #include "../router/UploadSinkRouter.hpp"
 #include "../server/FtpsServer.hpp"
@@ -131,6 +143,15 @@ void print_usage(std::FILE* out) {
         "                one device, with SessionRouter / UploadSinkRouter /\n"
         "                CameraSourceRouter routing between LAN and cloud.\n"
         "                Runs until SIGINT / SIGTERM.\n"
+        "\n"
+        "  tier2 <command> [common-flags] [command-flags]\n"
+        "                One-shot publish of an unenveloped MQTT command\n"
+        "                (camera.*/xcam.*/system.*) via the printer's mTLS\n"
+        "                cert+key. Common flags: --dev-id, --printer-ip,\n"
+        "                --access-code, --printer-port (default 8883),\n"
+        "                --qos (default 1), --sequence-id, --dry-run, --cert,\n"
+        "                --key, --mtls-dir. Run `tier2` with no args to see\n"
+        "                the per-command flag list.\n"
         "\n"
         "  cloud-bridge --dev-id <id> --plugin <path-to-libbambu_networking.so>\n"
         "               --config-dir <path> [--country-code <cc>]\n"
@@ -1218,6 +1239,348 @@ int cmd_proxy(int argc, char** argv) {
     return 0;
 }
 
+// ---- tier2 ---------------------------------------------------------------
+//
+// Ops-grade entry point for the unenveloped MQTT command classes
+// (`camera.*` / `xcam.*` / `system.*`). These commands require the
+// per-printer mTLS cert+key on the TLS handshake but NOT the enc_msg
+// signed envelope, so they can ship via the same paho subprocess path
+// that LanUplink uses for print.*. This subcommand bypasses the bridge
+// process entirely: it shapes the JSON via Tier2Commands and shells out
+// to raw_mqtt_publish.py directly. Useful for poking a printer without
+// having to stand up the full bridge.
+//
+// Cert/key resolution mirrors BridgeApp::resolve_mtls_paths:
+//   1. --cert / --key explicit args
+//   2. $BBL_BRIDGE_MTLS_CERT_<dev_id> / $BBL_BRIDGE_MTLS_KEY_<dev_id>
+//   3. --mtls-dir / $BBL_BRIDGE_MTLS_DIR (scan for *_<dev_id>_chain.pem
+//      and *_<dev_id>_key.pem)
+//   4. /tmp/bbl_capture/mtls.fresh/paired (canonical default)
+
+static std::pair<std::string, std::string>
+tier2_resolve_mtls(const std::string& dev_id,
+                   const std::string& explicit_cert,
+                   const std::string& explicit_key,
+                   const std::string& explicit_dir) {
+    auto file_exists = [](const std::string& p) {
+        struct stat st;
+        return !p.empty() && ::stat(p.c_str(), &st) == 0;
+    };
+    if (file_exists(explicit_cert) && file_exists(explicit_key)) {
+        return {explicit_cert, explicit_key};
+    }
+    const std::string cert_env_key = "BBL_BRIDGE_MTLS_CERT_" + dev_id;
+    const std::string key_env_key  = "BBL_BRIDGE_MTLS_KEY_"  + dev_id;
+    const char* ec = std::getenv(cert_env_key.c_str());
+    const char* ek = std::getenv(key_env_key.c_str());
+    if (ec && *ec && ek && *ek && file_exists(ec) && file_exists(ek)) {
+        return {std::string(ec), std::string(ek)};
+    }
+    std::string dir = explicit_dir;
+    if (dir.empty()) {
+        if (const char* env = std::getenv("BBL_BRIDGE_MTLS_DIR");
+            env && *env) {
+            dir = env;
+        }
+    }
+    if (dir.empty()) dir = "/tmp/bbl_capture/mtls.fresh/paired";
+    std::error_code ec2;
+    std::string cert_path, key_path;
+    const std::string chain_suffix = "_" + dev_id + "_chain.pem";
+    const std::string key_suffix   = "_" + dev_id + "_key.pem";
+    for (auto& entry : std::filesystem::directory_iterator(dir, ec2)) {
+        const std::string name = entry.path().filename().string();
+        auto ends_with = [&](const std::string& suf) {
+            return name.size() >= suf.size() &&
+                   name.compare(name.size() - suf.size(),
+                                suf.size(), suf) == 0;
+        };
+        if (cert_path.empty() && ends_with(chain_suffix))
+            cert_path = entry.path().string();
+        else if (key_path.empty() && ends_with(key_suffix))
+            key_path = entry.path().string();
+        if (!cert_path.empty() && !key_path.empty()) break;
+    }
+    return {cert_path, key_path};
+}
+
+// Resolve raw_mqtt_publish.py the same way LanUplink does.
+static std::string tier2_resolve_helper() {
+    if (const char* env = std::getenv("BBL_BRIDGE_RAW_MQTT_HELPER");
+        env && *env) {
+        struct stat st;
+        if (::stat(env, &st) == 0) return env;
+    }
+    char buf[4096] = {0};
+    ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        std::string exe(buf, buf + n);
+        auto slash = exe.find_last_of('/');
+        const std::string dir = (slash == std::string::npos)
+            ? std::string(".") : exe.substr(0, slash);
+        const std::vector<std::string> candidates = {
+            dir + "/../../src/bambu_bridge/router/raw_mqtt_publish.py",
+            dir + "/../../../src/bambu_bridge/router/raw_mqtt_publish.py",
+            dir + "/raw_mqtt_publish.py",
+        };
+        for (const auto& p : candidates) {
+            struct stat st;
+            if (::stat(p.c_str(), &st) == 0) return p;
+        }
+    }
+    const std::string canonical =
+        "/home/danielwoz/BambuStudio-bridge/src/bambu_bridge/router/"
+        "raw_mqtt_publish.py";
+    struct stat st;
+    if (::stat(canonical.c_str(), &st) == 0) return canonical;
+    return {};
+}
+
+// Shell out to raw_mqtt_publish.py. Returns the helper's exit code.
+static int tier2_publish(const std::string& helper,
+                         const std::string& printer_ip,
+                         uint16_t           printer_port,
+                         const std::string& cert,
+                         const std::string& key,
+                         const std::string& access_code,
+                         const std::string& topic,
+                         const std::string& payload_json,
+                         uint8_t            qos) {
+    // Drop the payload to a temp file so the helper reads exact bytes
+    // (avoids stdin races / argv length limits).
+    char tmpl[] = "/tmp/bridgecli_tier2_XXXXXX";
+    int tfd = ::mkstemp(tmpl);
+    if (tfd < 0) {
+        std::fprintf(stderr,
+            "bridge-cli: tier2 mkstemp failed: %s\n", std::strerror(errno));
+        return 1;
+    }
+    ::write(tfd, payload_json.data(), payload_json.size());
+    ::close(tfd);
+
+    const std::string port_s = std::to_string(printer_port);
+    const std::string qos_s  = std::to_string(static_cast<int>(qos));
+
+    // Slicer-shaped client_id ("bridgecli:<unix>:<rand>" — same shape as
+    // LanUplink::make_client_id).
+    char cid[64];
+    {
+        std::random_device rd;
+        std::mt19937 rng(rd());
+        std::snprintf(cid, sizeof(cid), "bridgecli:%lld:%08x",
+                      static_cast<long long>(std::time(nullptr)),
+                      static_cast<unsigned>(rng()));
+    }
+
+    std::vector<const char*> argv = {
+        "python3", helper.c_str(),
+        "--ip",          printer_ip.c_str(),
+        "--port",        port_s.c_str(),
+        "--cert",        cert.c_str(),
+        "--key",         key.c_str(),
+        "--user",        "bblp",
+        "--pass",        access_code.c_str(),
+        "--client-id",   cid,
+        "--topic",       topic.c_str(),
+        "--qos",         qos_s.c_str(),
+        "--payload-file",tmpl,
+        nullptr,
+    };
+
+    int status = 0;
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        std::fprintf(stderr, "bridge-cli: tier2 fork failed: %s\n",
+                     std::strerror(errno));
+        ::unlink(tmpl);
+        return 1;
+    }
+    if (pid == 0) {
+        ::execvp("python3", const_cast<char* const*>(argv.data()));
+        std::_Exit(127);
+    }
+    if (::waitpid(pid, &status, 0) < 0) {
+        std::fprintf(stderr, "bridge-cli: tier2 waitpid failed: %s\n",
+                     std::strerror(errno));
+        ::unlink(tmpl);
+        return 1;
+    }
+    ::unlink(tmpl);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
+int cmd_tier2(int argc, char** argv) {
+    if (argc < 1) {
+        std::fprintf(stderr,
+            "bridge-cli: tier2 requires a command\n"
+            "  Commands:\n"
+            "    ledctrl       --led-node <chamber_light|work_light>\n"
+            "                  --led-mode <on|off|flashing>\n"
+            "    get-access-code\n"
+            "    nozzle        --type <stainless_steel|hardened_steel>\n"
+            "                  --diameter <0.2|0.4|0.6|0.8>\n"
+            "    timelapse     --control <enable|disable>\n"
+            "    record        --control <enable|disable>\n"
+            "    xcam          --module <module-name>\n"
+            "                  --control <on|off> [--print-halt]\n"
+            "  Common flags:\n"
+            "    --dev-id <id>          (required)\n"
+            "    --printer-ip <ip>      (required)\n"
+            "    --access-code <code>   (required)\n"
+            "    --printer-port <p>     (default 8883)\n"
+            "    --cert <path>          (override resolver)\n"
+            "    --key  <path>          (override resolver)\n"
+            "    --mtls-dir <path>      (override resolver dir)\n"
+            "    --qos <0|1>            (default 1)\n"
+            "    --sequence-id <id>     (default \"0\")\n"
+            "    --dry-run              (print JSON, don't publish)\n");
+        return 2;
+    }
+    const std::string sub = argv[0];
+    int idx = 1;
+
+    std::string dev_id, printer_ip, access_code;
+    std::string cert, key, mtls_dir;
+    int         printer_port = 8883;
+    int         qos = 1;
+    std::string seq;
+    bool        dry_run = false;
+
+    // sub-command specific
+    std::string led_node, led_mode;
+    std::string nozzle_type;
+    double      nozzle_diameter = 0.4;
+    std::string control;          // enable/disable
+    std::string xcam_module;
+    std::string xcam_control;     // on/off
+    bool        xcam_print_halt = false;
+
+    for (; idx < argc; ++idx) {
+        std::string a = argv[idx];
+        auto need_value = [&](const char* flag) -> const char* {
+            if (idx + 1 >= argc) {
+                std::fprintf(stderr, "bridge-cli: %s requires a value\n", flag);
+                return nullptr;
+            }
+            return argv[++idx];
+        };
+        if      (a == "--dev-id")        { auto v = need_value("--dev-id");        if (!v) return 2; dev_id = v; }
+        else if (a == "--printer-ip")    { auto v = need_value("--printer-ip");    if (!v) return 2; printer_ip = v; }
+        else if (a == "--printer-port")  { auto v = need_value("--printer-port");  if (!v) return 2; printer_port = std::atoi(v); }
+        else if (a == "--access-code")   { auto v = need_value("--access-code");   if (!v) return 2; access_code = v; }
+        else if (a == "--cert")          { auto v = need_value("--cert");          if (!v) return 2; cert = v; }
+        else if (a == "--key")           { auto v = need_value("--key");           if (!v) return 2; key = v; }
+        else if (a == "--mtls-dir")      { auto v = need_value("--mtls-dir");      if (!v) return 2; mtls_dir = v; }
+        else if (a == "--qos")           { auto v = need_value("--qos");           if (!v) return 2; qos = std::atoi(v); }
+        else if (a == "--sequence-id")   { auto v = need_value("--sequence-id");   if (!v) return 2; seq = v; }
+        else if (a == "--dry-run")       { dry_run = true; }
+        else if (a == "--led-node")      { auto v = need_value("--led-node");      if (!v) return 2; led_node = v; }
+        else if (a == "--led-mode")      { auto v = need_value("--led-mode");      if (!v) return 2; led_mode = v; }
+        else if (a == "--type")          { auto v = need_value("--type");          if (!v) return 2; nozzle_type = v; }
+        else if (a == "--diameter")      { auto v = need_value("--diameter");      if (!v) return 2; nozzle_diameter = std::atof(v); }
+        else if (a == "--control")       { auto v = need_value("--control");       if (!v) return 2; control = v; }
+        else if (a == "--module")        { auto v = need_value("--module");        if (!v) return 2; xcam_module = v; }
+        else if (a == "--print-halt")    { xcam_print_halt = true; }
+        else if (a == "-h" || a == "--help") { print_usage(stdout); return 0; }
+        else {
+            std::fprintf(stderr, "bridge-cli: tier2 unknown option '%s'\n", a.c_str());
+            return 2;
+        }
+    }
+
+    // Shape the JSON for the requested command.
+    std::string payload;
+    if      (sub == "ledctrl") {
+        if (led_node.empty() || led_mode.empty()) {
+            std::fprintf(stderr,
+                "bridge-cli: tier2 ledctrl needs --led-node and --led-mode\n");
+            return 2;
+        }
+        payload = Slic3r::bridge::tier2::system_ledctrl(seq, led_node, led_mode);
+    }
+    else if (sub == "get-access-code") {
+        payload = Slic3r::bridge::tier2::system_get_access_code(seq);
+    }
+    else if (sub == "nozzle") {
+        if (nozzle_type.empty()) {
+            std::fprintf(stderr,
+                "bridge-cli: tier2 nozzle needs --type and --diameter\n");
+            return 2;
+        }
+        payload = Slic3r::bridge::tier2::system_set_accessories_nozzle(
+            seq, nozzle_type, nozzle_diameter);
+    }
+    else if (sub == "timelapse") {
+        if (control.empty()) {
+            std::fprintf(stderr,
+                "bridge-cli: tier2 timelapse needs --control enable|disable\n");
+            return 2;
+        }
+        payload = Slic3r::bridge::tier2::camera_ipcam_timelapse(seq, control);
+    }
+    else if (sub == "record") {
+        if (control.empty()) {
+            std::fprintf(stderr,
+                "bridge-cli: tier2 record needs --control enable|disable\n");
+            return 2;
+        }
+        payload = Slic3r::bridge::tier2::camera_ipcam_record_set(seq, control);
+    }
+    else if (sub == "xcam") {
+        if (xcam_module.empty()) {
+            std::fprintf(stderr,
+                "bridge-cli: tier2 xcam needs --module <name> and --control on|off\n");
+            return 2;
+        }
+        // accept on/off or true/false
+        const bool ctl = (control == "on" || control == "true" || control == "enable");
+        payload = Slic3r::bridge::tier2::xcam_control_set(
+            seq, xcam_module, ctl, xcam_print_halt);
+    }
+    else {
+        std::fprintf(stderr, "bridge-cli: tier2 unknown command '%s'\n", sub.c_str());
+        return 2;
+    }
+
+    std::cout << payload << '\n';
+    if (dry_run) return 0;
+
+    if (dev_id.empty() || printer_ip.empty() || access_code.empty()) {
+        std::fprintf(stderr,
+            "bridge-cli: tier2 publish needs --dev-id, --printer-ip, --access-code "
+            "(use --dry-run to just print the JSON)\n");
+        return 2;
+    }
+    auto mtls = tier2_resolve_mtls(dev_id, cert, key, mtls_dir);
+    if (mtls.first.empty() || mtls.second.empty()) {
+        std::fprintf(stderr,
+            "bridge-cli: tier2 could not resolve mTLS cert+key for dev=%s "
+            "(tried --cert/--key, $BBL_BRIDGE_MTLS_CERT_%s, scan of %s)\n",
+            dev_id.c_str(), dev_id.c_str(),
+            mtls_dir.empty() ? "/tmp/bbl_capture/mtls.fresh/paired"
+                             : mtls_dir.c_str());
+        return 1;
+    }
+    const std::string helper = tier2_resolve_helper();
+    if (helper.empty()) {
+        std::fprintf(stderr,
+            "bridge-cli: tier2 raw_mqtt_publish.py not found "
+            "(set BBL_BRIDGE_RAW_MQTT_HELPER)\n");
+        return 1;
+    }
+    const std::string topic = std::string("device/") + dev_id + "/request";
+    std::fprintf(stderr,
+        "bridge-cli: tier2 publishing dev=%s topic=%s "
+        "cert=%s key=%s ip=%s:%d qos=%d bytes=%zu\n",
+        dev_id.c_str(), topic.c_str(),
+        mtls.first.c_str(), mtls.second.c_str(),
+        printer_ip.c_str(), printer_port, qos, payload.size());
+    return tier2_publish(helper, printer_ip,
+                         static_cast<uint16_t>(printer_port),
+                         mtls.first, mtls.second, access_code,
+                         topic, payload, static_cast<uint8_t>(qos));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1252,6 +1615,9 @@ int main(int argc, char** argv) {
     }
     if (sub == "proxy") {
         return cmd_proxy(argc - 2, argv + 2);
+    }
+    if (sub == "tier2") {
+        return cmd_tier2(argc - 2, argv + 2);
     }
     if (sub == "-h" || sub == "--help" || sub == "help") {
         print_usage(stdout);
