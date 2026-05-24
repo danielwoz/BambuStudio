@@ -68,6 +68,8 @@ add_library(bambu_bridge STATIC
     CloudSession.hpp
     CloudDeviceList.cpp
     CloudDeviceList.hpp
+    EncMsgEnvelope.cpp
+    EncMsgEnvelope.hpp
     tls/CertFactory.cpp
     tls/CertFactory.hpp
     server/SsdpResponder.cpp
@@ -93,6 +95,8 @@ add_library(bambu_bridge STATIC
     router/LanUplink.hpp
     router/RawMqttPublisher.cpp
     router/RawMqttPublisher.hpp
+    router/Tier2Commands.cpp
+    router/Tier2Commands.hpp
     router/CloudUplink.cpp
     router/CloudUplink.hpp
     router/NullUploadSink.cpp
@@ -109,6 +113,8 @@ add_library(bambu_bridge STATIC
     router/LanCameraSource.hpp
     router/CloudCameraSource.cpp
     router/CloudCameraSource.hpp
+    router/JpegCameraSource.cpp
+    router/JpegCameraSource.hpp
     router/UplinkHealth.cpp
     router/UplinkHealth.hpp
     router/SessionRouter.cpp

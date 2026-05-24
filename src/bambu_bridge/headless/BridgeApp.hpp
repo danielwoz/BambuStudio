@@ -88,6 +88,7 @@ namespace router { class LanUploadSink;      }
 namespace router { class CloudUploadSink;    }
 namespace router { class LanCameraSource;    }
 namespace router { class CloudCameraSource;  }
+namespace router { class JpegCameraSource;   }
 namespace router { class NullCameraSource;   }
 namespace router { class SessionRouter;      }
 namespace router { class UploadSinkRouter;   }
@@ -500,6 +501,9 @@ private:
         std::shared_ptr<router::CameraSourceRouter>       cam_router;
         std::shared_ptr<router::LanCameraSource>          lan_cam;
         std::shared_ptr<router::CloudCameraSource>        cloud_cam;
+        // Only populated for A1/P1-series models per
+        // router::is_jpeg_camera_model — see add_device_locked.
+        std::shared_ptr<router::JpegCameraSource>         jpeg_cam;
     };
     mutable std::mutex                                    m_devices_mu;
     std::map<std::string, DeviceState>                    m_devices;

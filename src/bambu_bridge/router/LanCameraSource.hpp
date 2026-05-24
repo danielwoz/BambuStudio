@@ -77,6 +77,18 @@ struct LanCameraSourceConfig {
     // sources. Headless mode leaves it empty and the source falls
     // back to its own rtsps:// builder.
     std::string url_override;
+
+    // Optional secondary URL tried only when the primary URL's
+    // `bambu_start_stream` fails with the plugin's -107 / -113 codes
+    // (TCP refused / unreachable). On H2/X1 firmware where the user
+    // has not enabled LAN RTSPS via the printer's touchscreen, port
+    // 322 is closed but port 6000 (the LAN-local control/video port)
+    // stays open and serves an alternate `bambu:///local/...?port=6000`
+    // camera stream. BridgeApp populates this with that fallback URL
+    // so the bridge can deliver video without cloud TUTK relay even
+    // when LAN RTSPS is disabled in firmware. Empty disables the
+    // fallback.
+    std::string local_fallback_url;
 };
 
 class LanCameraSource : public server::ICameraSource {

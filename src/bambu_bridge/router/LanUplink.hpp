@@ -49,6 +49,7 @@ namespace Slic3r {
 namespace bridge {
 
 class BambuNetworkingPluginHandle;   // forward, owned by caller as shared_ptr.
+class EncMsgEnvelope;                 // forward; Ship 7 native enc_msg.
 
 namespace router {
 
@@ -94,6 +95,17 @@ public:
     // Returns the currently-attached handle, or nullptr. Useful for the
     // health monitor.
     std::shared_ptr<BambuNetworkingPluginHandle> plugin_handle() const;
+
+    // Ship 7 — install a native enc_msg envelope wrapper. When installed,
+    // `on_publish` will wrap print.* payloads with the plugin-compatible
+    // RSA-SHA256-signed envelope BEFORE handing them to the cert+key
+    // paho publish helper. Without an envelope wrapper, print.* payloads
+    // are still published via the cert+key path but unsigned — newer
+    // firmware may reject those.
+    //
+    // Pass nullptr to detach. Caller retains ownership.
+    void attach_enc_msg_envelope(std::shared_ptr<EncMsgEnvelope> envelope);
+    std::shared_ptr<EncMsgEnvelope> enc_msg_envelope() const;
 
     // Register the device the bridge mirrors. Triggers `connect_printer`
     // on the plugin for this dev_id immediately. Idempotent on the same

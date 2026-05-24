@@ -23,6 +23,7 @@
 #include "../router/CloudUploadSink.hpp"
 #include "../router/LanCameraSource.hpp"
 #include "../router/CloudCameraSource.hpp"
+#include "../router/JpegCameraSource.hpp"
 #include "../router/NullCameraSource.hpp"
 #include "../router/SessionRouter.hpp"
 #include "../router/UploadSinkRouter.hpp"
@@ -900,6 +901,26 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         lc.slicer_dev_ver = m_cfg.ssdp_default_firmware;
         lc.slicer_cli_id  = m_cfg.slicer_cli_id;
         lc.slicer_cli_ver = m_cfg.slicer_cli_ver;
+        // LAN ladder: if the printer has LAN RTSPS disabled in firmware
+        // (`ipcam.rtsp_url == "disable"`, the default on shipped H2S/
+        // H2D firmware 01.02.00.00) port 322 is closed and the live555
+        // client returns -107. Port 6000 stays open and serves the
+        // same video over the `bambu:///local/...?port=6000` form.
+        // We build that URL once here so LanCameraSource can retry the
+        // primary rtsps:// attempt against it without re-discovering
+        // the credentials. Same query-param recipe as MediaPlayCtrl
+        // uses for storage on port 6000 — kept aligned so the plugin
+        // fingerprints the call shape as legitimate.
+        if (!lan_ip.empty() && !access_code.empty()) {
+            std::string lf = "bambu:///local/" + lan_ip
+                             + ".?port=6000&user=bblp&passwd=" + access_code;
+            lf += "&device="  + dev_id;
+            lf += "&net_ver=" + m_cfg.slicer_net_ver;
+            lf += "&dev_ver=" + m_cfg.ssdp_default_firmware;
+            lf += "&cli_id="  + m_cfg.slicer_cli_id;
+            lf += "&cli_ver=" + m_cfg.slicer_cli_ver;
+            lc.local_fallback_url = std::move(lf);
+        }
         state.lan_cam  = std::make_shared<router::LanCameraSource>(lc);
         state.lan_cam->attach_source_handle(m_bambu_source);
         router::CloudCameraSourceConfig cc;
@@ -916,6 +937,35 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         state.cam_router->set_cloud_source(state.cloud_cam);
         state.cam_router->set_null_source(m_null_camera);
         state.cam_router->set_health_monitor(m_health);
+
+        // A1 / P1 series speak the native JPEG-on-port-6000 protocol
+        // (OpenBambuAPI/video.md). For those models, prefer the
+        // JpegCameraSource over LanCameraSource (which would try RTSPS
+        // on 322 — A1/P1 don't expose that) and over CloudCameraSource
+        // (which goes through the proprietary plugin's TUTK relay).
+        // For X1/H2-series models, leave the JPEG source null and the
+        // router falls back to existing LAN→Cloud preference.
+        if (router::is_jpeg_camera_model(state.model)) {
+            router::JpegCameraSourceConfig jc;
+            jc.dev_id      = dev_id;
+            jc.printer_ip  = lan_ip;
+            jc.access_code = access_code;
+            state.jpeg_cam = std::make_shared<router::JpegCameraSource>(jc);
+            state.cam_router->set_jpeg_source(state.jpeg_cam);
+
+            router::CameraSourceRouter::Policy pol;
+            pol.prefer_lan          = true;
+            pol.prefer_jpeg         = true;
+            pol.allow_null_fallback = false;
+            state.cam_router->set_policy(pol);
+
+            std::fprintf(stderr,
+                "[bridge-app] dev=%s model=%s -> using JpegCameraSource "
+                "(LAN port 6000, OpenBambuAPI video.md)\n",
+                dev_id.c_str(),
+                router::jpeg_camera_model_tag(state.model).c_str());
+            std::fflush(stderr);
+        }
 
         if (m_rtsp) {
             server::RtspVirtualDevice rdev;
@@ -1050,6 +1100,17 @@ void BridgeApp::update_lan_ip_locked(DeviceState&       state,
     lc.slicer_dev_ver = m_cfg.ssdp_default_firmware; // see ctor-site comment in connect path
     lc.slicer_cli_id  = m_cfg.slicer_cli_id;
     lc.slicer_cli_ver = m_cfg.slicer_cli_ver;
+    // Local-port-6000 fallback URL, kept aligned with add_device_locked.
+    if (!lan_ip.empty() && !state.access_code.empty()) {
+        std::string lf = "bambu:///local/" + lan_ip
+                         + ".?port=6000&user=bblp&passwd=" + state.access_code;
+        lf += "&device="  + state.dev_id;
+        lf += "&net_ver=" + m_cfg.slicer_net_ver;
+        lf += "&dev_ver=" + m_cfg.ssdp_default_firmware;
+        lf += "&cli_id="  + m_cfg.slicer_cli_id;
+        lf += "&cli_ver=" + m_cfg.slicer_cli_ver;
+        lc.local_fallback_url = std::move(lf);
+    }
     state.lan_cam  = std::make_shared<router::LanCameraSource>(lc);
     state.lan_cam->attach_source_handle(m_bambu_source);
     if (state.cam_router) state.cam_router->set_lan_source(state.lan_cam);

@@ -78,13 +78,33 @@ public:
     // disambiguate via `is_open()` (false means EOS / source dropped).
     virtual std::optional<VideoFrame> next_frame(int timeout_ms) = 0;
 
+    // Codec advertised in StreamInfo. `H264_AnnexB` is the historical
+    // default and matches NullCameraSource / LanCameraSource /
+    // CloudCameraSource (all of which produce H.264 NAL units in Annex-B
+    // form). `MotionJpeg` is for sources that emit raw JPEG frames (one
+    // JPEG per VideoFrame, in `nal_data`) — e.g. `JpegCameraSource` for
+    // A1 / P1-series printers, which speak the OpenBambuAPI port-6000
+    // JPEG-streaming protocol. Defaults to `H264_AnnexB` so existing
+    // sources/tests need no change.
+    //
+    // RtspServer's RTP packetiser currently only handles H264_AnnexB;
+    // adding RFC-2435 RTP-JPEG packetisation is tracked separately. A
+    // MotionJpeg source still surfaces `next_frame()` and is fully
+    // unit-testable in isolation.
+    enum class Codec {
+        H264_AnnexB = 0,
+        MotionJpeg  = 1,
+    };
+
     // Per-stream advertising info. Filled in once `open()` succeeds and
     // remains stable for the lifetime of the open source. The SDP-shaped
-    // fields (sps, pps) MUST be raw NAL units (no start code).
+    // fields (sps, pps) MUST be raw NAL units (no start code) and are
+    // only meaningful when `codec == H264_AnnexB`.
     struct StreamInfo {
         int                   width  = 0;
         int                   height = 0;
         int                   fps    = 0;
+        Codec                 codec  = Codec::H264_AnnexB;
         std::vector<uint8_t>  sps;
         std::vector<uint8_t>  pps;
     };

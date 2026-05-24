@@ -46,15 +46,24 @@ namespace router {
 
 class LanCameraSource;
 class CloudCameraSource;
+class JpegCameraSource;
 class NullCameraSource;
 class UplinkHealthMonitor;
 
 class CameraSourceRouter final : public server::ICameraSource {
 public:
-    enum class Choice { None, Lan, Cloud, Null };
+    enum class Choice { None, Lan, Cloud, Jpeg, Null };
 
     struct Policy {
         bool prefer_lan          = true;
+        // When true and a JpegCameraSource is configured, prefer the JPEG
+        // source over both LAN and Cloud sources. BridgeApp sets this for
+        // A1 / P1-series printers where JPEG-on-6000 is the native LAN
+        // camera protocol (X1/H2 series use H.264 via LanCameraSource —
+        // for those, prefer_jpeg stays false and the JPEG source is left
+        // null). See `JpegCameraSource::is_jpeg_camera_model` for the
+        // model-gating predicate.
+        bool prefer_jpeg         = false;
         bool allow_null_fallback = false;
     };
 
@@ -66,6 +75,7 @@ public:
 
     void set_lan_source   (std::shared_ptr<LanCameraSource>     lan);
     void set_cloud_source (std::shared_ptr<CloudCameraSource>   cloud);
+    void set_jpeg_source  (std::shared_ptr<JpegCameraSource>    jpeg);
     void set_null_source  (std::shared_ptr<NullCameraSource>    null);
     void set_health_monitor(std::shared_ptr<UplinkHealthMonitor> monitor);
     void set_policy(Policy p);
@@ -92,6 +102,7 @@ private:
     mutable std::mutex                         m_mu;
     std::shared_ptr<LanCameraSource>           m_lan;
     std::shared_ptr<CloudCameraSource>         m_cloud;
+    std::shared_ptr<JpegCameraSource>          m_jpeg;
     std::shared_ptr<NullCameraSource>          m_null;
     std::shared_ptr<UplinkHealthMonitor>       m_health;
     Policy                                     m_policy;
