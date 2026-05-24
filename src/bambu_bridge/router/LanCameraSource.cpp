@@ -110,6 +110,128 @@ std::string LanCameraSource::build_url() const {
     return url;
 }
 
+// One pass: try a single URL through bambu_create / open / start_stream.
+// On success returns {tunnel, info}; on failure logs and returns nullptr
+// tunnel + best-effort cleanup. `tag` is a short label ("rtsps", "local")
+// included in log lines so cross-URL fallback transitions are clear.
+//
+// Encodes the same per-call invariants the GUI's wxMediaCtrl3 path
+// requires (set_logger between Create and Open, 3 s would_block grace
+// window before treating bambu_start_stream as a hard failure).
+//
+// Returns the new tunnel on success, nullptr on failure. The stream
+// info is written into `out_si` on success only.
+static void* try_open_url(BambuSourceHandle& handle,
+                          const std::string& dev_id,
+                          const std::string& tag,
+                          const std::string& url,
+                          server::ICameraSource::StreamInfo& out_si,
+                          std::vector<uint8_t>& out_scratch,
+                          int& out_last_rc) {
+    out_last_rc = 0;
+    std::fprintf(stderr,
+        "[lan-camera] open dev=%s tag=%s url=%s\n",
+        dev_id.c_str(), tag.c_str(), url.c_str());
+    std::fflush(stderr);
+
+    void* tunnel = nullptr;
+    int rc = handle.bambu_create(&tunnel, url);
+    if (rc != 0 || !tunnel) {
+        std::fprintf(stderr,
+            "[lan-camera] open dev=%s tag=%s FAIL: bambu_create rc=%d tunnel=%p\n",
+            dev_id.c_str(), tag.c_str(), rc, tunnel);
+        std::fflush(stderr);
+        out_last_rc = rc;
+        return nullptr;
+    }
+
+    // The GUI (wxMediaCtrl3.cpp:288) sets a logger BETWEEN Create and
+    // Open. Without it the plugin appears to fingerprint the caller as
+    // unauthenticated and `Bambu_StartStream` later returns -107.
+    struct LogCtx { std::string dev_id; std::string tag; };
+    static thread_local LogCtx s_log_ctx;
+    s_log_ctx.dev_id = dev_id;
+    s_log_ctx.tag    = tag;
+    handle.bambu_set_logger(tunnel,
+        +[](void* ctx, int level, const char* msg) {
+            auto* lc = static_cast<LogCtx*>(ctx);
+            std::fprintf(stderr,
+                "[lan-camera] bambu-log dev=%s tag=%s lvl=%d %s\n",
+                lc ? lc->dev_id.c_str() : "?",
+                lc ? lc->tag.c_str()    : "?",
+                level, msg ? msg : "");
+            std::fflush(stderr);
+        },
+        &s_log_ctx);
+
+    rc = handle.bambu_open(tunnel);
+    if (rc != 0) {
+        std::fprintf(stderr,
+            "[lan-camera] open dev=%s tag=%s FAIL: bambu_open rc=%d\n",
+            dev_id.c_str(), tag.c_str(), rc);
+        std::fflush(stderr);
+        handle.bambu_destroy(tunnel);
+        out_last_rc = rc;
+        return nullptr;
+    }
+    // The printer often returns Bambu_would_block (rc=2) for the first
+    // few hundred ms after the tunnel comes up — the camera takes a
+    // moment to wake. PrinterFileSystem handles this with a 3s retry
+    // loop in Reconnect(); mirror that here. Without the loop the
+    // first-attempt liveview always fails on the H2S/H2D, even though
+    // the printer is perfectly happy to stream once primed.
+    int start_loops = 0;
+    {
+        const auto start = std::chrono::steady_clock::now();
+        const auto timeout = std::chrono::seconds(3);
+        do {
+            rc = handle.bambu_start_stream(tunnel, /*video=*/true);
+            if (rc != kBambuWouldBlock) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            ++start_loops;
+        } while (std::chrono::steady_clock::now() - start < timeout);
+    }
+    if (rc != 0) {
+        std::fprintf(stderr,
+            "[lan-camera] open dev=%s tag=%s FAIL: bambu_start_stream rc=%d (after %d would_block retries)\n",
+            dev_id.c_str(), tag.c_str(), rc, start_loops);
+        std::fflush(stderr);
+        handle.bambu_close(tunnel);
+        handle.bambu_destroy(tunnel);
+        out_last_rc = rc;
+        return nullptr;
+    }
+    std::fprintf(stderr,
+        "[lan-camera] open dev=%s tag=%s OK (bambu_start_stream succeeded after %d would_block retries)\n",
+        dev_id.c_str(), tag.c_str(), start_loops);
+    std::fflush(stderr);
+
+    // Pull stream info for the SDP advertising. Find the first VIDEO
+    // stream and cache its dimensions / fps. The `format_buffer` holds
+    // SPS/PPS for H.264 in Annex-B form.
+    out_si      = server::ICameraSource::StreamInfo{};
+    out_si.fps  = 30;
+    const int count = handle.bambu_get_stream_count(tunnel);
+    for (int i = 0; i < count; ++i) {
+        MirrorBambu_StreamInfo bi{};
+        if (handle.bambu_get_stream_info(tunnel, i, &bi) != 0) continue;
+        if (bi.type != kStreamTypeVideo) continue;
+        out_si.width  = bi.format.video.width;
+        out_si.height = bi.format.video.height;
+        out_si.fps    = bi.format.video.frame_rate > 0 ? bi.format.video.frame_rate : out_si.fps;
+        if (bi.format_size > 0 && bi.format_buffer) {
+            out_si.sps.assign(bi.format_buffer,
+                              bi.format_buffer + bi.format_size);
+        }
+        const int scratch = bi.max_frame_size > 0
+                            ? bi.max_frame_size + 64
+                            : 256 * 1024;
+        out_scratch.reserve(static_cast<std::size_t>(scratch));
+        break;
+    }
+    return tunnel;
+}
+
 bool LanCameraSource::open() {
     std::shared_ptr<BambuSourceHandle> handle;
     {
@@ -134,113 +256,50 @@ bool LanCameraSource::open() {
         return false;
     }
 
-    const std::string u = build_url();
-    std::fprintf(stderr,
-        "[lan-camera] open dev=%s url=%s\n",
-        m_cfg.dev_id.c_str(), u.c_str());
-    std::fflush(stderr);
+    // Two-step LAN ladder: prefer the primary URL (typically RTSPS via
+    // port 322), but fall back to the printer's local-protocol port
+    // 6000 stream when the primary fails at start_stream. On modern H2
+    // firmware where the user has not enabled LAN RTSPS via the
+    // touchscreen, port 322 is closed and the plugin's live555 client
+    // returns -107 within a few hundred ms; port 6000 stays open and
+    // serves the same video over the bambu:///local/...?port=6000 form.
+    //
+    // We only fall back when the primary tag is "rtsps" (or a custom
+    // override that ISN'T already a local URL) AND a fallback URL was
+    // supplied by the caller. If the caller didn't bother, keep the
+    // historical single-attempt behaviour so a misconfigured deploy
+    // fails loud instead of silently re-trying.
+    const std::string primary_url = build_url();
+    const bool primary_is_local =
+        primary_url.find("bambu:///local/") != std::string::npos;
+    const std::string primary_tag = primary_is_local ? "local" : "rtsps";
 
-    void* tunnel = nullptr;
-    int rc = handle->bambu_create(&tunnel, u);
-    if (rc != 0 || !tunnel) {
-        std::fprintf(stderr,
-            "[lan-camera] open dev=%s FAIL: bambu_create rc=%d tunnel=%p\n",
-            m_cfg.dev_id.c_str(), rc, tunnel);
-        std::fflush(stderr);
-        return false;
-    }
-    // The GUI (wxMediaCtrl3.cpp:288) sets a logger BETWEEN Create and
-    // Open. Without it the plugin appears to fingerprint the caller as
-    // unauthenticated and `Bambu_StartStream` later returns -107.
-    // Mirror byte-for-byte: install a plain C-callback that tags each
-    // line with the dev_id this LanCameraSource owns (passed via the
-    // void* ctx). C-ABI signature matches BambuTunnel.h `Logger`.
-    struct LogCtx { std::string dev_id; };
-    static thread_local LogCtx s_log_ctx;
-    s_log_ctx.dev_id = m_cfg.dev_id;
-    handle->bambu_set_logger(tunnel,
-        +[](void* ctx, int level, const char* msg) {
-            auto* lc = static_cast<LogCtx*>(ctx);
-            std::fprintf(stderr,
-                "[lan-camera] bambu-log dev=%s lvl=%d %s\n",
-                lc ? lc->dev_id.c_str() : "?", level, msg ? msg : "");
-            std::fflush(stderr);
-        },
-        &s_log_ctx);
-    rc = handle->bambu_open(tunnel);
-    if (rc != 0) {
-        std::fprintf(stderr,
-            "[lan-camera] open dev=%s FAIL: bambu_open rc=%d\n",
-            m_cfg.dev_id.c_str(), rc);
-        std::fflush(stderr);
-        handle->bambu_destroy(tunnel);
-        return false;
-    }
-    // The printer often returns Bambu_would_block (rc=2) for the first
-    // few hundred ms after the tunnel comes up — the camera takes a
-    // moment to wake. PrinterFileSystem handles this with a 3s retry
-    // loop in Reconnect(); mirror that here. Without the loop the
-    // first-attempt liveview always fails on the H2S/H2D, even though
-    // the printer is perfectly happy to stream once primed.
-    int start_loops = 0;
-    {
-        const auto start = std::chrono::steady_clock::now();
-        const auto timeout = std::chrono::seconds(3);
-        do {
-            rc = handle->bambu_start_stream(tunnel, /*video=*/true);
-            if (rc != kBambuWouldBlock) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            ++start_loops;
-        } while (std::chrono::steady_clock::now() - start < timeout);
-    }
-    if (rc != 0) {
-        std::fprintf(stderr,
-            "[lan-camera] open dev=%s FAIL: bambu_start_stream rc=%d (after %d would_block retries)\n",
-            m_cfg.dev_id.c_str(), rc, start_loops);
-        std::fflush(stderr);
-        handle->bambu_close(tunnel);
-        handle->bambu_destroy(tunnel);
-        return false;
-    }
-    std::fprintf(stderr,
-        "[lan-camera] open dev=%s OK (bambu_start_stream succeeded after %d would_block retries)\n",
-        m_cfg.dev_id.c_str(), start_loops);
-    std::fflush(stderr);
-
-    // Pull stream info for the SDP advertising. Find the first VIDEO
-    // stream and cache its dimensions / fps. The `format_buffer` holds
-    // SPS/PPS for H.264 in Annex-B form; we don't parse it out here
-    // (the RtspServer fills sprop-parameter-sets from a separate path),
-    // but we keep the cached info around for `info()`.
     server::ICameraSource::StreamInfo si;
-    si.fps = 30; // sensible default
-    const int count = handle->bambu_get_stream_count(tunnel);
-    for (int i = 0; i < count; ++i) {
-        MirrorBambu_StreamInfo bi{};
-        if (handle->bambu_get_stream_info(tunnel, i, &bi) != 0) continue;
-        if (bi.type != kStreamTypeVideo) continue;
-        si.width  = bi.format.video.width;
-        si.height = bi.format.video.height;
-        si.fps    = bi.format.video.frame_rate > 0 ? bi.format.video.frame_rate : si.fps;
-        // Stash the library-owned format_buffer bytes (SPS+PPS Annex-B)
-        // into our own scratch so the consumer can read them safely after
-        // ReadSample invalidates the library's pointer. We split out raw
-        // SPS / PPS lazily in info() if needed; for now stash both lumps
-        // joined in `sps` (the SDP packetiser expects raw NAL form, and
-        // for a non-AVC1 stream this won't matter).
-        if (bi.format_size > 0 && bi.format_buffer) {
-            si.sps.assign(bi.format_buffer,
-                          bi.format_buffer + bi.format_size);
-        }
-        // Pre-allocate scratch so next_frame() doesn't malloc per call.
-        // The library only guarantees `max_frame_size` is a hint; round
-        // up generously.
-        const int scratch = bi.max_frame_size > 0
-                            ? bi.max_frame_size + 64
-                            : 256 * 1024;
-        m_scratch.reserve(static_cast<std::size_t>(scratch));
-        break;
+    int last_rc = 0;
+    void* tunnel = try_open_url(*handle, m_cfg.dev_id,
+                                primary_tag, primary_url,
+                                si, m_scratch, last_rc);
+
+    if (!tunnel
+        && !primary_is_local
+        && !m_cfg.local_fallback_url.empty()) {
+        // Fall back to LAN port-6000 local form. -107 from live555 is
+        // the typical "TCP refused / firmware disabled RTSP" code; we
+        // also retry on any non-zero rc out of paranoia, since the
+        // worst case is a single extra create/open round-trip.
+        std::fprintf(stderr,
+            "[lan-camera] open dev=%s primary tag=%s rc=%d failed, "
+            "trying local fallback url=%s\n",
+            m_cfg.dev_id.c_str(), primary_tag.c_str(), last_rc,
+            m_cfg.local_fallback_url.c_str());
+        std::fflush(stderr);
+        tunnel = try_open_url(*handle, m_cfg.dev_id,
+                              "local-fallback",
+                              m_cfg.local_fallback_url,
+                              si, m_scratch, last_rc);
     }
+
+    if (!tunnel) return false;
 
     {
         std::lock_guard<std::mutex> lk(m_mu);
