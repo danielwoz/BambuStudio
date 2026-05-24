@@ -44,6 +44,7 @@
 #include "RtspServer.hpp"
 
 #include "ICameraSource.hpp"
+#include "RtspJpegPacketiser.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -362,6 +363,264 @@ bool write_rtsp_response(SSL* ssl, int code, const char* status,
     return ssl_write_all(ssl, s.data(), s.size());
 }
 
+// Forward declaration: RFC 6184 / RFC 2435 packetisers share the
+// interleaved RTP-over-TLS sender defined a few hundred lines below.
+bool send_rtp_interleaved(SSL* ssl, uint8_t channel,
+                          uint16_t& seq, uint32_t ts, uint32_t ssrc,
+                          uint8_t pt, bool marker,
+                          const uint8_t* payload, size_t plen);
+
+// ---------------------------------------------------------------------------
+// RFC 2435 RTP/JPEG packetisation.
+// ---------------------------------------------------------------------------
+//
+// What RFC 2435 wants on the wire (per RTP packet):
+//
+//   Main JPEG header (8 bytes, every packet of a frame):
+//     Type-specific (1)  | Fragment offset (3) |
+//     Type (1)           | Q (1)               |
+//     Width (1, /8 px)   | Height (1, /8 px)
+//
+//   Optional Quantization Table header (only on FIRST packet, when Q in
+//   128..255 — we always set Q=255 so receivers don't need a static table):
+//     MBZ (1) | Precision (1) | Length (2, BE) | <quant table bytes>
+//
+//   Payload bytes: the JPEG entropy-coded scan data only (no JFIF / DQT /
+//   SOF / SOS headers). The decoder reconstructs those from the RTP-JPEG
+//   header fields + quant tables.
+//
+// What we implement:
+//   - Type=1 (4:2:0) or Type=0 (4:2:2), picked from the SOF horizontal
+//     sampling factor of component 1 (Y). 4:2:2 cameras like the A1
+//     report (Hi=2,Vi=1); 4:2:0 cameras report (Hi=2,Vi=2).
+//   - Q=255 + Quantization Table header so we don't depend on receiver-side
+//     static tables. Precision=0 (8-bit) — every IP camera ships 8-bit DQTs.
+//   - Width/Height in units of 8 px; capped at 2040 px (RFC 2435 §3.1.5).
+//   - Fragment offset advances per-fragment; M (marker) bit set on the
+//     final fragment of each frame.
+//   - Restart Marker Header: NOT emitted. Most IP cameras (incl A1) don't
+//     use restart markers, and many decoders mishandle this header anyway.
+//     If we ever see DRI > 0 in the source frame we'll need to extend.
+//
+// Sources whose codec is MotionJpeg deliver one whole JPEG per VideoFrame in
+// `nal_data`. The packetiser parses the JFIF in-place, extracts dimensions
+// + quant tables + scan-data offset/length, and emits one or more RTP
+// packets all sharing the same timestamp.
+
+// Type alias: anonymous-namespace shorthand for the test-exposed parse struct.
+using JpegParse = RtpJpegParse;
+
+// Parse a JFIF buffer. Tolerates missing JFIF APP0 marker — many IP cameras
+// emit raw "SOI ... DQT ... SOF ... SOS ... data ... EOI" without an APP0.
+// Returns ok=true iff width/height/scan-data and at least one quant table
+// were found.
+JpegParse parse_jfif(const uint8_t* p, size_t n) {
+    JpegParse out;
+    if (n < 4 || p[0] != 0xFF || p[1] != 0xD8) return out;  // SOI
+    size_t i = 2;
+    while (i + 1 < n) {
+        if (p[i] != 0xFF) { ++i; continue; }
+        // Skip fill bytes.
+        while (i < n && p[i] == 0xFF) ++i;
+        if (i >= n) break;
+        const uint8_t marker = p[i++];
+        if (marker == 0xD9 || marker == 0xDA) {
+            // EOI or SOS — SOS gets its own handling below.
+            if (marker == 0xDA) {
+                // SOS: 2-byte length, then `Ns` + 2*Ns + 3 bytes of header,
+                // then scan data through EOI.
+                if (i + 2 > n) return out;
+                const uint16_t sos_len =
+                    (static_cast<uint16_t>(p[i]) << 8) | p[i + 1];
+                if (i + sos_len > n) return out;
+                const size_t scan_start = i + sos_len;
+                // Walk to EOI (search for FF D9, skipping stuffed FF 00 and
+                // restart-marker FF D0..D7).
+                size_t j = scan_start;
+                size_t scan_end = n;
+                while (j + 1 < n) {
+                    if (p[j] != 0xFF) { ++j; continue; }
+                    const uint8_t m2 = p[j + 1];
+                    if (m2 == 0x00 ||
+                        (m2 >= 0xD0 && m2 <= 0xD7)) { j += 2; continue; }
+                    if (m2 == 0xD9) { scan_end = j; break; }
+                    // Some other marker before EOI — unexpected but treat as
+                    // end-of-scan to avoid corrupting downstream data.
+                    scan_end = j;
+                    break;
+                }
+                out.scan_off = scan_start;
+                out.scan_len = (scan_end > scan_start) ? (scan_end - scan_start) : 0;
+                break;
+            }
+            // EOI without prior SOS — malformed.
+            return out;
+        }
+        // Standalone markers with no length: D0..D7 (RST), 01, 02 etc.
+        if ((marker >= 0xD0 && marker <= 0xD7) ||
+            marker == 0x01) {
+            continue;
+        }
+        // All other markers carry a 2-byte length covering the length bytes.
+        if (i + 2 > n) return out;
+        const uint16_t seg_len =
+            (static_cast<uint16_t>(p[i]) << 8) | p[i + 1];
+        if (seg_len < 2 || i + seg_len > n) return out;
+        const uint8_t* seg = p + i + 2;
+        const size_t   slen = seg_len - 2;
+
+        if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2) {
+            // SOF0 / SOF1 / SOF2: precision(1), height(2 BE), width(2 BE),
+            // Nf(1), then Nf*(Ci, HiVi, Tqi).
+            if (slen < 6) return out;
+            out.height = (static_cast<int>(seg[1]) << 8) | seg[2];
+            out.width  = (static_cast<int>(seg[3]) << 8) | seg[4];
+            const uint8_t nf = seg[5];
+            if (nf >= 1 && slen >= 6u + static_cast<size_t>(nf) * 3u) {
+                // Component 1 sampling factors: high nibble = H, low = V.
+                const uint8_t hv = seg[6 + 1];   // (Ci, HiVi, Tqi)
+                const uint8_t h  = (hv >> 4) & 0x0F;
+                const uint8_t v  = hv & 0x0F;
+                // Type=0 (yuv422): H=2,V=1.  Type=1 (yuv420): H=2,V=2.
+                // Fallback to Type=1 for anything else (most permissive).
+                if (h == 2 && v == 1) out.type = 0;
+                else if (h == 2 && v == 2) out.type = 1;
+                else                      out.type = 1;
+            }
+        } else if (marker == 0xDB) {
+            // DQT: one or more (Pq|Tq, q0..q63) blocks. We collect 8-bit
+            // tables in slot-0/slot-1 order to keep RFC-2435 receivers happy.
+            size_t k = 0;
+            while (k < slen) {
+                if (k + 1 > slen) return out;
+                const uint8_t pq_tq = seg[k++];
+                const uint8_t pq    = (pq_tq >> 4) & 0x0F;
+                const size_t  qsize = (pq == 0) ? 64u : 128u;
+                if (k + qsize > slen) return out;
+                // For RFC 2435 Q=255 with Precision=0 we only emit 8-bit
+                // tables. Skip 16-bit tables — cameras almost never use them.
+                if (pq == 0) {
+                    out.qtables.insert(out.qtables.end(),
+                                       seg + k, seg + k + qsize);
+                }
+                k += qsize;
+            }
+        }
+        // Other markers (APPn, COM, DRI, DHT, etc.) are skipped — the
+        // decoder reconstructs DHT from defaults and we ignore DRI as noted.
+        i += seg_len;
+    }
+
+    out.ok = (out.width > 0 && out.height > 0 &&
+              out.scan_len > 0 && !out.qtables.empty());
+    return out;
+}
+
+// Build the per-packet payload sequence (RTP-JPEG header + optional QT
+// header + scan bytes) for one MJPEG frame. The 12-byte RTP header is NOT
+// included — callers prepend it (either via send_rtp_interleaved or, for
+// tests, by constructing it directly from `seq`/`ts`/`ssrc`).
+//
+// On the wire each packet looks like:
+//   first  : [8 B JPEG hdr][4 B QT hdr][qtables][scan bytes...]
+//   others : [8 B JPEG hdr][scan bytes...]
+//
+// All packets carry the same width/height/type/Q in the JPEG header; the
+// fragment-offset field advances per packet. The caller sets the RTP M
+// (marker) bit on the LAST packet — this builder doesn't model M directly.
+std::vector<std::vector<uint8_t>>
+build_rtp_jpeg_payloads(const JpegParse& jp,
+                        const uint8_t* scan, size_t scan_len,
+                        size_t max_payload) {
+    std::vector<std::vector<uint8_t>> out;
+    if (scan_len == 0) return out;
+
+    // RFC 2435 §3.1.5: Width/Height fields are 8-px units; max 2040 px.
+    // Above that the encoder must use a JPEG2000-style extension we don't
+    // implement; cap at 2040 — A1 is 1280x720, well under.
+    auto px_to_field = [](int px) -> uint8_t {
+        int u = (px + 7) / 8;
+        if (u > 255) u = 255;
+        return static_cast<uint8_t>(u);
+    };
+    const uint8_t w_field = px_to_field(jp.width);
+    const uint8_t h_field = px_to_field(jp.height);
+
+    // Precompute QT header (goes on first packet only).
+    const size_t qt_total = jp.qtables.size();
+    std::vector<uint8_t> qt_hdr;
+    qt_hdr.reserve(4 + qt_total);
+    qt_hdr.push_back(0x00);                                            // MBZ
+    qt_hdr.push_back(0x00);                                            // Precision (8-bit)
+    qt_hdr.push_back(static_cast<uint8_t>((qt_total >> 8) & 0xFF));    // Len hi
+    qt_hdr.push_back(static_cast<uint8_t>( qt_total       & 0xFF));    // Len lo
+    qt_hdr.insert(qt_hdr.end(), jp.qtables.begin(), jp.qtables.end());
+
+    const size_t jpeg_hdr_bytes = 8;
+    uint32_t     frag_off = 0;
+    size_t       remain   = scan_len;
+    const uint8_t* p      = scan;
+    bool         first    = true;
+
+    while (remain > 0) {
+        std::vector<uint8_t> pkt;
+        pkt.reserve(max_payload + 16);
+
+        // RTP-JPEG main header.
+        pkt.push_back(0x00);                                              // type-spec
+        pkt.push_back(static_cast<uint8_t>((frag_off >> 16) & 0xFF));     // frag off hi
+        pkt.push_back(static_cast<uint8_t>((frag_off >>  8) & 0xFF));
+        pkt.push_back(static_cast<uint8_t>( frag_off        & 0xFF));
+        pkt.push_back(jp.type);
+        pkt.push_back(255);                                                // Q=255 (QTs included)
+        pkt.push_back(w_field);
+        pkt.push_back(h_field);
+
+        size_t budget = (max_payload > jpeg_hdr_bytes)
+            ? (max_payload - jpeg_hdr_bytes) : 1;
+        if (first) {
+            if (budget <= qt_hdr.size()) {
+                // Pathological: max_payload too small to fit even the QT
+                // header on the first packet. Emit a runt packet — losing
+                // one packet's MTU compliance beats dropping the frame.
+                pkt.insert(pkt.end(), qt_hdr.begin(), qt_hdr.end());
+                budget = 1;
+            } else {
+                pkt.insert(pkt.end(), qt_hdr.begin(), qt_hdr.end());
+                budget -= qt_hdr.size();
+            }
+        }
+        const size_t chunk = std::min(remain, budget);
+        pkt.insert(pkt.end(), p, p + chunk);
+
+        out.push_back(std::move(pkt));
+        p        += chunk;
+        remain   -= chunk;
+        frag_off += static_cast<uint32_t>(chunk);
+        first     = false;
+    }
+    return out;
+}
+
+// Build & send all RTP packets for one MJPEG frame. Returns false on TLS
+// write failure. Marker bit goes on the last packet.
+bool packetise_jpeg_frame(SSL* ssl, uint8_t channel,
+                          uint16_t& seq, uint32_t ts, uint32_t ssrc,
+                          const JpegParse& jp,
+                          const uint8_t* scan, size_t scan_len,
+                          size_t max_payload) {
+    auto payloads = build_rtp_jpeg_payloads(jp, scan, scan_len, max_payload);
+    for (size_t i = 0; i < payloads.size(); ++i) {
+        const bool marker = (i + 1 == payloads.size());
+        if (!send_rtp_interleaved(ssl, channel, seq, ts, ssrc,
+                                  /*pt=*/26, marker,
+                                  payloads[i].data(), payloads[i].size())) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // RFC 6184 H.264 packetisation.
 // ---------------------------------------------------------------------------
@@ -494,31 +753,46 @@ bool packetise_nal(SSL* ssl, uint8_t channel,
 // ---------------------------------------------------------------------------
 
 std::string build_sdp(const std::string& ctrl_base,
-                      const std::vector<uint8_t>& sps_raw,
-                      const std::vector<uint8_t>& pps_raw) {
-    // profile-level-id: from SPS bytes [1..3] if present, else a safe default.
-    char plid[8] = "42C00A"; // baseline level 1.0 — matches our null source.
-    if (sps_raw.size() >= 4) {
-        std::snprintf(plid, sizeof(plid), "%02X%02X%02X",
-                      static_cast<unsigned>(sps_raw[1]),
-                      static_cast<unsigned>(sps_raw[2]),
-                      static_cast<unsigned>(sps_raw[3]));
-    }
-    std::string sprop;
-    if (!sps_raw.empty()) sprop += b64_encode(sps_raw.data(), sps_raw.size());
-    if (!pps_raw.empty()) {
-        if (!sprop.empty()) sprop += ",";
-        sprop += b64_encode(pps_raw.data(), pps_raw.size());
-    }
-
+                      const ICameraSource::StreamInfo& si) {
     std::ostringstream os;
     os << "v=0\r\n"
        << "o=- 0 0 IN IP4 0.0.0.0\r\n"
        << "s=Bambu Bridge Camera\r\n"
        << "c=IN IP4 0.0.0.0\r\n"
        << "t=0 0\r\n"
-       << "a=control:" << ctrl_base << "\r\n"
-       << "m=video 0 RTP/AVP 96\r\n"
+       << "a=control:" << ctrl_base << "\r\n";
+
+    if (si.codec == ICameraSource::Codec::MotionJpeg) {
+        // RFC 2435 / RFC 3551 §A.5 — JPEG is RTP static payload type 26 with
+        // a 90kHz clock. No fmtp parameters are required (Q-tables ship in
+        // the RTP-JPEG header on the first packet of each frame).
+        os << "m=video 0 RTP/AVP 26\r\n"
+           << "a=rtpmap:26 JPEG/90000\r\n";
+        if (si.fps > 0)    os << "a=framerate:" << si.fps << "\r\n";
+        if (si.width > 0 && si.height > 0) {
+            os << "a=x-dimensions:" << si.width << "," << si.height << "\r\n";
+        }
+        os << "a=control:streamid=0\r\n";
+        return os.str();
+    }
+
+    // H.264 path (default).
+    // profile-level-id: from SPS bytes [1..3] if present, else a safe default.
+    char plid[8] = "42C00A"; // baseline level 1.0 — matches our null source.
+    if (si.sps.size() >= 4) {
+        std::snprintf(plid, sizeof(plid), "%02X%02X%02X",
+                      static_cast<unsigned>(si.sps[1]),
+                      static_cast<unsigned>(si.sps[2]),
+                      static_cast<unsigned>(si.sps[3]));
+    }
+    std::string sprop;
+    if (!si.sps.empty()) sprop += b64_encode(si.sps.data(), si.sps.size());
+    if (!si.pps.empty()) {
+        if (!sprop.empty()) sprop += ",";
+        sprop += b64_encode(si.pps.data(), si.pps.size());
+    }
+
+    os << "m=video 0 RTP/AVP 96\r\n"
        << "a=rtpmap:96 H264/90000\r\n"
        << "a=fmtp:96 packetization-mode=1;profile-level-id=" << plid
        << ";sprop-parameter-sets=" << sprop << "\r\n"
@@ -527,6 +801,27 @@ std::string build_sdp(const std::string& ctrl_base,
 }
 
 } // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// RtspJpegPacketiser.hpp shims — public surface for unit tests. The bodies
+// just forward to the anonymous-namespace helpers used by the streaming loop.
+// ---------------------------------------------------------------------------
+
+RtpJpegParse rtp_jpeg_parse(const uint8_t* data, std::size_t n) {
+    return parse_jfif(data, n);
+}
+
+std::vector<std::vector<uint8_t>>
+rtp_jpeg_build_packets(uint16_t& /*seq*/, uint32_t /*ts*/, uint32_t /*ssrc*/,
+                       const RtpJpegParse& jp,
+                       const uint8_t* scan, std::size_t scan_len,
+                       std::size_t max_payload) {
+    // Note: seq/ts/ssrc are accepted for API symmetry with the production
+    // sender (and to leave room for future RTP-header-included variants),
+    // but the packetiser itself doesn't need them — they live in the
+    // 12-byte RTP header which test code synthesises separately.
+    return build_rtp_jpeg_payloads(jp, scan, scan_len, max_payload);
+}
 
 // ---------------------------------------------------------------------------
 // Per-device + per-session state.
@@ -667,15 +962,38 @@ void session_io_loop(RtspServer::Device* dev,
         return write_rtsp_response(sess->ssl, 200, "OK", cseq, h, body);
     };
 
+    // The codec is fixed at source-open time; cache it so we don't poll
+    // info() per frame. Defaults to H264_AnnexB if the source is null
+    // (DESCRIBE-then-die path; the streaming loop won't actually run).
+    const ICameraSource::Codec stream_codec =
+        src ? src->info().codec : ICameraSource::Codec::H264_AnnexB;
+
     // Helper: send one access-unit's worth of RTP packets for a Frame
     // pulled from the source. Returns false on TLS write failure.
     auto stream_one_frame = [&](const VideoFrame& f) -> bool {
+        // 90kHz RTP clock — shared across codecs (RFC 6184 + RFC 2435).
+        const uint32_t ts = static_cast<uint32_t>(
+            (static_cast<int64_t>(f.pts_us) * 90LL) / 1000LL);
+
+        if (stream_codec == ICameraSource::Codec::MotionJpeg) {
+            if (f.nal_data.empty()) return true;
+            JpegParse jp = parse_jfif(f.nal_data.data(), f.nal_data.size());
+            if (!jp.ok) {
+                // Malformed JPEG — drop this frame. A persistent stream of
+                // malformed frames will starve the client; surface as TLS
+                // failure only if EVERY frame is bad.
+                return true;
+            }
+            return packetise_jpeg_frame(sess->ssl, rtp_channel, rtp_seq, ts,
+                                        rtp_ssrc, jp,
+                                        f.nal_data.data() + jp.scan_off,
+                                        jp.scan_len,
+                                        static_cast<size_t>(cfg.rtp_max_payload));
+        }
+
         std::vector<std::pair<size_t,size_t>> ranges;
         split_annexb_nals(f.nal_data, ranges);
         if (ranges.empty()) return true;
-        // 90kHz RTP clock.
-        const uint32_t ts = static_cast<uint32_t>(
-            (static_cast<int64_t>(f.pts_us) * 90LL) / 1000LL);
         for (size_t i = 0; i < ranges.size(); ++i) {
             const uint8_t* p = f.nal_data.data() + ranges[i].first;
             const size_t   n = ranges[i].second;
@@ -741,7 +1059,7 @@ void session_io_loop(RtspServer::Device* dev,
                     continue;
                 }
             }
-            std::string sdp = build_sdp(req.target, si.sps, si.pps);
+            std::string sdp = build_sdp(req.target, si);
             write_resp_ok(cseq, {
                 {"Content-Type", "application/sdp"},
                 {"Content-Base", req.target + "/"}

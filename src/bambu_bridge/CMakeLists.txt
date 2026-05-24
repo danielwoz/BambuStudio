@@ -85,6 +85,7 @@ add_library(bambu_bridge STATIC
     server/ICameraSource.hpp
     server/RtspServer.cpp
     server/RtspServer.hpp
+    server/RtspJpegPacketiser.hpp
     server/VirtualTunnelServer.cpp
     server/VirtualTunnelServer.hpp
     router/NullUplink.cpp

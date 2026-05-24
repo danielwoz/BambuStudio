@@ -33,13 +33,10 @@
 //
 // Frame surface: `VideoFrame::nal_data` carries the RAW JPEG payload
 // (not Annex-B H.264) and `StreamInfo::codec` is reported as
-// `Codec::MotionJpeg`. Downstream consumers (`RtspServer`) must inspect
-// `codec` before treating `nal_data` as H.264; until the RtspServer
-// gains an RFC-2435 (RTP-over-JPEG) packetiser, an MJPEG source plugged
-// into the H.264-only RTSP path will be advertised in SDP as JPEG and
-// most slicer-side clients will refuse SETUP cleanly. The source itself
-// is fully functional and unit-tested; the RTSP packetiser upgrade is
-// tracked separately.
+// `Codec::MotionJpeg`. Downstream consumers (`RtspServer`) inspect
+// `codec` before treating `nal_data` as H.264; ship-11d added the
+// RFC-2435 RTP-over-JPEG packetiser (payload type 26) so MotionJpeg
+// sources flow end-to-end through the RTSP republish path.
 
 #ifndef SLIC3R_BAMBU_BRIDGE_ROUTER_JPEG_CAMERA_SOURCE_HPP
 #define SLIC3R_BAMBU_BRIDGE_ROUTER_JPEG_CAMERA_SOURCE_HPP
