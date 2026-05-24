@@ -23,6 +23,7 @@
 #include "../router/CloudUploadSink.hpp"
 #include "../router/LanCameraSource.hpp"
 #include "../router/CloudCameraSource.hpp"
+#include "../router/JpegCameraSource.hpp"
 #include "../router/NullCameraSource.hpp"
 #include "../router/SessionRouter.hpp"
 #include "../router/UploadSinkRouter.hpp"
@@ -916,6 +917,35 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         state.cam_router->set_cloud_source(state.cloud_cam);
         state.cam_router->set_null_source(m_null_camera);
         state.cam_router->set_health_monitor(m_health);
+
+        // A1 / P1 series speak the native JPEG-on-port-6000 protocol
+        // (OpenBambuAPI/video.md). For those models, prefer the
+        // JpegCameraSource over LanCameraSource (which would try RTSPS
+        // on 322 — A1/P1 don't expose that) and over CloudCameraSource
+        // (which goes through the proprietary plugin's TUTK relay).
+        // For X1/H2-series models, leave the JPEG source null and the
+        // router falls back to existing LAN→Cloud preference.
+        if (router::is_jpeg_camera_model(state.model)) {
+            router::JpegCameraSourceConfig jc;
+            jc.dev_id      = dev_id;
+            jc.printer_ip  = lan_ip;
+            jc.access_code = access_code;
+            state.jpeg_cam = std::make_shared<router::JpegCameraSource>(jc);
+            state.cam_router->set_jpeg_source(state.jpeg_cam);
+
+            router::CameraSourceRouter::Policy pol;
+            pol.prefer_lan          = true;
+            pol.prefer_jpeg         = true;
+            pol.allow_null_fallback = false;
+            state.cam_router->set_policy(pol);
+
+            std::fprintf(stderr,
+                "[bridge-app] dev=%s model=%s -> using JpegCameraSource "
+                "(LAN port 6000, OpenBambuAPI video.md)\n",
+                dev_id.c_str(),
+                router::jpeg_camera_model_tag(state.model).c_str());
+            std::fflush(stderr);
+        }
 
         if (m_rtsp) {
             server::RtspVirtualDevice rdev;
