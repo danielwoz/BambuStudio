@@ -35,6 +35,24 @@ namespace router {
 
 namespace {
 
+// Diagnostic cert+key bypass: when BBL_BRIDGE_ENABLE_PRINT_BYPASS=1 is
+// set, `LanUplink::on_publish` reroutes `{"print":...}` control payloads
+// through the raw_mqtt_publish.py subprocess (which speaks LAN MQTT with
+// the per-printer mTLS material extracted by `install_device_cert`)
+// instead of the plugin's `send_message_to_printer` path.
+//
+// Production default is OFF — the plugin path (cycle-warmed at startup
+// in BridgeBootstrap) is the validated route that the firmware actually
+// accepts. Exp B / Exp E both showed the printer firmware rejects raw
+// publishes that lack the plugin's enc_msg envelope (err_code 0x05024007),
+// so the bypass is only useful for diagnostic observers that want to
+// emit a known-malformed frame and see how the printer reacts. See
+// EXP-{A..E}-RESULTS.md for the full empirical picture.
+bool print_bypass_enabled() {
+    const char* env = std::getenv("BBL_BRIDGE_ENABLE_PRINT_BYPASS");
+    return env && *env && std::strcmp(env, "0") != 0;
+}
+
 // Cheap-and-honest check: is the top-level key of this JSON payload
 // literally `"print"`? We don't need a full parse — control payloads are
 // always `{"print":{...}}` with no leading whitespace beyond what the
@@ -123,7 +141,7 @@ std::string write_tmp_payload(const std::vector<uint8_t>& payload,
     int fd = ::mkstemp(tmpl);
     if (fd < 0) {
         std::fprintf(stderr,
-            "[print-via-cert dev=%s] mkstemp failed: %s\n",
+            "[print-via-cert/diag dev=%s] mkstemp failed: %s\n",
             dev_id.c_str(), std::strerror(errno));
         return {};
     }
@@ -197,7 +215,7 @@ int spawn_raw_mqtt_helper(const std::string& helper_path,
     pid_t pid = ::fork();
     if (pid < 0) {
         std::fprintf(stderr,
-            "[print-via-cert dev=%s] fork failed: %s\n",
+            "[print-via-cert/diag dev=%s] fork failed: %s\n",
             dev_id.c_str(), std::strerror(errno));
         return -1;
     }
@@ -213,7 +231,7 @@ int spawn_raw_mqtt_helper(const std::string& helper_path,
         ::execvp("python3", const_cast<char* const*>(argv.data()));
         // exec failed
         std::fprintf(stderr,
-            "[print-via-cert dev=%s] execvp python3 failed: %s\n",
+            "[print-via-cert/diag dev=%s] execvp python3 failed: %s\n",
             dev_id.c_str(), std::strerror(errno));
         std::_Exit(127);
     }
@@ -228,14 +246,14 @@ int spawn_raw_mqtt_helper(const std::string& helper_path,
         if (r < 0) {
             if (errno == EINTR) continue;
             std::fprintf(stderr,
-                "[print-via-cert dev=%s] waitpid failed: %s\n",
+                "[print-via-cert/diag dev=%s] waitpid failed: %s\n",
                 dev_id.c_str(), std::strerror(errno));
             return -2;
         }
         // r == 0: still running
         if (std::chrono::steady_clock::now() >= deadline) {
             std::fprintf(stderr,
-                "[print-via-cert dev=%s] helper timeout — killing pid=%d\n",
+                "[print-via-cert/diag dev=%s] helper timeout — killing pid=%d\n",
                 dev_id.c_str(), pid);
             ::kill(pid, SIGKILL);
             ::waitpid(pid, &status, 0);
@@ -505,22 +523,30 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
     }
     std::string json(payload.begin(), payload.end());
 
-    // Route control commands (`{"print":...}`) via the per-printer
-    // mTLS cert+key (subprocess to raw_mqtt_publish.py). The
-    // proprietary plugin silently drops `print.command=*` from
-    // non-UI contexts; the printer's LAN broker accepts the publish
-    // when the TLS handshake presents a valid client cert (see
-    // DISCOVERY-2026-05-22.md). Other payloads (`pushing.*`, `info.*`)
-    // still go through the plugin so `pushall`, `get_version`, etc.
-    // keep using the persistent plugin session.
-    const bool is_print = payload_is_print_control(json);
+    // Diagnostic cert+key bypass for `{"print":...}` control commands.
+    // OFF by default — must be enabled with BBL_BRIDGE_ENABLE_PRINT_BYPASS=1.
+    //
+    // Production routing for `print.command=*` is the plugin path below
+    // (`send_message_to_printer`). After the bridge's startup cycle
+    // (`set_user_selected_machine` → `install_device_cert` per dev_id) the
+    // plugin's enc_msg gate is open and writes are applied by firmware
+    // (validated end-to-end by Exp C and Exp D).
+    //
+    // The bypass routes the raw payload through raw_mqtt_publish.py with
+    // the per-printer mTLS cert+key extracted from the slicer plugin's
+    // heap (see resolve_mtls_paths in BridgeApp.cpp). The TLS handshake
+    // succeeds, but firmware rejects the publish because it isn't wrapped
+    // in the plugin's enc_msg envelope (Exp E: err_code 0x05024007). Kept
+    // as DIAGNOSTIC-ONLY so observers can emit a known-malformed frame
+    // and see how the printer reacts.
+    const bool is_print  = payload_is_print_control(json);
     const bool have_cert = !cfg.mtls_cert_path.empty()
                         && !cfg.mtls_key_path.empty();
-    if (is_print && have_cert) {
+    if (is_print && have_cert && print_bypass_enabled()) {
         const std::string helper = resolve_helper_path_once();
         if (helper.empty()) {
             std::fprintf(stderr,
-                "[print-via-cert dev=%s] helper script not found "
+                "[print-via-cert/diag dev=%s] helper script not found "
                 "(set BBL_BRIDGE_RAW_MQTT_HELPER); falling back to plugin\n",
                 dev_id.c_str());
             std::fflush(stderr);
@@ -530,7 +556,7 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
             const std::string tmpfile = write_tmp_payload(payload, dev_id);
             if (tmpfile.empty()) {
                 std::fprintf(stderr,
-                    "[print-via-cert dev=%s] tmp file write failed; falling back\n",
+                    "[print-via-cert/diag dev=%s] tmp file write failed; falling back\n",
                     dev_id.c_str());
                 std::fflush(stderr);
             } else {
@@ -551,7 +577,7 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
                     dev_id);
                 ::unlink(tmpfile.c_str());
                 std::fprintf(stderr,
-                    "[print-via-cert] dev=%s topic=%s qos=%u bytes=%zu rc=%d\n",
+                    "[print-via-cert/diag] dev=%s topic=%s qos=%u bytes=%zu rc=%d\n",
                     dev_id.c_str(), topic_real.c_str(),
                     unsigned(qos), payload.size(), rc);
                 std::fflush(stderr);

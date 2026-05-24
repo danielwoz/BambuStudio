@@ -44,6 +44,17 @@ endif ()
 # half-way through the build.
 find_package(OpenSSL REQUIRED)
 
+# Ship-2: CloudSession + CloudDeviceList make HTTPS calls to api.bambulab.com
+# via libcurl. We prefer the parent project's libcurl import target if it's
+# already defined (BambuStudio's deps tree provides one named `libcurl`);
+# otherwise fall back to find_package(CURL).
+if (TARGET libcurl)
+    set(BAMBU_BRIDGE_CURL_TARGET libcurl)
+else ()
+    find_package(CURL REQUIRED)
+    set(BAMBU_BRIDGE_CURL_TARGET CURL::libcurl)
+endif ()
+
 add_library(bambu_bridge STATIC
     BridgeService.cpp
     BridgeService.hpp
@@ -53,6 +64,10 @@ add_library(bambu_bridge STATIC
     BambuSourceHandle.hpp
     CloudInventory.cpp
     CloudInventory.hpp
+    CloudSession.cpp
+    CloudSession.hpp
+    CloudDeviceList.cpp
+    CloudDeviceList.hpp
     tls/CertFactory.cpp
     tls/CertFactory.hpp
     server/SsdpResponder.cpp
@@ -102,6 +117,10 @@ add_library(bambu_bridge STATIC
     router/UploadSinkRouter.hpp
     router/CameraSourceRouter.cpp
     router/CameraSourceRouter.hpp
+    router/LocalControlTunnel.cpp
+    router/LocalControlTunnel.hpp
+    router/NativeStorageDelegate.cpp
+    router/NativeStorageDelegate.hpp
     headless/BridgeApp.cpp
     headless/BridgeApp.hpp
     headless/BridgeAppCliArgs.cpp
@@ -113,6 +132,7 @@ add_library(bambu_bridge STATIC
 )
 
 target_link_libraries(bambu_bridge PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(bambu_bridge PUBLIC ${BAMBU_BRIDGE_CURL_TARGET})
 
 target_include_directories(bambu_bridge
     PUBLIC
