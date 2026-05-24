@@ -8,13 +8,23 @@
 //     CertMaterial the MqttBroker / FtpsServer use, so the on-the-wire
 //     shape is indistinguishable from a real printer's camera channel).
 //   - RTSP method subset: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN.
-//   - DESCRIBE returns an SDP that advertises ONE video track:
-//       m=video 0 RTP/AVP 96
-//       a=rtpmap:96 H264/90000
-//       a=fmtp:96 packetization-mode=1; profile-level-id=...;
-//                 sprop-parameter-sets=<b64(sps)>,<b64(pps)>
-//       a=control:streamid=0
-//     The SPS / PPS come from the bound ICameraSource's `StreamInfo`.
+//   - DESCRIBE returns an SDP that advertises ONE video track. Codec is
+//     selected from the bound ICameraSource's `StreamInfo::codec`:
+//       H264_AnnexB (default):
+//         m=video 0 RTP/AVP 96
+//         a=rtpmap:96 H264/90000
+//         a=fmtp:96 packetization-mode=1; profile-level-id=...;
+//                   sprop-parameter-sets=<b64(sps)>,<b64(pps)>
+//         a=control:streamid=0
+//       MotionJpeg (A1 / P1 native port-6000 source — ship-11d):
+//         m=video 0 RTP/AVP 26
+//         a=rtpmap:26 JPEG/90000
+//         (a=framerate, a=x-dimensions where known)
+//         a=control:streamid=0
+//     RFC 2435 packetisation: each frame is JFIF-parsed for SOF dimensions
+//     + DQT tables; payload is the entropy-coded scan data with an 8-byte
+//     RTP-JPEG header on every packet + a Quantization Table header on the
+//     first packet (Q=255, precision=0, 8-bit tables only).
 //   - SETUP only honours `Transport: RTP/AVP/TCP;interleaved=0-1`
 //     (RTP+RTCP interleaved over the same TLS RTSP socket). We do NOT
 //     implement UDP RTP transport or RTSP-over-UDP — keeping the data

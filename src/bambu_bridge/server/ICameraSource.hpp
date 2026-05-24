@@ -87,10 +87,10 @@ public:
     // JPEG-streaming protocol. Defaults to `H264_AnnexB` so existing
     // sources/tests need no change.
     //
-    // RtspServer's RTP packetiser currently only handles H264_AnnexB;
-    // adding RFC-2435 RTP-JPEG packetisation is tracked separately. A
-    // MotionJpeg source still surfaces `next_frame()` and is fully
-    // unit-testable in isolation.
+    // RtspServer's RTP packetiser handles both: H264_AnnexB via RFC 6184
+    // (payload type 96) and MotionJpeg via RFC 2435 (static payload type
+    // 26, JFIF parsed per-frame). The codec is fixed at source-open time
+    // and cached by the streaming loop.
     enum class Codec {
         H264_AnnexB = 0,
         MotionJpeg  = 1,

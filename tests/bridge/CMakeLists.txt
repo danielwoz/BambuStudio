@@ -362,6 +362,45 @@ set_tests_properties(RtspServerLoopbackTest PROPERTIES
     SKIP_RETURN_CODE 77
 )
 
+# ---- Ship-11d: RFC 2435 RTP/JPEG packetiser ----------------------------
+#
+# RtspJpegPacketiserTest        — unit; pins the JFIF parser (SOF/DQT/SOS
+#                                 walk) and the RTP-JPEG packet builder
+#                                 (8 B JPEG hdr + 4 B QT hdr + qtables +
+#                                 scan bytes; fragmentation with monotonic
+#                                 frag-offset). No TLS, no sockets.
+
+add_executable(RtspJpegPacketiserTest RtspJpegPacketiserTest.cpp)
+target_link_libraries(RtspJpegPacketiserTest PRIVATE bambu_bridge)
+set_target_properties(RtspJpegPacketiserTest PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+add_test(NAME RtspJpegPacketiserTest COMMAND RtspJpegPacketiserTest)
+
+# RtspServerMjpegLoopbackTest    — integration test exercising the full
+#                                  DESCRIBE/SETUP/PLAY/TEARDOWN flow against
+#                                  a stub MJPEG ICameraSource. Asserts SDP
+#                                  advertises PT 26 (JPEG/90000) and the
+#                                  resulting RTP packets carry the RFC 2435
+#                                  header + Quantization Table header that
+#                                  matches the source's DQT bytes.
+add_executable(RtspServerMjpegLoopbackTest
+    RtspServerMjpegLoopbackTest.cpp
+    support/RtspTestClient.cpp
+    support/RtspTestClient.hpp
+)
+target_link_libraries(RtspServerMjpegLoopbackTest PRIVATE
+    bambu_bridge OpenSSL::SSL OpenSSL::Crypto)
+set_target_properties(RtspServerMjpegLoopbackTest PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+add_test(NAME RtspServerMjpegLoopbackTest COMMAND RtspServerMjpegLoopbackTest)
+set_tests_properties(RtspServerMjpegLoopbackTest PROPERTIES
+    SKIP_RETURN_CODE 77
+)
+
 # ---- Phase 9 ------------------------------------------------------------
 #
 # SessionRouterTest               — pure unit; stub LanUplink + CloudUplink,
