@@ -164,8 +164,16 @@ int main() {
         // username left at its default ("bblp") to pin the slicer-matching form.
 
         LanCameraSource src(cfg, mock);
-        check(src.url() == "bambu:///rtsps___bblp:ABCDEF@192.0.2.42/streaming/live/1?proto=rtsps",
-              "URL has triple underscore + creds + ?proto=rtsps");
+        // build_url() always appends the 5 slicer-identity query params
+        // (device/net_ver/dev_ver/cli_id/cli_ver) — even with empty values
+        // they have to be present, the plugin fingerprints the URL and
+        // returns -107 when the call shape doesn't match the GUI. Here the
+        // slicer_* fields are all empty so the form expands to "&...=&...=".
+        const std::string expected_url =
+            "bambu:///rtsps___bblp:ABCDEF@192.0.2.42/streaming/live/1?proto=rtsps"
+            "&device=0938X1&net_ver=&dev_ver=&cli_id=&cli_ver=";
+        check(src.url() == expected_url,
+              "URL has triple underscore + creds + ?proto=rtsps + 5 slicer-id params");
 
         // Pre-queue two frames the mock will emit.
         MockSource::ScriptedFrame f1;
@@ -187,8 +195,7 @@ int main() {
             std::lock_guard<std::mutex> lk(mock->mu);
             check(mock->creates.size() == 1, "Bambu_Create called once");
             if (!mock->creates.empty()) {
-                check(mock->creates[0].url
-                      == "bambu:///rtsps___bblp:ABCDEF@192.0.2.42/streaming/live/1?proto=rtsps",
+                check(mock->creates[0].url == expected_url,
                       "Create URL matches the build_url() output");
             }
             check(mock->opens         == 1, "Bambu_Open called once");
@@ -286,6 +293,101 @@ int main() {
             std::lock_guard<std::mutex> lk(mock->mu);
             check(mock->closes   == 1, "Bambu_Close called to clean up");
             check(mock->destroys == 1, "Bambu_Destroy called to clean up");
+        }
+    }
+
+    // ---- Ship-10G: primary RTSPS -107 → local-fallback URL used -------
+    //
+    // Models the H2S/H2D path where firmware has `ipcam.rtsp_url == "disable"`,
+    // port 322 is refused, and the plugin's live555 client surfaces -107
+    // from bambu_start_stream. With `local_fallback_url` set the source
+    // must retry against the bambu:///local/...?port=6000 form and report
+    // open success.
+    {
+        auto mock = std::make_shared<MockSource>();
+        // First create+open+start round returns -107 from StartStream;
+        // second round (after the fallback URL gets handed in) succeeds.
+        // We model this by flipping `start_rc` AFTER the first call: the
+        // mock keeps a `start_streams` counter we can examine, so we use
+        // a simple latching subclass below to scope the behaviour.
+        struct LatchingMock : MockSource {
+            int n_starts = 0;
+            int bambu_start_stream(void* t, bool video) override {
+                std::lock_guard<std::mutex> lk(mu);
+                (void)t;
+                start_streams.push_back(video);
+                ++n_starts;
+                if (n_starts == 1) return -107; // primary fails
+                return 0;                       // fallback succeeds
+            }
+        };
+        auto latch = std::make_shared<LatchingMock>();
+
+        LanCameraSourceConfig cfg;
+        cfg.dev_id            = "0938BC58";
+        cfg.printer_ip        = "192.168.1.209";
+        cfg.access_code       = "64e81956";
+        cfg.local_fallback_url =
+            "bambu:///local/192.168.1.209.?port=6000&user=bblp&passwd=64e81956";
+
+        LanCameraSource src(cfg, latch);
+        check(src.open(),
+              "ship-10g: open() succeeds via local-fallback URL after -107 on primary");
+        {
+            std::lock_guard<std::mutex> lk(latch->mu);
+            // Two full open ladders: 2 creates, 2 opens, 2 start_streams.
+            check(latch->creates.size() == 2,
+                  "ship-10g: Bambu_Create called twice (primary + fallback)");
+            check(latch->opens == 2,
+                  "ship-10g: Bambu_Open called twice");
+            check(latch->n_starts == 2,
+                  "ship-10g: Bambu_StartStream called twice");
+            // Primary URL is the rtsps form, fallback URL is the local form.
+            if (latch->creates.size() >= 2) {
+                bool primary_is_rtsps =
+                    latch->creates[0].url.find("rtsps___") != std::string::npos;
+                bool fallback_is_local =
+                    latch->creates[1].url.find("bambu:///local/") != std::string::npos
+                    && latch->creates[1].url.find("port=6000") != std::string::npos;
+                check(primary_is_rtsps,
+                      "ship-10g: first Create url is rtsps___ form");
+                check(fallback_is_local,
+                      "ship-10g: second Create url is bambu:///local/...?port=6000");
+            }
+            // Primary failure must have cleaned up before the fallback retry —
+            // close + destroy after StartStream-fail; then a fresh create
+            // for the fallback.
+            check(latch->closes   >= 1,
+                  "ship-10g: primary cleanup called Bambu_Close at least once");
+            check(latch->destroys >= 1,
+                  "ship-10g: primary cleanup called Bambu_Destroy at least once");
+        }
+        src.close();
+    }
+
+    // ---- Ship-10G: no fallback URL → behaves like before --------------
+    //
+    // Regression guard: when `local_fallback_url` is empty the source
+    // must NOT silently retry — it should report open() failure exactly
+    // once, same as the pre-ship-10g behaviour.
+    {
+        auto mock = std::make_shared<MockSource>();
+        mock->start_rc = -107;
+        LanCameraSourceConfig cfg;
+        cfg.dev_id      = "0938BC58";
+        cfg.printer_ip  = "192.168.1.209";
+        cfg.access_code = "64e81956";
+        // local_fallback_url intentionally empty.
+
+        LanCameraSource src(cfg, mock);
+        check(!src.open(),
+              "ship-10g: open() fails fast with no fallback URL configured");
+        {
+            std::lock_guard<std::mutex> lk(mock->mu);
+            check(mock->creates.size() == 1,
+                  "ship-10g: only one Create when no fallback URL");
+            check(mock->start_streams.size() == 1,
+                  "ship-10g: only one StartStream attempt when no fallback URL");
         }
     }
 
