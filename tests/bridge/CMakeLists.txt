@@ -307,6 +307,25 @@ set_target_properties(CloudCameraSourcePluginTest PROPERTIES
 )
 add_test(NAME CloudCameraSourcePluginTest COMMAND CloudCameraSourcePluginTest)
 
+# ---- Ship-10e: A1/P1 JPEG-on-port-6000 camera source -------------------
+#
+# JpegCameraSourceTest         — unit; pins the OpenBambuAPI/video.md
+#                                wire format (80-byte auth packet,
+#                                16-byte LE frame header) and the
+#                                end-to-end open / next_frame / close
+#                                lifecycle via a faked socket IO seam.
+#                                Also pins the model-gating predicate
+#                                that selects JPEG for A1/P1-series
+#                                models and skips X1/H2 series.
+
+add_executable(JpegCameraSourceTest JpegCameraSourceTest.cpp)
+target_link_libraries(JpegCameraSourceTest PRIVATE bambu_bridge)
+set_target_properties(JpegCameraSourceTest PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+add_test(NAME JpegCameraSourceTest COMMAND JpegCameraSourceTest)
+
 add_executable(BambuSourceHandleTest BambuSourceHandleTest.cpp)
 target_link_libraries(BambuSourceHandleTest PRIVATE bambu_bridge)
 set_target_properties(BambuSourceHandleTest PROPERTIES

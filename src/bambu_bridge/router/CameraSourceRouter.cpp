@@ -3,6 +3,7 @@
 #include "CameraSourceRouter.hpp"
 
 #include "CloudCameraSource.hpp"
+#include "JpegCameraSource.hpp"
 #include "LanCameraSource.hpp"
 #include "NullCameraSource.hpp"
 #include "UplinkHealth.hpp"
@@ -21,6 +22,7 @@ const char* choice_name(CameraSourceRouter::Choice c) {
     case CameraSourceRouter::Choice::None:  return "None";
     case CameraSourceRouter::Choice::Lan:   return "Lan";
     case CameraSourceRouter::Choice::Cloud: return "Cloud";
+    case CameraSourceRouter::Choice::Jpeg:  return "Jpeg";
     case CameraSourceRouter::Choice::Null:  return "Null";
     }
     return "?";
@@ -46,6 +48,11 @@ void CameraSourceRouter::set_cloud_source(std::shared_ptr<CloudCameraSource> clo
     m_cloud = std::move(cloud);
 }
 
+void CameraSourceRouter::set_jpeg_source(std::shared_ptr<JpegCameraSource> jpeg) {
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_jpeg = std::move(jpeg);
+}
+
 void CameraSourceRouter::set_null_source(std::shared_ptr<NullCameraSource> null) {
     std::lock_guard<std::mutex> lk(m_mu);
     m_null = std::move(null);
@@ -66,6 +73,7 @@ CameraSourceRouter::pick_locked(Choice c) const {
     switch (c) {
     case Choice::Lan:   return std::static_pointer_cast<server::ICameraSource>(m_lan);
     case Choice::Cloud: return std::static_pointer_cast<server::ICameraSource>(m_cloud);
+    case Choice::Jpeg:  return std::static_pointer_cast<server::ICameraSource>(m_jpeg);
     case Choice::Null:  return std::static_pointer_cast<server::ICameraSource>(m_null);
     case Choice::None:  break;
     }
@@ -76,6 +84,7 @@ bool CameraSourceRouter::open() {
     // Sample everything under lock first.
     std::shared_ptr<LanCameraSource>     lan;
     std::shared_ptr<CloudCameraSource>   cloud;
+    std::shared_ptr<JpegCameraSource>    jpeg;
     std::shared_ptr<NullCameraSource>    null;
     std::shared_ptr<UplinkHealthMonitor> health;
     Policy                               policy;
@@ -85,6 +94,7 @@ bool CameraSourceRouter::open() {
         if (m_open) return true; // already open
         lan    = m_lan;
         cloud  = m_cloud;
+        jpeg   = m_jpeg;
         null   = m_null;
         health = m_health;
         policy = m_policy;
@@ -100,11 +110,20 @@ bool CameraSourceRouter::open() {
     // decide for itself; we just fall through on failure.
     const bool lan_ok   = static_cast<bool>(lan);
     const bool cloud_ok = static_cast<bool>(cloud);
+    const bool jpeg_ok  = static_cast<bool>(jpeg);
     (void)health;
 
-    // Build the preference order.
-    Choice order[3] = { Choice::None, Choice::None, Choice::None };
+    // Build the preference order. JPEG (A1/P1 native) always wins when
+    // `prefer_jpeg` is set AND a JPEG source is configured — for those
+    // models the H.264 LanCameraSource path is wrong (printer's port 322
+    // isn't an RTSPS server) and cloud path requires TUTK plugin. JPEG
+    // failing falls back to LAN→Cloud→Null in the usual order so the
+    // bridge degrades gracefully (e.g. printer offline).
+    Choice order[4] = { Choice::None, Choice::None, Choice::None, Choice::None };
     int    n        = 0;
+    if (policy.prefer_jpeg && jpeg_ok && jpeg) {
+        order[n++] = Choice::Jpeg;
+    }
     if (policy.prefer_lan) {
         if (lan_ok   && lan)   order[n++] = Choice::Lan;
         if (cloud_ok && cloud) order[n++] = Choice::Cloud;
@@ -119,6 +138,7 @@ bool CameraSourceRouter::open() {
         switch (order[i]) {
         case Choice::Lan:   src = lan;   break;
         case Choice::Cloud: src = cloud; break;
+        case Choice::Jpeg:  src = jpeg;  break;
         case Choice::Null:  src = null;  break;
         default: break;
         }
@@ -128,6 +148,10 @@ bool CameraSourceRouter::open() {
             m_choice = order[i];
             m_chosen = src;
             m_open   = true;
+            std::fprintf(stderr,
+                "[camera-router] dev=%s opened via %s\n",
+                dev_id.c_str(), choice_name(order[i]));
+            std::fflush(stderr);
             return true;
         }
     }

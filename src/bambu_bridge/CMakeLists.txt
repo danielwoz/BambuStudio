@@ -109,6 +109,8 @@ add_library(bambu_bridge STATIC
     router/LanCameraSource.hpp
     router/CloudCameraSource.cpp
     router/CloudCameraSource.hpp
+    router/JpegCameraSource.cpp
+    router/JpegCameraSource.hpp
     router/UplinkHealth.cpp
     router/UplinkHealth.hpp
     router/SessionRouter.cpp
