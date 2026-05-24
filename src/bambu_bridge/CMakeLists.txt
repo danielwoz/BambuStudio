@@ -80,6 +80,8 @@ add_library(bambu_bridge STATIC
     router/LanUplink.hpp
     router/RawMqttPublisher.cpp
     router/RawMqttPublisher.hpp
+    router/Tier2Commands.cpp
+    router/Tier2Commands.hpp
     router/CloudUplink.cpp
     router/CloudUplink.hpp
     router/NullUploadSink.cpp
