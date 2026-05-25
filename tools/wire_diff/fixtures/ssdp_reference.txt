@@ -1,0 +1,15 @@
+HTTP/1.1 200 OK
+CACHE-CONTROL: max-age=1800
+EXT:
+LOCATION: 127.0.0.1
+SERVER: UPnP/1.0
+ST: urn:bambulab-com:device:3dprinter:1
+USN: EXAMPLESERIAL01
+DevModel.bambu.com: H2S
+DevName.bambu.com: My H2S
+DevConnect.bambu.com: lan
+DevBind.bambu.com: occupied
+Devseclink.bambu.com: secure
+DevVersion.bambu.com: 01.02.00.00
+DevCap.bambu.com: 1
+
