@@ -1045,7 +1045,11 @@ void session_io_loop(RtspServer::Device* dev,
             fd_set rfds; FD_ZERO(&rfds); FD_SET(sess->fd, &rfds);
             timeval tv{}; tv.tv_sec = 0; tv.tv_usec = 0;
             int s = ::select(sess->fd + 1, &rfds, nullptr, nullptr, &tv);
-            if (s <= 0 && SSL_pending(sess->ssl) == 0) continue;
+            // Plain-RTSP sessions have no SSL — SSL_pending(nullptr) segfaults
+            // (this is what crashed the bridge on every camera PLAY). Only
+            // consult the SSL read-buffer when there IS an SSL object; for
+            // plain TCP, select() alone decides whether a control msg waits.
+            if (s <= 0 && (!sess->ssl || SSL_pending(sess->ssl) == 0)) continue;
         }
 
         RtspRequest req;
