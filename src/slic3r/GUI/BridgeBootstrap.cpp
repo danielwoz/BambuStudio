@@ -577,11 +577,20 @@ bool run_headless(GUI_App* app)
                 // (and the bridge's CloudCameraSource has its own
                 // get_camera_url path). Empty p.camera_url => no local
                 // protocol resolved -> the bridge prefers cloud.
+                // Capture via shared_ptr, NOT [&p]: build_media_live_url's
+                // TUTK/remote branch calls agent->get_camera_url() which fires
+                // its callback ASYNCHRONOUSLY (HTTP fetch) — long after `p` is
+                // moved into `snap` and destroyed. A [&p] capture there is a
+                // use-after-free (segfault / heap corruption). The shared_ptr
+                // outlives both; we read the SYNC (LAN-direct) result right
+                // after the call, and any late async write lands harmlessly.
+                auto cam_url = std::make_shared<std::string>();
                 Slic3r::GUI::build_media_live_url(mo,
-                    [&p](std::string url, Slic3r::GUI::MediaUrlError err) {
+                    [cam_url](std::string url, Slic3r::GUI::MediaUrlError err) {
                         if (err == Slic3r::GUI::MediaUrlError::Ok)
-                            p.camera_url = std::move(url);
+                            *cam_url = std::move(url);
                     });
+                p.camera_url = *cam_url;
                 snap.push_back(std::move(p));
             }
             if (snap.empty()) return;
@@ -846,11 +855,20 @@ void install_gui_worker(GUI_App* app)
                 // snapshot adds the device first — so camera_url must be set
                 // on both paths or the cascade-added device picks cloud). Same
                 // synchronous LAN-direct capture as the push-timer snapshot.
+                // Capture via shared_ptr, NOT [&p]: build_media_live_url's
+                // TUTK/remote branch calls agent->get_camera_url() which fires
+                // its callback ASYNCHRONOUSLY (HTTP fetch) — long after `p` is
+                // moved into `snap` and destroyed. A [&p] capture there is a
+                // use-after-free (segfault / heap corruption). The shared_ptr
+                // outlives both; we read the SYNC (LAN-direct) result right
+                // after the call, and any late async write lands harmlessly.
+                auto cam_url = std::make_shared<std::string>();
                 Slic3r::GUI::build_media_live_url(mo,
-                    [&p](std::string url, Slic3r::GUI::MediaUrlError err) {
+                    [cam_url](std::string url, Slic3r::GUI::MediaUrlError err) {
                         if (err == Slic3r::GUI::MediaUrlError::Ok)
-                            p.camera_url = std::move(url);
+                            *cam_url = std::move(url);
                     });
+                p.camera_url = *cam_url;
                 snap.push_back(std::move(p));
             }
             // Same logic at the snapshot level: an empty list from a
