@@ -961,9 +961,14 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         bool        wire_jpeg = false;  // create JpegCameraSource (primary or fallback)
         const char* why       = "";
         if (cu.rfind("bambu:///local", 0) == 0) {
-            // Native path: lib drives bambu:///local; JPEG only as fallback.
-            pol.prefer_lan = true; pol.prefer_jpeg = false; wire_jpeg = true;
-            why = "camera_url=local -> LAN(lib) + JPEG fallback";
+            // A1/P1 port-6000: the hand-rolled JpegCameraSource speaks the
+            // actual JPEG protocol and WORKS headless (verified: port-6000
+            // serves JPEG-SOI frames). libBambuSource's bambu:///local path
+            // connects but would-blocks with frame_count=0 (it drives the
+            // tunnel protocol, not the A1 camera), so prefer JPEG and keep
+            // LAN(lib) only as the fallback.
+            pol.prefer_jpeg = true; pol.prefer_lan = true; wire_jpeg = true;
+            why = "camera_url=local -> JPEG-6000 (LAN-lib fallback)";
         } else if (cu.find("rtsps___") != std::string::npos ||
                    cu.find("rtsp___")  != std::string::npos) {
             pol.prefer_lan = true;          // RTSP(S) via LanCameraSource
@@ -973,11 +978,12 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
             why = "camera_url=remote -> cloud/TUTK";
         } else {
             // camera_url unresolved (local disabled / TUTK-async / not yet
-            // reported). Prefer the LAN(lib) path with a JPEG fallback for the
-            // transient-unknown A1/P1 case; otherwise cloud.
-            wire_jpeg      = router::is_jpeg_camera_model(state.model);
-            pol.prefer_lan = wire_jpeg;     // jpeg models: lan(lib)->cloud->jpeg
-            why = wire_jpeg ? "camera_url=empty -> LAN(lib) + JPEG fallback"
+            // reported). For jpeg models (A1/P1) prefer the JPEG-6000 source —
+            // the one that actually delivers frames headless; otherwise cloud.
+            wire_jpeg       = router::is_jpeg_camera_model(state.model);
+            pol.prefer_jpeg = wire_jpeg;    // jpeg models: JPEG-6000 first
+            pol.prefer_lan  = wire_jpeg;    // then lan(lib), then cloud
+            why = wire_jpeg ? "camera_url=empty -> JPEG-6000 (LAN-lib fallback)"
                             : "camera_url=empty -> cloud/TUTK";
         }
         if (wire_jpeg) {
@@ -1152,6 +1158,21 @@ void BridgeApp::update_lan_ip_locked(DeviceState&       state,
     state.lan_cam  = std::make_shared<router::LanCameraSource>(lc);
     state.lan_cam->attach_source_handle(m_bambu_source);
     if (state.cam_router) state.cam_router->set_lan_source(state.lan_cam);
+
+    // JpegCameraSource (A1/P1 port-6000) is likewise config-baked at
+    // construction and was created in add_device_locked when lan_ip may
+    // still have been empty (cloud-add before LAN discovery) — leaving it
+    // with an empty printer_ip so it open-FAILs and the router falls through
+    // to the libBambuSource local path (which would-blocks on the A1 JPEG
+    // camera). Rebuild it with the live IP so the JPEG client can connect.
+    if (state.jpeg_cam && !lan_ip.empty()) {
+        router::JpegCameraSourceConfig jc;
+        jc.dev_id      = state.dev_id;
+        jc.printer_ip  = lan_ip;
+        jc.access_code = state.access_code;
+        state.jpeg_cam = std::make_shared<router::JpegCameraSource>(jc);
+        if (state.cam_router) state.cam_router->set_jpeg_source(state.jpeg_cam);
+    }
 
     // Storage proxy: VirtualTunnelServer captured an empty
     // printer_lan_ip at add_device time (cloud snapshots rarely carry
