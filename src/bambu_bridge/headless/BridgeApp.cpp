@@ -13,6 +13,7 @@
 #include "../server/MqttBroker.hpp"
 #include "../server/FtpsServer.hpp"
 #include "../server/RtspServer.hpp"
+#include "../server/TranscodingCameraSource.hpp"
 #include "../server/VirtualTunnelServer.hpp"
 #include "../server/IUplink.hpp"
 #include "../server/IUploadSink.hpp"
@@ -1008,7 +1009,13 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
             rdev.port        = state.rtsp_port;
             rdev.access_code = access_code;
             rdev.cert        = cert;
-            rdev.source      = state.cam_router;
+            // Wrap the router in the MJPEG->H.264 transcoder so EVERY virtual
+            // printer republishes as uniform standard H.264 (the A1/P1 JPEG
+            // cameras get transcoded; H.264 LAN/cloud sources pass through
+            // untouched). Players that can't decode MJPEG-over-RTSP (e.g.
+            // Windows Media Foundation) then work the same as on Linux.
+            rdev.source      = std::make_shared<server::TranscodingCameraSource>(
+                                   state.cam_router);
             // Camera RTSP transport. Default PLAIN RTSP: standard clients
             // (slicer GStreamer, VLC, ffmpeg) connect directly without
             // tripping on our self-signed TLS. Set BAMBU_BRIDGE_RTSP_TLS=1
