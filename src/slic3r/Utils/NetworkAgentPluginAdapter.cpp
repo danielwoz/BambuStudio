@@ -110,6 +110,16 @@ int NetworkAgentPluginAdapter::connect_printer(
     return rc;
 }
 
+int NetworkAgentPluginAdapter::set_user_selected_machine(const std::string& dev_id) {
+    if (!m_agent) return -1;
+    return m_agent->set_user_selected_machine(dev_id);
+}
+
+void NetworkAgentPluginAdapter::install_device_cert(const std::string& dev_id, bool lan_only) {
+    if (!m_agent) return;
+    m_agent->install_device_cert(dev_id, lan_only);
+}
+
 int NetworkAgentPluginAdapter::disconnect_printer() {
     if (!m_agent) return -1;
     int rc = m_agent->disconnect_printer();

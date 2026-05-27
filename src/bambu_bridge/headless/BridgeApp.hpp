@@ -110,9 +110,17 @@ struct VirtualPrinter {
     std::string access_code;
     std::string model;         // e.g. "H2S"; empty -> falls back to ssdp_default_model
     std::string firmware;      // empty -> falls back to ssdp_default_firmware
-    // Pre-resolved camera URL from Slic3r::GUI::build_media_live_url
-    // (the same ladder MediaPlayCtrl uses). Optional — when empty the
-    // bridge's camera sources fall back to their built-in URL form.
+    // Pre-resolved camera URL from Slic3r::GUI::build_media_live_url — the
+    // single native helper that encodes BambuStudio's
+    // liveview_local/remote/lan_mode/lan_ip ladder (the same one
+    // MediaPlayCtrl follows). The bridge REUSES this decision: it picks its
+    // camera source from the scheme of this URL rather than re-deriving it.
+    //   "bambu:///local..."       -> port-6000 JPEG (LVL_Local)
+    //   "...rtsps___/rtsp___..."  -> RTSP(S) via LanCameraSource (LVL_Rtsp*)
+    //   empty                     -> no local protocol resolved (disabled /
+    //                                remote-TUTK / not-yet-reported): prefer
+    //                                cloud, with a model-heuristic fallback
+    //                                for the transient unknown case.
     std::string camera_url;
 };
 

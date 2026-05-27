@@ -938,34 +938,62 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         state.cam_router->set_null_source(m_null_camera);
         state.cam_router->set_health_monitor(m_health);
 
-        // A1 / P1 series speak the native JPEG-on-port-6000 protocol
-        // (OpenBambuAPI/video.md). For those models, prefer the
-        // JpegCameraSource over LanCameraSource (which would try RTSPS
-        // on 322 — A1/P1 don't expose that) and over CloudCameraSource
-        // (which goes through the proprietary plugin's TUTK relay).
-        // For X1/H2-series models, leave the JPEG source null and the
-        // router falls back to existing LAN→Cloud preference.
-        if (router::is_jpeg_camera_model(state.model)) {
+        // Camera-source selection REUSES the native decision rather than
+        // re-implementing it: vp.camera_url was produced by the GUI's
+        // Slic3r::GUI::build_media_live_url — the single helper that encodes
+        // BambuStudio's liveview_local/remote/lan_mode/lan_ip ladder (the
+        // same one MediaPlayCtrl follows). We map its chosen scheme to a
+        // source, but in EVERY local/LAN case we lead with the libBambuSource
+        // LanCameraSource (lc.url_override = vp.camera_url, set above) — the
+        // exact same lib + URL native BambuStudio drives through gstbambusrc,
+        // for A1's bambu:///local port-6000 too. The hand-rolled
+        // JpegCameraSource (which native has no equivalent of) is demoted to a
+        // trailing fallback for the local case, in case the lib's headless
+        // local path can't open.
+        //   bambu:///local...   (LVL_Local) -> LAN (lib, local URL) + JPEG fb
+        //   ...rtsps___/rtsp___ (LVL_Rtsp*) -> LAN (lib, RTSP(S))
+        //   remote URL                       -> cloud/TUTK
+        //   empty (Disable/None, or not-yet-reported) -> prefer cloud; for the
+        //     transient-unknown case wire the JPEG fallback for A1/P1.
+        const std::string& cu = vp.camera_url;
+        router::CameraSourceRouter::Policy pol;
+        pol.allow_null_fallback = false;
+        bool        wire_jpeg = false;  // create JpegCameraSource (primary or fallback)
+        const char* why       = "";
+        if (cu.rfind("bambu:///local", 0) == 0) {
+            // Native path: lib drives bambu:///local; JPEG only as fallback.
+            pol.prefer_lan = true; pol.prefer_jpeg = false; wire_jpeg = true;
+            why = "camera_url=local -> LAN(lib) + JPEG fallback";
+        } else if (cu.find("rtsps___") != std::string::npos ||
+                   cu.find("rtsp___")  != std::string::npos) {
+            pol.prefer_lan = true;          // RTSP(S) via LanCameraSource
+            why = "camera_url=rtsp(s) -> LAN RTSPS";
+        } else if (!cu.empty()) {
+            pol.prefer_lan = false;         // resolved to a remote/cloud URL
+            why = "camera_url=remote -> cloud/TUTK";
+        } else {
+            // camera_url unresolved (local disabled / TUTK-async / not yet
+            // reported). Prefer the LAN(lib) path with a JPEG fallback for the
+            // transient-unknown A1/P1 case; otherwise cloud.
+            wire_jpeg      = router::is_jpeg_camera_model(state.model);
+            pol.prefer_lan = wire_jpeg;     // jpeg models: lan(lib)->cloud->jpeg
+            why = wire_jpeg ? "camera_url=empty -> LAN(lib) + JPEG fallback"
+                            : "camera_url=empty -> cloud/TUTK";
+        }
+        if (wire_jpeg) {
             router::JpegCameraSourceConfig jc;
             jc.dev_id      = dev_id;
             jc.printer_ip  = lan_ip;
             jc.access_code = access_code;
             state.jpeg_cam = std::make_shared<router::JpegCameraSource>(jc);
             state.cam_router->set_jpeg_source(state.jpeg_cam);
-
-            router::CameraSourceRouter::Policy pol;
-            pol.prefer_lan          = true;
-            pol.prefer_jpeg         = true;
-            pol.allow_null_fallback = false;
-            state.cam_router->set_policy(pol);
-
-            std::fprintf(stderr,
-                "[bridge-app] dev=%s model=%s -> using JpegCameraSource "
-                "(LAN port 6000, OpenBambuAPI video.md)\n",
-                dev_id.c_str(),
-                router::jpeg_camera_model_tag(state.model).c_str());
-            std::fflush(stderr);
         }
+        state.cam_router->set_policy(pol);
+        std::fprintf(stderr,
+            "[bridge-app] dev=%s model=%s camera_url=%.48s -> %s\n",
+            dev_id.c_str(), state.model.c_str(),
+            cu.empty() ? "(none)" : cu.c_str(), why);
+        std::fflush(stderr);
 
         if (m_rtsp) {
             server::RtspVirtualDevice rdev;
@@ -975,6 +1003,16 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
             rdev.access_code = access_code;
             rdev.cert        = cert;
             rdev.source      = state.cam_router;
+            // Camera RTSP transport. Default PLAIN RTSP: standard clients
+            // (slicer GStreamer, VLC, ffmpeg) connect directly without
+            // tripping on our self-signed TLS. Set BAMBU_BRIDGE_RTSP_TLS=1
+            // to serve RTSPS instead (TLS, real-printer-camera mimicry) —
+            // the slicer side must match (its virtual_camera_rtsps flag).
+            rdev.tls = false;
+            if (const char* e = std::getenv("BAMBU_BRIDGE_RTSP_TLS");
+                e && (*e == '1' || *e == 't' || *e == 'T' || *e == 'y' || *e == 'Y')) {
+                rdev.tls = true;
+            }
             try { m_rtsp->add_device(std::move(rdev)); }
             catch (const std::exception& ex) {
             }

@@ -188,11 +188,20 @@ int open_listener(const std::string& ip, uint16_t port, int backlog,
     return fd;
 }
 
-bool ssl_write_all(SSL* ssl, const void* data, size_t n) {
+// Write helper. When ssl is non-null this is TLS (RTSPS, real-printer
+// mimicry); when ssl is null we write the raw fd (plain RTSP — standard
+// clients like GStreamer/VLC that reject our self-signed cert).
+bool ssl_write_all(SSL* ssl, int fd, const void* data, size_t n) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
     size_t off = 0;
     while (off < n) {
-        int w = SSL_write(ssl, p + off, static_cast<int>(n - off));
+        int w;
+        if (ssl) {
+            w = SSL_write(ssl, p + off, static_cast<int>(n - off));
+        } else {
+            ssize_t s = ::send(fd, p + off, n - off, MSG_NOSIGNAL);
+            w = static_cast<int>(s);
+        }
         if (w <= 0) return false;
         off += static_cast<size_t>(w);
     }
@@ -256,7 +265,7 @@ bool read_some(SSL* ssl, int fd, std::vector<uint8_t>& buf,
                std::chrono::seconds timeout) {
     auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (SSL_pending(ssl) == 0) {
+        if (!ssl || SSL_pending(ssl) == 0) {
             fd_set rfds; FD_ZERO(&rfds); FD_SET(fd, &rfds);
             timeval tv{}; tv.tv_sec = 1; tv.tv_usec = 0;
             int s = ::select(fd + 1, &rfds, nullptr, nullptr, &tv);
@@ -264,13 +273,23 @@ bool read_some(SSL* ssl, int fd, std::vector<uint8_t>& buf,
             if (s == 0) continue;
         }
         uint8_t tmp[2048];
-        int n = SSL_read(ssl, tmp, sizeof(tmp));
+        int n;
+        if (ssl) {
+            n = SSL_read(ssl, tmp, sizeof(tmp));
+        } else {
+            ssize_t s = ::recv(fd, tmp, sizeof(tmp), 0);
+            n = static_cast<int>(s);
+        }
         if (n > 0) {
             buf.insert(buf.end(), tmp, tmp + n);
             return true;
         }
-        int err = SSL_get_error(ssl, n);
-        if (err == SSL_ERROR_WANT_READ) continue;
+        if (ssl) {
+            int err = SSL_get_error(ssl, n);
+            if (err == SSL_ERROR_WANT_READ) continue;
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        }
         return false;
     }
     return false;
@@ -340,7 +359,7 @@ bool read_rtsp_request(SSL* ssl, int fd, std::vector<uint8_t>& buf,
     return true;
 }
 
-bool write_rtsp_response(SSL* ssl, int code, const char* status,
+bool write_rtsp_response(SSL* ssl, int fd, int code, const char* status,
                          const std::string& cseq,
                          const std::vector<std::pair<std::string,std::string>>& hdrs,
                          const std::string& body) {
@@ -360,12 +379,12 @@ bool write_rtsp_response(SSL* ssl, int code, const char* status,
     os << "\r\n";
     os << body;
     std::string s = os.str();
-    return ssl_write_all(ssl, s.data(), s.size());
+    return ssl_write_all(ssl, fd, s.data(), s.size());
 }
 
 // Forward declaration: RFC 6184 / RFC 2435 packetisers share the
 // interleaved RTP-over-TLS sender defined a few hundred lines below.
-bool send_rtp_interleaved(SSL* ssl, uint8_t channel,
+bool send_rtp_interleaved(SSL* ssl, int fd, uint8_t channel,
                           uint16_t& seq, uint32_t ts, uint32_t ssrc,
                           uint8_t pt, bool marker,
                           const uint8_t* payload, size_t plen);
@@ -604,7 +623,7 @@ build_rtp_jpeg_payloads(const JpegParse& jp,
 
 // Build & send all RTP packets for one MJPEG frame. Returns false on TLS
 // write failure. Marker bit goes on the last packet.
-bool packetise_jpeg_frame(SSL* ssl, uint8_t channel,
+bool packetise_jpeg_frame(SSL* ssl, int fd, uint8_t channel,
                           uint16_t& seq, uint32_t ts, uint32_t ssrc,
                           const JpegParse& jp,
                           const uint8_t* scan, size_t scan_len,
@@ -612,7 +631,7 @@ bool packetise_jpeg_frame(SSL* ssl, uint8_t channel,
     auto payloads = build_rtp_jpeg_payloads(jp, scan, scan_len, max_payload);
     for (size_t i = 0; i < payloads.size(); ++i) {
         const bool marker = (i + 1 == payloads.size());
-        if (!send_rtp_interleaved(ssl, channel, seq, ts, ssrc,
+        if (!send_rtp_interleaved(ssl, fd, channel, seq, ts, ssrc,
                                   /*pt=*/26, marker,
                                   payloads[i].data(), payloads[i].size())) {
             return false;
@@ -663,7 +682,7 @@ void split_annexb_nals(const std::vector<uint8_t>& in,
 // TLS write failure. `marker` sets the M bit; `pt` is the payload type.
 //
 // We don't need to expose the RTP header struct outside this fn.
-bool send_rtp_interleaved(SSL* ssl, uint8_t channel,
+bool send_rtp_interleaved(SSL* ssl, int fd, uint8_t channel,
                           uint16_t& seq, uint32_t ts, uint32_t ssrc,
                           uint8_t pt, bool marker,
                           const uint8_t* payload, size_t plen) {
@@ -690,23 +709,23 @@ bool send_rtp_interleaved(SSL* ssl, uint8_t channel,
     frm[2] = static_cast<uint8_t>(total >> 8);
     frm[3] = static_cast<uint8_t>(total & 0xFF);
 
-    if (!ssl_write_all(ssl, frm, sizeof(frm))) return false;
-    if (!ssl_write_all(ssl, hdr, sizeof(hdr))) return false;
-    if (plen && !ssl_write_all(ssl, payload, plen)) return false;
+    if (!ssl_write_all(ssl, fd, frm, sizeof(frm))) return false;
+    if (!ssl_write_all(ssl, fd, hdr, sizeof(hdr))) return false;
+    if (plen && !ssl_write_all(ssl, fd, payload, plen)) return false;
     return true;
 }
 
 // Packetise ONE NAL unit per RFC 6184. Single-NAL when small, FU-A
 // fragmentation when bigger than max_payload. `marker` should be true
 // on the LAST NAL of the access unit.
-bool packetise_nal(SSL* ssl, uint8_t channel,
+bool packetise_nal(SSL* ssl, int fd, uint8_t channel,
                    uint16_t& seq, uint32_t ts, uint32_t ssrc,
                    const uint8_t* nal, size_t nlen,
                    bool last_nal_of_au,
                    size_t max_payload) {
     if (nlen == 0) return true;
     if (nlen <= max_payload) {
-        return send_rtp_interleaved(ssl, channel, seq, ts, ssrc,
+        return send_rtp_interleaved(ssl, fd, channel, seq, ts, ssrc,
                                     /*pt=*/96,
                                     /*marker=*/last_nal_of_au,
                                     nal, nlen);
@@ -736,7 +755,7 @@ bool packetise_nal(SSL* ssl, uint8_t channel,
         buf.insert(buf.end(), body + off, body + off + chunk);
 
         const bool m = last && last_nal_of_au;
-        if (!send_rtp_interleaved(ssl, channel, seq, ts, ssrc,
+        if (!send_rtp_interleaved(ssl, fd, channel, seq, ts, ssrc,
                                   /*pt=*/96, m,
                                   buf.data(), buf.size())) {
             return false;
@@ -864,11 +883,13 @@ RtspServer::Device* RtspServer::find_locked(const std::string& dev_id) {
 void RtspServer::add_device(RtspVirtualDevice dev) {
     auto d     = std::make_unique<Device>();
     d->spec    = std::move(dev);
-    d->ssl_ctx = make_device_ctx(d->spec.cert);
-    if (!d->ssl_ctx) {
-        throw std::runtime_error("RtspServer: failed to build SSL_CTX for dev_id="
-                                 + d->spec.dev_id);
-    }
+    if (d->spec.tls) {
+        d->ssl_ctx = make_device_ctx(d->spec.cert);
+        if (!d->ssl_ctx) {
+            throw std::runtime_error("RtspServer: failed to build SSL_CTX for dev_id="
+                                     + d->spec.dev_id);
+        }
+    }  // else: plain RTSP, no TLS context
     Device* raw = d.get();
     {
         std::lock_guard<std::mutex> lk(m_devices_mu);
@@ -913,9 +934,11 @@ void session_io_loop(RtspServer::Device* dev,
         ~Cleanup() { sess->stopped.store(true); }
     } cleanup{sess};
 
-    if (SSL_accept(sess->ssl) != 1) {
-        log_ssl_err("SSL_accept(rtsp)");
-        return;
+    if (sess->ssl) {  // TLS (RTSPS); plain RTSP skips the handshake
+        if (SSL_accept(sess->ssl) != 1) {
+            log_ssl_err("SSL_accept(rtsp)");
+            return;
+        }
     }
 
     // Per-session control state.
@@ -959,7 +982,7 @@ void session_io_loop(RtspServer::Device* dev,
     auto write_resp_ok = [&](const std::string& cseq,
                              const std::vector<std::pair<std::string,std::string>>& h,
                              const std::string& body) {
-        return write_rtsp_response(sess->ssl, 200, "OK", cseq, h, body);
+        return write_rtsp_response(sess->ssl, sess->fd,200, "OK", cseq, h, body);
     };
 
     // The codec is fixed at source-open time; cache it so we don't poll
@@ -984,7 +1007,7 @@ void session_io_loop(RtspServer::Device* dev,
                 // failure only if EVERY frame is bad.
                 return true;
             }
-            return packetise_jpeg_frame(sess->ssl, rtp_channel, rtp_seq, ts,
+            return packetise_jpeg_frame(sess->ssl, sess->fd, rtp_channel, rtp_seq, ts,
                                         rtp_ssrc, jp,
                                         f.nal_data.data() + jp.scan_off,
                                         jp.scan_len,
@@ -998,7 +1021,7 @@ void session_io_loop(RtspServer::Device* dev,
             const uint8_t* p = f.nal_data.data() + ranges[i].first;
             const size_t   n = ranges[i].second;
             const bool last  = (i + 1 == ranges.size());
-            if (!packetise_nal(sess->ssl, rtp_channel, rtp_seq, ts, rtp_ssrc,
+            if (!packetise_nal(sess->ssl, sess->fd, rtp_channel, rtp_seq, ts, rtp_ssrc,
                                p, n, last,
                                static_cast<size_t>(cfg.rtp_max_payload))) {
                 return false;
@@ -1054,7 +1077,7 @@ void session_io_loop(RtspServer::Device* dev,
                         ("bblp:" + dev->spec.access_code).c_str()),
                     5 + dev->spec.access_code.size());
                 if (it == req.headers.end() || it->second != expect) {
-                    write_rtsp_response(sess->ssl, 401, "Unauthorized", cseq,
+                    write_rtsp_response(sess->ssl, sess->fd,401, "Unauthorized", cseq,
                         {{"WWW-Authenticate", "Basic realm=\"bambu\""}}, "");
                     continue;
                 }
@@ -1072,7 +1095,7 @@ void session_io_loop(RtspServer::Device* dev,
             std::string lower = transport;
             for (auto& c : lower) if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
             if (lower.find("rtp/avp/tcp") == std::string::npos) {
-                write_rtsp_response(sess->ssl, 461, "Unsupported transport", cseq, {}, "");
+                write_rtsp_response(sess->ssl, sess->fd,461, "Unsupported transport", cseq, {}, "");
                 continue;
             }
             // Echo the interleaved channels back. Parse "interleaved=a-b".
@@ -1096,7 +1119,7 @@ void session_io_loop(RtspServer::Device* dev,
         }
         else if (verb == "PLAY") {
             if (!setup_done) {
-                write_rtsp_response(sess->ssl, 455, "Method Not Valid In This State", cseq, {}, "");
+                write_rtsp_response(sess->ssl, sess->fd,455, "Method Not Valid In This State", cseq, {}, "");
                 continue;
             }
             if (src && !src->is_open()) (void)src->open();
@@ -1120,7 +1143,7 @@ void session_io_loop(RtspServer::Device* dev,
             write_resp_ok(cseq, {{"Session", session_id}}, "");
         }
         else {
-            write_rtsp_response(sess->ssl, 501, "Not Implemented", cseq, {}, "");
+            write_rtsp_response(sess->ssl, sess->fd,501, "Not Implemented", cseq, {}, "");
         }
     }
 }
@@ -1207,12 +1230,15 @@ void RtspServer::start_device(Device& d) {
                 }
             }
 
-            SSL* ssl = SSL_new(d.ssl_ctx);
-            if (!ssl) { ::close(cfd); continue; }
-            SSL_set_fd(ssl, cfd);
+            SSL* ssl = nullptr;
+            if (d.spec.tls) {
+                ssl = SSL_new(d.ssl_ctx);
+                if (!ssl) { ::close(cfd); continue; }
+                SSL_set_fd(ssl, cfd);
+            }  // else: plain RTSP — io loop uses the raw fd directly
 
             auto sess = std::make_unique<RtspServer::Device::Session>();
-            sess->ssl = ssl;
+            sess->ssl = ssl;   // nullptr in plain mode
             sess->fd  = cfd;
             sess->stopped.store(false);
 

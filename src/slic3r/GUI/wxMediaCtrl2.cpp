@@ -57,6 +57,11 @@ wxMediaCtrl2::wxMediaCtrl2(wxWindow *parent)
 void wxMediaCtrl2::Load(wxURI url)
 {
 #ifdef __WIN32__
+    // Virtual-printer cameras now use a STANDARD rtsp(s):// URL (from
+    // build_virtual_live_url) — handle them the same way as Linux: hand the
+    // URL straight to the media backend, with none of the BambuSource.dll /
+    // bambu-scheme / &hwnd=&tid= machinery (legacy bambu:/// scheme only).
+    const bool is_bambu_scheme = (url.GetScheme() == "bambu");
     InvalidateBestSize();
     if (m_imp == nullptr) {
         static bool notified = false;
@@ -76,7 +81,7 @@ void wxMediaCtrl2::Load(wxURI url)
         wxPostEvent(this, event);
         return;
     }
-    {
+    if (is_bambu_scheme) {
         wxRegKey key11(wxRegKey::HKCU, L"SOFTWARE\\Classes\\CLSID\\" CLSID_BAMBU_SOURCE L"\\InProcServer32");
         wxRegKey key12(wxRegKey::HKCR, L"CLSID\\" CLSID_BAMBU_SOURCE L"\\InProcServer32");
         wxString path = key11.Exists() ? key11.QueryDefaultValue()
@@ -140,8 +145,12 @@ void wxMediaCtrl2::Load(wxURI url)
             keyWmp.SetValue("Permissions", permissions);
         }
     }
-    url = wxURI(url.BuildURI().append("&hwnd=").append(boost::lexical_cast<std::string>(GetHandle())).append("&tid=").append(
-        boost::lexical_cast<std::string>(GetCurrentThreadId())));
+    if (is_bambu_scheme) {
+        // BambuSource (DirectShow) reads the target window + thread from the
+        // URL. Standard rtsp(s):// streams go to the native backend untouched.
+        url = wxURI(url.BuildURI().append("&hwnd=").append(boost::lexical_cast<std::string>(GetHandle())).append("&tid=").append(
+            boost::lexical_cast<std::string>(GetCurrentThreadId())));
+    }
 #endif
 #ifdef __WXGTK3__
     GstElementFactory *factory;

@@ -76,6 +76,11 @@ struct RtspVirtualDevice {
     std::string                   access_code;
     tls::CertMaterial             cert;
     std::shared_ptr<ICameraSource> source;
+    // When true (default) the endpoint is implicit-TLS RTSPS (real-printer
+    // mimicry, for the bambu:/// libBambuSource client path). When false it
+    // serves PLAIN RTSP — standard clients (OrcaSlicer/BambuStudio GStreamer,
+    // VLC, ffmpeg) connect directly without tripping on the self-signed cert.
+    bool                          tls = true;
 };
 
 struct RtspServerConfig {

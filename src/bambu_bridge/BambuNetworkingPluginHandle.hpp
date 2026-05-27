@@ -213,6 +213,20 @@ public:
                                 const std::string& password,
                                 bool               use_ssl);
 
+    // Mark `dev_id` the plugin's active machine. The enc_msg gate and
+    // the cert handshake are keyed off this selection. Returns plugin's
+    // rc (0 = success), -1/-2 for no-agent / missing-export.
+    virtual int set_user_selected_machine(const std::string& dev_id);
+
+    // Trigger the device-cert handshake (cert_request → printer's
+    // cert_report reply) that populates the plugin's device_pub_key_map
+    // for `dev_id`. Until that map entry exists, the enc_msg gate refuses
+    // to sign print.* and send_message_to_printer drops the publish with
+    // rc=-4. Must be called AFTER connect_printer establishes the LAN
+    // session so the cert_request rides a live socket. No return (the
+    // plugin export is void).
+    virtual void install_device_cert(const std::string& dev_id, bool lan_only);
+
     // Tear down the current LAN MQTT-over-TLS connection. Global (the
     // plugin only holds one). Returns plugin's rc (0 = success), -1/-2
     // for the no-agent / missing-export degraded states.

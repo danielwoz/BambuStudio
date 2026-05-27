@@ -11,6 +11,9 @@
 #include "slic3r/Utils/BBLUtil.hpp"
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "slic3r/Utils/FileTransferObject.hpp"
+#include "slic3r/Utils/bambu_virtual_client/VirtualLanPrinterStore.hpp"
+#include <boost/asio.hpp>
+#include <cstring>
 
 #include <boost/lexical_cast.hpp>
 #include <boost/log/trivial.hpp>
@@ -281,6 +284,48 @@ void refresh_agora_url(char const* device, char const* dev_ver, char const* chan
     });
 }
 
+// Detect whether the bridge serves the camera as plain RTSP or RTSPS (the
+// bridge chooses via BAMBU_BRIDGE_RTSP_TLS). Probe the port so the slicer
+// needs no matching flag: open the socket, send a plaintext RTSP OPTIONS;
+// a plain server answers "RTSP/...", a TLS server treats the plaintext as a
+// bad handshake (alert/close/no reply) so anything else means rtsps. Bounded
+// timeouts; defaults to plain rtsp on any error.
+static const char* probe_rtsp_scheme(const std::string& host, uint16_t port)
+{
+    namespace ba = boost::asio;
+    using namespace std::chrono;
+    const char* scheme = "rtsp";
+    try {
+        ba::io_context io;
+        ba::ip::tcp::socket sock(io);
+        boost::system::error_code cec = ba::error::would_block;
+        sock.async_connect(
+            ba::ip::tcp::endpoint(ba::ip::make_address(host), port),
+            [&](const boost::system::error_code& e) { cec = e; });
+        io.run_for(milliseconds(500));
+        if (cec || !sock.is_open()) return scheme;
+
+        const std::string req =
+            "OPTIONS rtsp://" + host + "/streaming/live/1 RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        boost::system::error_code wec;
+        ba::write(sock, ba::buffer(req), wec);
+
+        io.restart();
+        char buf[16] = {0};
+        std::size_t got = 0;
+        sock.async_read_some(ba::buffer(buf),
+            [&](const boost::system::error_code& e, std::size_t n) { if (!e) got = n; });
+        io.run_for(milliseconds(500));
+
+        scheme = (got >= 5 && std::memcmp(buf, "RTSP/", 5) == 0) ? "rtsp" : "rtsps";
+        boost::system::error_code ig;
+        sock.close(ig);
+    } catch (...) {
+        scheme = "rtsp";
+    }
+    return scheme;
+}
+
 void MediaPlayCtrl::Play()
 {
     if (!m_next_retry.IsValid() || wxDateTime::Now() < m_next_retry)
@@ -327,19 +372,32 @@ void MediaPlayCtrl::Play()
     // support would need a slicer→bridge port lookup.
     if (Slic3r::NetworkAgent::is_virtual_dev_id(m_machine) &&
         !m_lan_ip.empty()) {
-        constexpr uint16_t kBridgeRtspPortBase = 38322;
-        std::string url =
-            "bambu:///rtsps___" + m_lan_user + ":" + m_lan_passwd +
-            "@" + m_lan_ip + ":" + std::to_string(kBridgeRtspPortBase) +
-            "/streaming/live/1?proto=rtsps";
-        url += "&device=" + m_machine;
-        url += "&net_ver=" + agent_version;
-        url += "&dev_ver=" + m_dev_ver;
-        url += "&cli_id=" + wxGetApp().app_config->get("slicer_uuid");
-        url += "&cli_ver=" + std::string(SLIC3R_VERSION);
+        // Standard PLAIN RTSP served by the bridge's own C++ RtspServer
+        // (server/RtspServer.cpp), NOT the proprietary bambu:/// scheme —
+        // virtual printers use standard streaming the slicer's native
+        // GStreamer rtspsrc plays directly (no libBambuSource). Per-device
+        // port = rtsp_base + (mqtt_port - mqtt_base).
+        constexpr uint16_t kBridgeMqttPort = 8883;
+        constexpr uint16_t kBridgeRtspPort = 38322;
+        uint16_t rtsp_port = kBridgeRtspPort;
+        {
+            Slic3r::VirtualLanPrinterStore store;
+            for (const auto& e : store.load()) {
+                if (e.dev_id == m_machine && e.mqtt_port != 0) {
+                    rtsp_port = static_cast<uint16_t>(
+                        int(kBridgeRtspPort) + (int(e.mqtt_port) - int(kBridgeMqttPort)));
+                    break;
+                }
+            }
+        }
+        // Transport (rtsp vs rtsps) is detected by probing the bridge — no
+        // slicer-side flag; the bridge's BAMBU_BRIDGE_RTSP_TLS is the single
+        // source of truth.
+        const char* scheme = probe_rtsp_scheme(m_lan_ip, rtsp_port);
+        std::string url = std::string(scheme) + "://" +
+            m_lan_ip + ":" + std::to_string(rtsp_port) + "/streaming/live/1";
         BOOST_LOG_TRIVIAL(info)
-            << "MediaPlayCtrl: virtual rtsps via bridge: "
-            << hide_passwd(url, {m_lan_passwd});
+            << "MediaPlayCtrl: virtual (standard rtsp) url " << url;
         m_url = url;
         load();
         m_button_play->SetIcon("media_stop");

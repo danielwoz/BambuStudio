@@ -22,6 +22,7 @@
 
 #include "router/CameraSourceRouter.hpp"
 #include "router/CloudCameraSource.hpp"
+#include "router/JpegCameraSource.hpp"
 #include "router/LanCameraSource.hpp"
 #include "router/NullCameraSource.hpp"
 #include "router/UplinkHealth.hpp"
@@ -37,6 +38,8 @@ void check(bool ok, const char* what) {
 using Slic3r::bridge::router::CameraSourceRouter;
 using Slic3r::bridge::router::CloudCameraSource;
 using Slic3r::bridge::router::CloudCameraSourceConfig;
+using Slic3r::bridge::router::JpegCameraSource;
+using Slic3r::bridge::router::JpegCameraSourceConfig;
 using Slic3r::bridge::router::LanCameraSource;
 using Slic3r::bridge::router::LanCameraSourceConfig;
 using Slic3r::bridge::router::NullCameraSource;
@@ -106,6 +109,36 @@ public:
     Slic3r::bridge::server::ICameraSource::StreamInfo info() const override {
         Slic3r::bridge::server::ICameraSource::StreamInfo si;
         si.width = 640; si.height = 480; si.fps = 24;
+        return si;
+    }
+private:
+    std::atomic<bool> m_open{false};
+};
+
+class StubJpeg : public JpegCameraSource {
+public:
+    StubJpeg() : JpegCameraSource(JpegCameraSourceConfig{}) {}
+    std::atomic<bool> open_succeeds{true};
+    std::atomic<int>  open_calls{0};
+    std::atomic<int>  frame_calls{0};
+
+    bool open() override {
+        ++open_calls;
+        if (!open_succeeds.load()) return false;
+        m_open.store(true);
+        return true;
+    }
+    void close() override { m_open.store(false); }
+    bool is_open() const override { return m_open.load(); }
+    std::optional<VideoFrame> next_frame(int) override {
+        ++frame_calls;
+        if (!m_open.load()) return std::nullopt;
+        VideoFrame f; f.nal_data = {0xFF,0xD8,0xFF,0xD9}; f.is_keyframe = true;
+        return f;
+    }
+    Slic3r::bridge::server::ICameraSource::StreamInfo info() const override {
+        Slic3r::bridge::server::ICameraSource::StreamInfo si;
+        si.width = 1280; si.height = 720; si.fps = 30;
         return si;
     }
 private:
@@ -276,6 +309,54 @@ int main() {
               "S5: cloud NOT asked after mid-stream failure");
         check(router.current_choice() == CameraSourceRouter::Choice::Lan,
               "S5: choice still LAN after mid-stream nullopt");
+    }
+
+    // ---- Scenario 6: JPEG demoted to trailing fallback (the native-aligned
+    // local path). prefer_lan + prefer_jpeg=false with a JPEG source wired:
+    // the libBambuSource LAN source must lead; JPEG is tried ONLY after LAN
+    // (and cloud) fail to open. This is the A1 bambu:///local case where we
+    // drive the same lib native does, with JpegCameraSource as the net. ----
+    {
+        // 6a: LAN healthy → LAN wins, JPEG never touched even though wired.
+        auto lan  = std::make_shared<StubLan>();
+        auto jpeg = std::make_shared<StubJpeg>();
+        CameraSourceRouter router(dev_id);
+        router.set_lan_source(lan);
+        router.set_jpeg_source(jpeg);
+        CameraSourceRouter::Policy pol;
+        pol.prefer_lan  = true;
+        pol.prefer_jpeg = false;   // JPEG is fallback-only
+        router.set_policy(pol);
+
+        check(router.open(), "S6a: router opens");
+        check(router.current_choice() == CameraSourceRouter::Choice::Lan,
+              "S6a: LAN(lib) leads when prefer_jpeg=false");
+        check(jpeg->open_calls.load() == 0,
+              "S6a: JPEG NOT preempting LAN");
+    }
+    {
+        // 6b: LAN open() fails (lib's headless local path can't open) →
+        // router falls through to the JPEG trailing fallback.
+        auto lan  = std::make_shared<StubLan>();
+        auto jpeg = std::make_shared<StubJpeg>();
+        lan->open_succeeds.store(false);
+        CameraSourceRouter router(dev_id);
+        router.set_lan_source(lan);
+        router.set_jpeg_source(jpeg);
+        CameraSourceRouter::Policy pol;
+        pol.prefer_lan  = true;
+        pol.prefer_jpeg = false;
+        router.set_policy(pol);
+
+        check(router.open(), "S6b: router opens via JPEG fallback");
+        check(router.current_choice() == CameraSourceRouter::Choice::Jpeg,
+              "S6b: JPEG chosen after LAN open() failure");
+        check(lan->open_calls.load()  == 1, "S6b: LAN tried first");
+        check(jpeg->open_calls.load() == 1, "S6b: JPEG tried after LAN failed");
+
+        auto f = router.next_frame(0);
+        check(f.has_value(),                 "S6b: frame served from JPEG");
+        check(jpeg->frame_calls.load() == 1, "S6b: JPEG counted");
     }
 
     if (g_fails) {

@@ -567,13 +567,16 @@ bool run_headless(GUI_App* app)
                 p.access_code = mo->get_access_code();
                 p.model       = mo->printer_type;
                 p.firmware    = mo->get_ota_version();
-                // Resolve the live-view URL through the same helper
-                // MediaPlayCtrl uses. We only capture the LAN-direct
-                // branch synchronously; the TUTK branch's HTTP fetch
-                // would arrive too late for this tick (and the bridge's
-                // CloudCameraSource has its own get_camera_url path that
-                // handles it). Empty p.camera_url tells the bridge's
-                // sources to fall back to their built-in URL builders.
+                // Resolve the live-view URL through build_media_live_url — the
+                // single native helper that encodes the liveview protocol
+                // decision (the same one MediaPlayCtrl uses). The bridge picks
+                // its camera source from this URL's scheme, so this IS the
+                // decision; we don't hand it a raw liveview_local to re-decide.
+                // We only capture the LAN-direct branch synchronously; the
+                // TUTK branch's HTTP fetch would arrive too late for this tick
+                // (and the bridge's CloudCameraSource has its own
+                // get_camera_url path). Empty p.camera_url => no local
+                // protocol resolved -> the bridge prefers cloud.
                 Slic3r::GUI::build_media_live_url(mo,
                     [&p](std::string url, Slic3r::GUI::MediaUrlError err) {
                         if (err == Slic3r::GUI::MediaUrlError::Ok)
@@ -663,6 +666,29 @@ void install_gui_worker(GUI_App* app)
         // early-returns when neither printer_source nor m_inventory
         // are wired). Leaving the default 60s so the poll thread
         // stays alive for shutdown-via-stop-flag plumbing.
+
+        // Multi-process launcher support: BAMBU_BRIDGE_PORT_OFFSET shifts
+        // every server's port base by N so one-bridge-per-printer children
+        // don't collide. Each child owns its own plugin LAN slot (no
+        // SWAP-thrash), so the enc_msg cert handshake stays stable and
+        // print.* signing is reliable for that printer. SSDP (1900/2021)
+        // is multicast with SO_REUSEPORT and stays shared — each child
+        // answers M-SEARCH for its own printer with its own (offset) port.
+        if (const char* off = std::getenv("BAMBU_BRIDGE_PORT_OFFSET");
+            off && *off) {
+            const int n = std::atoi(off);
+            if (n > 0 && n < 1000) {
+                cfg.mqtt_port_base = static_cast<uint16_t>(cfg.mqtt_port_base + n);
+                cfg.ftps_port_base = static_cast<uint16_t>(cfg.ftps_port_base + n);
+                cfg.rtsp_port_base = static_cast<uint16_t>(cfg.rtsp_port_base + n);
+                cfg.vtun_port_base = static_cast<uint16_t>(cfg.vtun_port_base + n);
+                std::fprintf(stderr,
+                    "[bridge-gui] PORT_OFFSET=%d -> mqtt=%u ftps=%u rtsp=%u vtun=%u\n",
+                    n, cfg.mqtt_port_base, cfg.ftps_port_base,
+                    cfg.rtsp_port_base, cfg.vtun_port_base);
+                std::fflush(stderr);
+            }
+        }
 
         // Slicer-identity fields baked into the storage tunnel URL.
         // Without these, libBambuSource refuses to advance
@@ -815,6 +841,16 @@ void install_gui_worker(GUI_App* app)
                 // first frame and bambu_start_stream_ex spins on
                 // would_block forever. Push the live value.
                 p.firmware    = mo->get_ota_version();
+                // Resolve the live-view URL via build_media_live_url here too
+                // (add_device_locked wires the camera ONCE, from whichever
+                // snapshot adds the device first — so camera_url must be set
+                // on both paths or the cascade-added device picks cloud). Same
+                // synchronous LAN-direct capture as the push-timer snapshot.
+                Slic3r::GUI::build_media_live_url(mo,
+                    [&p](std::string url, Slic3r::GUI::MediaUrlError err) {
+                        if (err == Slic3r::GUI::MediaUrlError::Ok)
+                            p.camera_url = std::move(url);
+                    });
                 snap.push_back(std::move(p));
             }
             // Same logic at the snapshot level: an empty list from a
@@ -862,6 +898,29 @@ void install_gui_worker(GUI_App* app)
                     std::vector<std::string> dev_ids;
                     for (const auto& kv : list)
                         if (!kv.first.empty()) dev_ids.push_back(kv.first);
+                    // Multi-process: when BAMBU_BRIDGE_TARGET_DEV pins this
+                    // process to specific printer(s), restrict the cert
+                    // cascade to those. Cycling non-served, non-LAN-connected
+                    // dev_ids (set_user_selected_machine on a printer this
+                    // process never connect_printer'd) churns the plugin's
+                    // active-machine state and races the served printer's
+                    // cert_report — leaving its device_pub_key_map empty.
+                    if (const char* td = std::getenv("BAMBU_BRIDGE_TARGET_DEV");
+                        td && *td) {
+                        std::vector<std::string> keep;
+                        const std::string s = td; size_t pos = 0;
+                        while (pos <= s.size()) {
+                            const size_t c = s.find(',', pos);
+                            const size_t e = (c == std::string::npos) ? s.size() : c;
+                            if (e > pos) keep.push_back(s.substr(pos, e - pos));
+                            if (c == std::string::npos) break;
+                            pos = c + 1;
+                        }
+                        dev_ids.erase(std::remove_if(dev_ids.begin(), dev_ids.end(),
+                            [&keep](const std::string& d){
+                                return std::find(keep.begin(), keep.end(), d) == keep.end();
+                            }), dev_ids.end());
+                    }
                     std::fprintf(stderr,
                         "[bridge-gui] cascade ready, %zu owned dev_ids; "
                         "wiring per-printer plugin setup\n",
@@ -943,16 +1002,22 @@ void install_gui_worker(GUI_App* app)
                         "[bridge-gui] post-LAN enc_msg gate-open cycle: "
                         "select + install_cert per dev_id\n");
                     std::fflush(stderr);
-                    for (const auto& d : dev_ids) {
-                        int sel_rc2 = ag->set_user_selected_machine(d);
-                        ag->install_device_cert(d, /*lan_only=*/false);
-                        std::fprintf(stderr,
-                            "[bridge-gui] (cycle) dev=%s "
-                            "set_user_selected_machine rc=%d + "
-                            "install_device_cert; waiting 5s for cert_report\n",
-                            d.c_str(), sel_rc2);
-                        std::fflush(stderr);
-                        std::this_thread::sleep_for(5s);
+                    // The cert_report round-trip is timing-flaky (a single
+                    // install_device_cert often loses the race and leaves
+                    // device_pub_key_map empty). It's idempotent, so retry a
+                    // few rounds per dev to make the gate-open reliable.
+                    for (int round = 0; round < 3; ++round) {
+                        for (const auto& d : dev_ids) {
+                            int sel_rc2 = ag->set_user_selected_machine(d);
+                            ag->install_device_cert(d, /*lan_only=*/false);
+                            std::fprintf(stderr,
+                                "[bridge-gui] (cycle r%d) dev=%s "
+                                "set_user_selected_machine rc=%d + "
+                                "install_device_cert; waiting 5s for cert_report\n",
+                                round, d.c_str(), sel_rc2);
+                            std::fflush(stderr);
+                            std::this_thread::sleep_for(5s);
+                        }
                     }
 
                     std::fprintf(stderr,

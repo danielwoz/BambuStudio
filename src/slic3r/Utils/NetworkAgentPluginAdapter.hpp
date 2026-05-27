@@ -66,6 +66,13 @@ public:
                         const std::string& password,
                         bool               use_ssl) override;
     int disconnect_printer() override;
+    // Delegate the enc_msg gate-open primitives to the wrapped GUI
+    // NetworkAgent (which owns the live plugin agent). The base
+    // BambuNetworkingPluginHandle impls check their own null m_impl->agent
+    // and would no-op here, so LanUplink's post-connect cert re-fire only
+    // works if these route through the real agent.
+    int  set_user_selected_machine(const std::string& dev_id) override;
+    void install_device_cert(const std::string& dev_id, bool lan_only) override;
     int send_message_to_printer(const std::string& dev_id,
                                 const std::string& json_payload,
                                 int                qos) override;

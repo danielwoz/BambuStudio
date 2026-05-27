@@ -51,3 +51,9 @@ compile_commands.json
 log_iotc.txt
 result.json
 tools/no_debugger.so
+
+# Ship 21 — recovered RSA key material (NEVER commit)
+app_key.pem
+**/app_key.pem
+rsa_components.json
+/tmp/ship21/

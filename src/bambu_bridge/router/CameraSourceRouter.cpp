@@ -113,12 +113,16 @@ bool CameraSourceRouter::open() {
     const bool jpeg_ok  = static_cast<bool>(jpeg);
     (void)health;
 
-    // Build the preference order. JPEG (A1/P1 native) always wins when
-    // `prefer_jpeg` is set AND a JPEG source is configured — for those
-    // models the H.264 LanCameraSource path is wrong (printer's port 322
-    // isn't an RTSPS server) and cloud path requires TUTK plugin. JPEG
-    // failing falls back to LAN→Cloud→Null in the usual order so the
-    // bridge degrades gracefully (e.g. printer offline).
+    // Build the preference order.
+    //
+    // `prefer_jpeg` puts the hand-rolled port-6000 JPEG source FIRST — used
+    // only when we can't drive the native libBambuSource path (no URL yet,
+    // proprietary lib unavailable). Otherwise the libBambuSource LAN source
+    // leads (it's the SAME path native BambuStudio uses for every model,
+    // including A1's bambu:///local port-6000 — see LanCameraSource), and a
+    // configured JPEG source is appended as a trailing fallback so we still
+    // degrade gracefully if the lib's headless local path can't open. JPEG
+    // appears at most once, so `order[4]` always suffices.
     Choice order[4] = { Choice::None, Choice::None, Choice::None, Choice::None };
     int    n        = 0;
     if (policy.prefer_jpeg && jpeg_ok && jpeg) {
@@ -131,6 +135,7 @@ bool CameraSourceRouter::open() {
         if (cloud_ok && cloud) order[n++] = Choice::Cloud;
         if (lan_ok   && lan)   order[n++] = Choice::Lan;
     }
+    if (!policy.prefer_jpeg && jpeg_ok && jpeg) order[n++] = Choice::Jpeg;
     if (policy.allow_null_fallback && null) order[n++] = Choice::Null;
 
     for (int i = 0; i < n; ++i) {

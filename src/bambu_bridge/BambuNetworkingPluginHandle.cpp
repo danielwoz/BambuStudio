@@ -91,6 +91,11 @@ extern "C++" {
                                                  std::string password,
                                                  bool        use_ssl);
     using func_disconnect_printer    = int   (*)(void* agent);
+    using func_set_user_selected_machine = int  (*)(void* agent,
+                                                    std::string dev_id);
+    using func_install_device_cert       = void (*)(void* agent,
+                                                    std::string dev_id,
+                                                    bool        lan_only);
     using func_set_on_local_msg_fn   = int   (*)(void* agent,
                                                  std::function<void(std::string dev_id,
                                                                     std::string msg)> fn);
@@ -284,6 +289,8 @@ struct BambuNetworkingPluginHandle::Impl {
     func_start_local_print_with_record   start_local_print_with_record   = nullptr;
     func_connect_printer                 connect_printer                 = nullptr;
     func_disconnect_printer              disconnect_printer              = nullptr;
+    func_set_user_selected_machine       set_user_selected_machine       = nullptr;
+    func_install_device_cert             install_device_cert             = nullptr;
     func_set_on_local_msg_fn             set_on_local_msg_fn             = nullptr;
     func_set_on_local_conn_fn            set_on_local_conn_fn            = nullptr;
     func_get_camera_url                  get_camera_url                  = nullptr;
@@ -361,6 +368,10 @@ struct BambuNetworkingPluginHandle::Impl {
             "bambu_network_start_local_print_with_record");
         connect_printer     = lib.sym<func_connect_printer>   ("bambu_network_connect_printer");
         disconnect_printer  = lib.sym<func_disconnect_printer>("bambu_network_disconnect_printer");
+        set_user_selected_machine = lib.sym<func_set_user_selected_machine>(
+            "bambu_network_set_user_selected_machine");
+        install_device_cert = lib.sym<func_install_device_cert>(
+            "bambu_network_install_device_cert");
         set_on_local_msg_fn = lib.sym<func_set_on_local_msg_fn>("bambu_network_set_on_local_message_fn");
         set_on_local_conn_fn = lib.sym<func_set_on_local_conn_fn>("bambu_network_set_on_local_connect_fn");
         get_camera_url       = lib.sym<func_get_camera_url>     ("bambu_network_get_camera_url");
@@ -617,6 +628,19 @@ int BambuNetworkingPluginHandle::connect_printer(const std::string& dev_id,
     if (!m_impl->connect_printer)  return -2;
     return m_impl->connect_printer(m_impl->agent, dev_id, dev_ip,
                                    username, password, use_ssl);
+}
+
+int BambuNetworkingPluginHandle::set_user_selected_machine(const std::string& dev_id) {
+    if (!m_impl->agent)                    return -1;
+    if (!m_impl->set_user_selected_machine) return -2;
+    return m_impl->set_user_selected_machine(m_impl->agent, dev_id);
+}
+
+void BambuNetworkingPluginHandle::install_device_cert(const std::string& dev_id,
+                                                      bool lan_only) {
+    if (!m_impl->agent)              return;
+    if (!m_impl->install_device_cert) return;
+    m_impl->install_device_cert(m_impl->agent, dev_id, lan_only);
 }
 
 int BambuNetworkingPluginHandle::disconnect_printer() {
