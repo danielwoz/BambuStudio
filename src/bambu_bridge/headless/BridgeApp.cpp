@@ -677,26 +677,44 @@ void BridgeApp::set_virtual_printers(std::vector<VirtualPrinter> printers) {
     // printer (and therefore its own plugin LAN slot, since the
     // proprietary plugin only supports one active LAN connection per
     // process). Empty / unset = keep all (default behaviour).
+    // Built when TARGET_DEV is set; used both for filtering printers
+    // and as the authoritative dev_id→offset map (env position = index)
+    // so slicers' persisted per-dev_id mqtt_port stays valid across
+    // bridge reboots / cloud-snapshot reorderings.
+    std::vector<std::string> env_keep_order;
     if (const char* env = std::getenv("BAMBU_BRIDGE_TARGET_DEV"); env && *env) {
-        std::vector<std::string> keep;
         const std::string s = env;
         size_t pos = 0;
         while (pos <= s.size()) {
             const size_t comma = s.find(',', pos);
             const size_t end = (comma == std::string::npos) ? s.size() : comma;
-            if (end > pos) keep.emplace_back(s.substr(pos, end - pos));
+            if (end > pos) env_keep_order.emplace_back(s.substr(pos, end - pos));
             if (comma == std::string::npos) break;
             pos = comma + 1;
         }
         printers.erase(
             std::remove_if(printers.begin(), printers.end(),
-                [&keep](const VirtualPrinter& p) {
-                    return std::find(keep.begin(), keep.end(), p.dev_id) == keep.end();
+                [&env_keep_order](const VirtualPrinter& p) {
+                    return std::find(env_keep_order.begin(), env_keep_order.end(), p.dev_id) == env_keep_order.end();
                 }),
             printers.end());
     }
 
     std::lock_guard<std::mutex> lk(m_devices_mu);
+
+    // First-time setup: pin each TARGET_DEV dev_id to its position in
+    // the env list. add_device_locked reads this map when assigning
+    // state.index. Idempotent across set_virtual_printers calls so
+    // re-parsing the same env doesn't churn the map.
+    if (m_pinned_offset.empty() && !env_keep_order.empty()) {
+        for (std::size_t i = 0; i < env_keep_order.size(); ++i) {
+            m_pinned_offset.emplace(env_keep_order[i], i);
+        }
+        // Bump the running counter past the pinned range so any
+        // not-in-env devices that show up later don't collide with a
+        // pinned slot.
+        m_next_index = env_keep_order.size();
+    }
 
     // Snapshot is the source of truth for device EXISTENCE; lan_ip is
     // a sticky field. Cloud REST (get_user_print_info) only reports
@@ -771,7 +789,14 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
     if (!lan_ip.empty())
         state.lan_ip_last_seen = std::chrono::steady_clock::now();
     state.access_code = access_code;
-    state.index       = m_next_index++;
+    // Prefer the env-pinned offset if this dev_id was listed in
+    // BAMBU_BRIDGE_TARGET_DEV; fall through to the running counter for
+    // any other dev_id (unfiltered mode / late arrivals).
+    if (auto it = m_pinned_offset.find(dev_id); it != m_pinned_offset.end()) {
+        state.index = it->second;
+    } else {
+        state.index = m_next_index++;
+    }
     state.mqtt_port   = static_cast<uint16_t>(m_cfg.mqtt_port_base + state.index);
     state.ftps_port   = static_cast<uint16_t>(m_cfg.ftps_port_base + state.index);
     state.rtsp_port   = static_cast<uint16_t>(m_cfg.rtsp_port_base + state.index);

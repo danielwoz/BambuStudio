@@ -533,6 +533,15 @@ private:
     mutable std::mutex                                    m_devices_mu;
     std::map<std::string, DeviceState>                    m_devices;
     std::size_t                                           m_next_index = 0;
+    // Pinned per-dev_id offsets so the same printer always binds the
+    // same ports across reboots / cloud-snapshot reorderings. Built
+    // once at startup from BAMBU_BRIDGE_TARGET_DEV (position in the
+    // comma-list = offset). When a dev_id is present here,
+    // add_device_locked uses the mapped value instead of m_next_index;
+    // when absent (unfiltered mode / unknown dev), m_next_index is
+    // used as before. Critical because slicer clients persist the
+    // per-dev_id mqtt_port in VirtualLanPrinterStore.
+    std::map<std::string, std::size_t>                    m_pinned_offset;
     // Resolved IP we emit in the SSDP LOCATION header. Filled the
     // first time we add a device; empty until then. See
     // detect_primary_lan_ip() in the .cpp.
