@@ -222,8 +222,53 @@ bool CloudCameraSource::open() {
         si.height = bi.format.video.height;
         si.fps    = bi.format.video.frame_rate > 0 ? bi.format.video.frame_rate : si.fps;
         if (bi.format_size > 0 && bi.format_buffer) {
-            si.sps.assign(bi.format_buffer,
-                          bi.format_buffer + bi.format_size);
+            // `format_buffer` is the H.264 codec extradata — usually a
+            // concatenation of SPS (NAL type 7) + PPS (type 8). Assigning the
+            // WHOLE blob to si.sps and leaving si.pps empty makes the SDP
+            // sprop-parameter-sets malformed -> the client decoder can't
+            // bootstrap -> black screen. Parse SPS and PPS into separate
+            // NAL bodies (no start code), supporting both Annex-B (start codes)
+            // and AVCC (length-prefixed) extradata layouts.
+            const uint8_t* buf = bi.format_buffer;
+            const int      sz  = bi.format_size;
+            auto take_nal = [&](const uint8_t* p, int len) {
+                if (len <= 0) return;
+                const uint8_t type = p[0] & 0x1F;
+                if      (type == 7 && si.sps.empty()) si.sps.assign(p, p + len);
+                else if (type == 8 && si.pps.empty()) si.pps.assign(p, p + len);
+            };
+            // Annex-B scan first.
+            int i = 0;
+            while (i < sz) {
+                int nal_start = -1;
+                if (i + 3 < sz && !buf[i] && !buf[i+1] && !buf[i+2] && buf[i+3] == 1) nal_start = i + 4;
+                else if (i + 2 < sz && !buf[i] && !buf[i+1] && buf[i+2] == 1)         nal_start = i + 3;
+                if (nal_start < 0) { ++i; continue; }
+                int j = nal_start;
+                while (j + 2 < sz &&
+                       !(buf[j]==0 && buf[j+1]==0 &&
+                         (buf[j+2]==1 || (j+3<sz && buf[j+2]==0 && buf[j+3]==1)))) ++j;
+                const int nal_end = (j + 2 < sz) ? j : sz;
+                take_nal(buf + nal_start, nal_end - nal_start);
+                i = nal_end;
+            }
+            // AVCC fallback if Annex-B yielded nothing.
+            if (si.sps.empty() && si.pps.empty() && sz >= 4) {
+                int p = 0;
+                while (p + 4 <= sz) {
+                    const uint32_t nl = (uint32_t(buf[p])   << 24) |
+                                        (uint32_t(buf[p+1]) << 16) |
+                                        (uint32_t(buf[p+2]) <<  8) |
+                                         uint32_t(buf[p+3]);
+                    p += 4;
+                    if (nl == 0 || p + static_cast<int>(nl) > sz) break;
+                    take_nal(buf + p, static_cast<int>(nl));
+                    p += static_cast<int>(nl);
+                }
+            }
+            // Last-ditch: a single bare SPS NAL with no framing.
+            if (si.sps.empty() && si.pps.empty() && sz > 0 && (buf[0] & 0x1F) == 7)
+                si.sps.assign(buf, buf + sz);
         }
         const int scratch = bi.max_frame_size > 0
                             ? bi.max_frame_size + 64
