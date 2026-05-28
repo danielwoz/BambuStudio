@@ -40,6 +40,16 @@ namespace BridgeBootstrap {
 // is up.
 bool is_bridge_only();
 
+// True iff BAMBU_BRIDGE_INVISIBLE_GUI=1 in the environment. "Invisible GUI"
+// means the full slicer process (NetworkAgent, DeviceManager, plugin, cloud
+// session, bridge worker) runs as normal — we just never Show() the main
+// window and auto-dismiss the startup modals that would otherwise block a
+// headless Xvfb. This collapses the old --bridge-only headless code path and
+// "real GUI" into ONE binary with one NetworkAgent/plugin instance, so the
+// bridge's camera/cert paths share the GUI's live cloud session (no separate
+// agent, no two-token confusion). Cached, safe before wx is up.
+bool is_invisible_gui();
+
 // File-scope hook: registered as a wxAppInitializer so wxEntry uses our
 // custom factory instead of the IMPLEMENT_APP-emitted default. Forces
 // the linker to keep this TU; without it the static-ctor never runs.

@@ -3392,8 +3392,13 @@ bool GUI_App::on_init_inner()
 #ifdef __WINDOWS__
     mainframe->topbar()->SaveNormalRect();
 #endif
-    mainframe->Show(true);
-    BOOST_LOG_TRIVIAL(info) << "main frame firstly shown";
+    // Invisible-GUI bridge mode: the slicer process runs as normal (full
+    // NetworkAgent / DeviceManager / cloud session / plugin) so the bridge
+    // server can share its agent — we just never show the main window.
+    if (!::Slic3r::GUI::BridgeBootstrap::is_invisible_gui())
+        mainframe->Show(true);
+    BOOST_LOG_TRIVIAL(info) << "main frame firstly shown="
+        << (::Slic3r::GUI::BridgeBootstrap::is_invisible_gui() ? "no(invisible)" : "yes");
 
 //#if BBL_HAS_FIRST_PAGE
     //BBS: set tp3DEditor firstly
@@ -4176,7 +4181,10 @@ void GUI_App::recreate_GUI(const wxString &msg_name)
     dlg.Update(80, _L("Loading current presets") + dots);
     m_printhost_job_queue.reset(new PrintHostJobQueue(mainframe->printhost_queue_dlg()));
     load_current_presets();
-    mainframe->Show(true);
+    // Invisible-GUI bridge mode: don't pop the main window here either
+    // (this Show() fires after a network-agent re-init / mainframe rebuild).
+    if (!::Slic3r::GUI::BridgeBootstrap::is_invisible_gui())
+        mainframe->Show(true);
     //mainframe->refresh_plugin_tips();
 
     dlg.Update(90, _L("Loading a mode view") + dots);

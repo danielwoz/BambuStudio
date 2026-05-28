@@ -64,6 +64,22 @@ bool is_bridge_only()
 }
 
 // ============================================================================
+// is_invisible_gui — BAMBU_BRIDGE_INVISIBLE_GUI=1: run the full GUI process
+// without showing windows or popping startup modals. Sole source of truth so
+// every site (MainFrame::Show, on_select_default_preset, etc.) reads the same
+// boolean. Cached on first call; safe to call before wx is up.
+// ============================================================================
+
+bool is_invisible_gui()
+{
+    static const bool cached = [] {
+        const char* e = std::getenv("BAMBU_BRIDGE_INVISIBLE_GUI");
+        return e && *e && (*e == '1' || *e == 't' || *e == 'T' || *e == 'y' || *e == 'Y');
+    }();
+    return cached;
+}
+
+// ============================================================================
 // register_app_factory — IMPLEMENT_APP replacement.
 //
 // IMPLEMENT_APP(GUI_App) normally expands to:

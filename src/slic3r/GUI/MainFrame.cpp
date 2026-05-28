@@ -68,6 +68,7 @@
 
 #include "DeviceCore/DevManager.h"
 #include "slic3r/GUI/DeviceWeb/DeviceWebPage.hpp"
+#include "slic3r/GUI/BridgeBootstrap.hpp"   // is_invisible_gui()
 
 #ifdef _WIN32
 #include <dbt.h>
@@ -4506,6 +4507,17 @@ void MainFrame::update_side_preset_ui()
 
 void MainFrame::on_select_default_preset(SimpleEvent& evt)
 {
+    // Invisible-GUI bridge mode: never pop a modal here (the user can't
+    // dismiss anything). Auto-pick "don't sync cloud presets" — the safe
+    // default for a server-y process. This is the specific ShowModal that
+    // was crashing the bridge under Xvfb on every device-selection event.
+    if (::Slic3r::GUI::BridgeBootstrap::is_invisible_gui()) {
+        wxGetApp().app_config->set_bool("sync_user_preset", false);
+        wxGetApp().stop_sync_user_preset();
+        BOOST_LOG_TRIVIAL(info) << "on_select_default_preset: invisible-GUI -> sync_user_preset=false (no modal)";
+        return;
+    }
+
     MessageDialog dialog(this,
                     _L("Do you want to synchronize your personal data from Bambu Cloud? \n"
                         "It contains the following information:\n"
