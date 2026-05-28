@@ -820,6 +820,26 @@ void install_gui_worker(GUI_App* app)
             app->m_bridge_app->attach_plugin_handle(std::move(adapter));
         }
 
+        // Camera-URL resolver: route CloudCameraSource::open()'s
+        // get_camera_url through the slicer's live NetworkAgent so the
+        // bridge picks up the host's existing cloud session + TUTK
+        // token. Without this, BridgeApp's plugin-adapter path works
+        // for MQTT/cloud control but the camera ask hit a separate
+        // (token-less) plugin instance and returned an empty URL,
+        // leaving the transcoded RTSP stream black on H2S/H2D.
+        // NetworkAgent::get_camera_url takes `dev_id`; CloudCameraSource
+        // builds an `<id>|<dev_ver>|<protocols>` triple — the agent
+        // hands the entire `ask` straight to the plugin, so the triple
+        // is preserved end-to-end.
+        if (app->m_agent) {
+            auto* agent = app->m_agent;  // raw pointer, owned by GUI_App
+            app->m_bridge_app->set_camera_url_resolver(
+                [agent](const std::string& ask,
+                        std::function<void(std::string)> cb) -> int {
+                    return agent->get_camera_url(ask, std::move(cb));
+                });
+        }
+
         app->m_bridge_thread = std::make_unique<std::thread>([app]() {
             try {
                 const int rc = app->m_bridge_app->run();

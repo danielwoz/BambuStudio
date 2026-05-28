@@ -392,6 +392,19 @@ public:
         StorageDelegate                         delegate,
         std::function<void(const std::string&)> release_cb = {});
 
+    // Host-provided camera-URL resolver. In invisible-GUI mode the
+    // bridge does NOT have its own usable plugin agent — the cloud
+    // session (and the TUTK token that comes with it) belongs to the
+    // slicer's existing NetworkAgent. The host passes a lambda that
+    // forwards to `wxGetApp().getAgent()->get_camera_url(ask, cb)`;
+    // BridgeApp installs it on every cloud_cam at construction time.
+    // Signature mirrors NetworkAgent::get_camera_url (async/callback)
+    // so no extra adapter shim is needed.
+    using CameraUrlResolver = std::function<
+        int(const std::string& dev_id_or_ask,
+            std::function<void(std::string url)> cb)>;
+    void set_camera_url_resolver(CameraUrlResolver fn);
+
     // Test-only single-iteration pump of what the poll thread does.
     // Returns true if the iteration ran (inventory was queried), false
     // if the bridge wasn't initialised. Used by the multi-device test to
@@ -448,6 +461,10 @@ private:
     // GUI-supplied storage delegate + release callback.
     StorageDelegate                                       m_storage_delegate;
     std::function<void(const std::string&)>               m_storage_release_cb;
+
+    // GUI-supplied camera-URL resolver. Empty in pure headless mode.
+    // Installed on every cloud_cam built in add_device_locked.
+    CameraUrlResolver                                     m_camera_url_resolver;
 
     // Initialised in initialise().
     std::unique_ptr<CloudInventory>                       m_inventory;

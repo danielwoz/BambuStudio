@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <future>
 #include <thread>
 #include <utility>
 
@@ -73,13 +74,20 @@ void CloudCameraSource::attach_source_handle(
     m_source = std::move(handle);
 }
 
+void CloudCameraSource::set_camera_url_resolver(CameraUrlResolver fn) {
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_url_resolver = std::move(fn);
+}
+
 bool CloudCameraSource::open() {
     std::shared_ptr<BambuNetworkingPluginHandle> plugin;
     std::shared_ptr<BambuSourceHandle>           source;
+    CameraUrlResolver                            resolver;
     {
         std::lock_guard<std::mutex> lk(m_mu);
-        plugin = m_handle;
-        source = m_source;
+        plugin   = m_handle;
+        source   = m_source;
+        resolver = m_url_resolver;   // host-provided agent (preferred)
         m_last_url.clear();
     }
 
@@ -122,7 +130,50 @@ bool CloudCameraSource::open() {
         const std::string protocols = "\"tutk\",\"agora\"";
         std::string ask = m_cfg.dev_id + "|" + m_cfg.dev_ver
                         + "|" + protocols;
-        rc = plugin->get_camera_url(ask, &url, timeout_ms);
+        if (resolver) {
+            // Invisible-GUI / host-injected path: the GUI's NetworkAgent
+            // owns the live cloud session. Use IT to resolve the URL so
+            // we share the same TUTK/Agora token instead of asking our
+            // own (often token-less) plugin agent. NetworkAgent's
+            // get_camera_url is async/callback — wrap it sync with a
+            // shared_ptr<promise> so a late callback that fires after
+            // our wait-timeout can still complete safely (it just
+            // satisfies a promise no one is reading).
+            auto p = std::make_shared<std::promise<std::string>>();
+            auto f = p->get_future();
+            std::atomic<bool> done{false};
+            const int call_rc = resolver(ask,
+                [p, &done](std::string resolved) {
+                    if (done.exchange(true)) return;   // single-shot
+                    try { p->set_value(std::move(resolved)); }
+                    catch (...) { /* already satisfied */ }
+                });
+            std::fprintf(stderr,
+                "[cloud-camera] resolver dispatched dev=%s call_rc=%d "
+                "timeout_ms=%d\n",
+                m_cfg.dev_id.c_str(), call_rc, timeout_ms);
+            std::fflush(stderr);
+            if (call_rc != 0) {
+                // Resolver refused to dispatch — fall through to plugin.
+            } else {
+                if (f.wait_for(std::chrono::milliseconds(timeout_ms))
+                    == std::future_status::ready) {
+                    url = f.get();
+                    rc  = 0;
+                } else {
+                    std::fprintf(stderr,
+                        "[cloud-camera] resolver TIMEOUT dev=%s after %dms\n",
+                        m_cfg.dev_id.c_str(), timeout_ms);
+                    std::fflush(stderr);
+                    rc = -1;
+                }
+            }
+        }
+        if (url.empty()) {
+            // Either no resolver, resolver refused, resolver timed out,
+            // or resolver returned empty — fall back to our own plugin.
+            rc = plugin->get_camera_url(ask, &url, timeout_ms);
+        }
         std::fprintf(stderr,
             "[cloud-camera] get_camera_url dev=%s rc=%d url=%s\n",
             m_cfg.dev_id.c_str(), rc, url.c_str());

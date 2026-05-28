@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -78,6 +79,21 @@ public:
     // attach_plugin.
     void attach_source_handle(std::shared_ptr<BambuSourceHandle> handle);
 
+    // Inject the host's camera-URL resolver. Matches the GUI NetworkAgent's
+    // get_camera_url signature (async, callback-style). When set, open()
+    // uses THIS instead of m_handle->get_camera_url, so the bridge talks to
+    // the cloud through the slicer host's live agent/session — not the
+    // bridge's own separately-created plugin instance (which has its own,
+    // typically missing, TUTK token). Pass nullptr to detach.
+    //
+    // CloudCameraSource synchronously waits on the callback with the same
+    // connect_timeout it would have given the plugin (no thread blocking
+    // beyond that).
+    using CameraUrlResolver = std::function<
+        int(const std::string& dev_id_or_ask,
+            std::function<void(std::string url)> cb)>;
+    void set_camera_url_resolver(CameraUrlResolver fn);
+
     // ICameraSource:
     bool open()           override;
     void close()          override;
@@ -97,6 +113,7 @@ protected:
     mutable std::mutex                            m_mu;
     std::shared_ptr<BambuNetworkingPluginHandle>  m_handle;
     std::shared_ptr<BambuSourceHandle>            m_source;
+    CameraUrlResolver                             m_url_resolver;
     std::string                                   m_last_url;
     void*                                         m_tunnel = nullptr;
     server::ICameraSource::StreamInfo             m_info;

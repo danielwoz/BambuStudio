@@ -218,6 +218,18 @@ void BridgeApp::attach_storage_delegate(
     }
 }
 
+void BridgeApp::set_camera_url_resolver(CameraUrlResolver fn) {
+    // Stash it; new cloud_cams (built in add_device_locked) pick it up.
+    // Also propagate to any cloud_cam that's already been constructed.
+    m_camera_url_resolver = fn;
+    std::lock_guard<std::mutex> lk(m_devices_mu);
+    for (auto& kv : m_devices) {
+        if (kv.second.cloud_cam) {
+            kv.second.cloud_cam->set_camera_url_resolver(fn);
+        }
+    }
+}
+
 uint16_t BridgeApp::mqtt_port_for_dev_id(const std::string& dev_id) const {
     std::lock_guard<std::mutex> lk(m_devices_mu);
     // Fast path: real dev_id.
@@ -934,6 +946,12 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
         state.cloud_cam = std::make_shared<router::CloudCameraSource>(cc);
         state.cloud_cam->attach_plugin(m_plugin);
         state.cloud_cam->attach_source_handle(m_bambu_source);
+        // Invisible-GUI / GUI-host mode: route URL resolution through the
+        // slicer's live NetworkAgent so the bridge picks up the host's
+        // existing cloud session + TUTK token.
+        if (m_camera_url_resolver) {
+            state.cloud_cam->set_camera_url_resolver(m_camera_url_resolver);
+        }
         state.cam_router->set_lan_source(state.lan_cam);
         state.cam_router->set_cloud_source(state.cloud_cam);
         state.cam_router->set_null_source(m_null_camera);
