@@ -1124,6 +1124,52 @@ void install_gui_worker(GUI_App* app)
                         dev_ids.size());
                     std::fflush(stderr);
 
+                    // -------- Simulate GUI "device tab click" ---------------
+                    // The cascade above called m_agent->set_user_selected_machine
+                    // directly on the plugin handle. The real GUI flow goes
+                    // through DeviceManager::set_selected_machine which ALSO
+                    // calls obj->reset(), wxGetApp().on_start_subscribe_again,
+                    // and DeviceManager::check_pushing eventually fires the
+                    // first MachineObject::command_request_push_all (the
+                    // m_push_count==0 branch). Empirically, without that
+                    // fuller chain the plugin's per-dev cloud tunnel stays
+                    // inert — proof-of-life sees rc_cloud=-2 (or send-accept
+                    // / no-reply) even though login=1/server=1. Hop to the wx
+                    // main thread (DeviceManager + MachineObject are wx-owned)
+                    // and run the chain per dev_id BEFORE the proof-of-life
+                    // probe so the probe gets a fair test.
+                    app->CallAfter([app, dev_ids] {
+                        if (app->is_closing()) return;
+                        auto* dev = app->m_device_manager;
+                        if (!dev) {
+                            std::fprintf(stderr,
+                                "[bridge-gui] device-tab-sim: no DeviceManager\n");
+                            std::fflush(stderr);
+                            return;
+                        }
+                        for (const auto& d : dev_ids) {
+                            const bool ok = dev->set_selected_machine(d);
+                            MachineObject* obj = dev->get_my_machine(d);
+                            std::fprintf(stderr,
+                                "[bridge-gui] device-tab-sim dev=%s "
+                                "set_selected_machine=%d have_obj=%d\n",
+                                d.c_str(), int(ok), int(obj != nullptr));
+                            std::fflush(stderr);
+                            if (obj) {
+                                int rc = obj->command_request_push_all(/*request_now=*/true);
+                                std::fprintf(stderr,
+                                    "[bridge-gui] device-tab-sim dev=%s "
+                                    "command_request_push_all rc=%d\n",
+                                    d.c_str(), rc);
+                                std::fflush(stderr);
+                            }
+                        }
+                    });
+                    // Give the wx loop a beat to run the CallAfter (and the
+                    // pushall to fly) before the proof-of-life probe goes.
+                    std::this_thread::sleep_for(2s);
+                    // --------------------------------------------------------
+
                     // -------- Proof-of-life ---------------------------------
                     // The cascade's success log above is misleading on its
                     // own: login=1/server=1 plus connect_printer rc=0 does
