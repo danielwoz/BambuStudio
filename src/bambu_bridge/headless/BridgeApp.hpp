@@ -534,14 +534,21 @@ private:
     std::map<std::string, DeviceState>                    m_devices;
     std::size_t                                           m_next_index = 0;
     // Pinned per-dev_id offsets so the same printer always binds the
-    // same ports across reboots / cloud-snapshot reorderings. Built
-    // once at startup from BAMBU_BRIDGE_TARGET_DEV (position in the
-    // comma-list = offset). When a dev_id is present here,
+    // same ports across reboots, cloud-snapshot reorderings, AND
+    // env-var edits. Loaded once at startup from the port-map file
+    // (default: $XDG_CONFIG_HOME/bambu-bridge/port-map, fallback
+    // $HOME/.config/bambu-bridge/port-map; override via
+    // BAMBU_BRIDGE_PORT_MAP_FILE). When a dev_id is present here,
     // add_device_locked uses the mapped value instead of m_next_index;
-    // when absent (unfiltered mode / unknown dev), m_next_index is
-    // used as before. Critical because slicer clients persist the
-    // per-dev_id mqtt_port in VirtualLanPrinterStore.
+    // when absent, the next free offset is assigned AND persisted so
+    // subsequent boots reuse it. BAMBU_BRIDGE_TARGET_DEV seeds the map
+    // on first boot when the file doesn't yet exist; thereafter the
+    // file is authoritative and env order is ignored for offsets
+    // (still used as a filter). Critical because slicer clients
+    // persist per-dev_id mqtt_port in VirtualLanPrinterStore.
     std::map<std::string, std::size_t>                    m_pinned_offset;
+    std::string                                           m_port_map_path;
+    bool                                                  m_port_map_loaded = false;
     // Resolved IP we emit in the SSDP LOCATION header. Filled the
     // first time we add a device; empty until then. See
     // detect_primary_lan_ip() in the .cpp.

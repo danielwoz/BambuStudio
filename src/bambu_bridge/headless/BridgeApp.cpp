@@ -37,6 +37,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <fstream>
+#include <sstream>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -170,6 +172,84 @@ static std::string mangle_serial(const std::string& real_sn) {
     return std::string(kVirtualSerialPrefix) +
            real_sn.substr(kPrefixLen);
 }
+
+// --- port-map persistence -------------------------------------------------
+//
+// File format is one entry per line: "<dev_id> <offset>\n". Trivially
+// parseable and hand-editable; no JSON dependency. Atomic write via
+// tmp + rename so a crash mid-write can't corrupt the file.
+
+static std::string default_port_map_path() {
+    if (const char* p = std::getenv("BAMBU_BRIDGE_PORT_MAP_FILE"); p && *p)
+        return p;
+    std::string base;
+    if (const char* x = std::getenv("XDG_CONFIG_HOME"); x && *x) {
+        base = x;
+    } else if (const char* h = std::getenv("HOME"); h && *h) {
+        base = std::string(h) + "/.config";
+    } else {
+        base = "/tmp"; // last-ditch fallback
+    }
+    return base + "/bambu-bridge/port-map";
+}
+
+// Best-effort load; missing or unreadable file => empty result, no error.
+static void load_port_map(const std::string& path,
+                          std::map<std::string, std::size_t>& out) {
+    std::ifstream in(path);
+    if (!in) return;
+    std::string line;
+    while (std::getline(in, line)) {
+        // Skip blank / comment lines.
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        std::string dev_id;
+        std::size_t offset = 0;
+        if (iss >> dev_id >> offset) out[dev_id] = offset;
+    }
+}
+
+// Atomic-ish save. Creates parent dir if needed; writes to .tmp, then
+// renames over the target. Returns true on success.
+static bool save_port_map(const std::string& path,
+                          const std::map<std::string, std::size_t>& m) {
+    // mkdir -p the parent. Walk components rather than pull in
+    // <filesystem> just for this.
+    const std::size_t slash = path.find_last_of('/');
+    if (slash != std::string::npos && slash > 0) {
+        const std::string dir = path.substr(0, slash);
+        std::string acc;
+        for (std::size_t i = 0; i <= dir.size(); ++i) {
+            if (i == dir.size() || dir[i] == '/') {
+                if (!acc.empty() && acc != "/") {
+                    // mkdir returns -1 + EEXIST if it's already there; fine.
+                    ::mkdir(acc.c_str(), 0755);
+                }
+            }
+            if (i < dir.size()) acc.push_back(dir[i]);
+        }
+    }
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        if (!out) {
+            std::fprintf(stderr,
+                "[bridge-app] port-map save FAILED: cannot open %s for write\n",
+                tmp.c_str());
+            return false;
+        }
+        out << "# bambu-bridge port-map (dev_id offset) — managed automatically\n";
+        for (const auto& kv : m) out << kv.first << ' ' << kv.second << '\n';
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::fprintf(stderr,
+            "[bridge-app] port-map save FAILED: rename %s -> %s errno=%d\n",
+            tmp.c_str(), path.c_str(), errno);
+        return false;
+    }
+    return true;
+}
+// --------------------------------------------------------------------------
 
 BridgeApp::BridgeApp(BridgeAppConfig cfg) : m_cfg(std::move(cfg)) {}
 
@@ -702,18 +782,54 @@ void BridgeApp::set_virtual_printers(std::vector<VirtualPrinter> printers) {
 
     std::lock_guard<std::mutex> lk(m_devices_mu);
 
-    // First-time setup: pin each TARGET_DEV dev_id to its position in
-    // the env list. add_device_locked reads this map when assigning
-    // state.index. Idempotent across set_virtual_printers calls so
-    // re-parsing the same env doesn't churn the map.
-    if (m_pinned_offset.empty() && !env_keep_order.empty()) {
-        for (std::size_t i = 0; i < env_keep_order.size(); ++i) {
-            m_pinned_offset.emplace(env_keep_order[i], i);
+    // First-time setup: load the persisted port-map (authoritative when
+    // present), then optionally seed from BAMBU_BRIDGE_TARGET_DEV when
+    // the file was empty (so existing deployments migrate cleanly).
+    // Idempotent across set_virtual_printers calls.
+    if (!m_port_map_loaded) {
+        m_port_map_path = default_port_map_path();
+        load_port_map(m_port_map_path, m_pinned_offset);
+        bool changed = false;
+        if (m_pinned_offset.empty() && !env_keep_order.empty()) {
+            // Migration / first boot: env order = initial offsets.
+            for (std::size_t i = 0; i < env_keep_order.size(); ++i) {
+                m_pinned_offset.emplace(env_keep_order[i], i);
+            }
+            changed = true;
+        } else if (!env_keep_order.empty()) {
+            // Append any TARGET_DEV dev_ids that aren't in the file yet
+            // (e.g. user added a new printer to the env list). Pick
+            // offsets past the existing max so existing pinnings don't
+            // shift.
+            std::size_t max_offset = 0;
+            bool any = false;
+            for (const auto& kv : m_pinned_offset) {
+                if (!any || kv.second > max_offset) { max_offset = kv.second; any = true; }
+            }
+            std::size_t next = any ? max_offset + 1 : 0;
+            for (const auto& dev : env_keep_order) {
+                if (m_pinned_offset.find(dev) == m_pinned_offset.end()) {
+                    m_pinned_offset.emplace(dev, next++);
+                    changed = true;
+                }
+            }
         }
-        // Bump the running counter past the pinned range so any
-        // not-in-env devices that show up later don't collide with a
-        // pinned slot.
-        m_next_index = env_keep_order.size();
+        if (changed) {
+            save_port_map(m_port_map_path, m_pinned_offset);
+        }
+        // Running counter starts past the highest pinned offset so
+        // late-arriving non-env devices can't collide with pinned slots.
+        std::size_t max_offset = 0;
+        bool any = false;
+        for (const auto& kv : m_pinned_offset) {
+            if (!any || kv.second > max_offset) { max_offset = kv.second; any = true; }
+        }
+        m_next_index = any ? max_offset + 1 : 0;
+        std::fprintf(stderr,
+            "[bridge-app] port-map %s loaded=%zu next_index=%zu\n",
+            m_port_map_path.c_str(), m_pinned_offset.size(), m_next_index);
+        std::fflush(stderr);
+        m_port_map_loaded = true;
     }
 
     // Snapshot is the source of truth for device EXISTENCE; lan_ip is
@@ -789,13 +905,21 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
     if (!lan_ip.empty())
         state.lan_ip_last_seen = std::chrono::steady_clock::now();
     state.access_code = access_code;
-    // Prefer the env-pinned offset if this dev_id was listed in
-    // BAMBU_BRIDGE_TARGET_DEV; fall through to the running counter for
-    // any other dev_id (unfiltered mode / late arrivals).
+    // Prefer the persisted/pinned offset; fall back to the running
+    // counter for any dev_id not yet in the map (unfiltered mode /
+    // late arrivals / brand-new device). Newly-assigned offsets are
+    // immediately persisted so subsequent boots reuse them.
     if (auto it = m_pinned_offset.find(dev_id); it != m_pinned_offset.end()) {
         state.index = it->second;
     } else {
         state.index = m_next_index++;
+        m_pinned_offset[dev_id] = state.index;
+        if (!m_port_map_path.empty())
+            save_port_map(m_port_map_path, m_pinned_offset);
+        std::fprintf(stderr,
+            "[bridge-app] port-map pinned new dev=%s offset=%zu (persisted)\n",
+            dev_id.c_str(), state.index);
+        std::fflush(stderr);
     }
     state.mqtt_port   = static_cast<uint16_t>(m_cfg.mqtt_port_base + state.index);
     state.ftps_port   = static_cast<uint16_t>(m_cfg.ftps_port_base + state.index);
