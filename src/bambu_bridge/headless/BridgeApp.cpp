@@ -787,7 +787,15 @@ void BridgeApp::set_virtual_printers(std::vector<VirtualPrinter> printers) {
     // the file was empty (so existing deployments migrate cleanly).
     // Idempotent across set_virtual_printers calls.
     if (!m_port_map_loaded) {
-        m_port_map_path = default_port_map_path();
+        // When config_dir is set (typical for --bridge-multi where each
+        // child gets its own dir), put the port-map inside it so
+        // sibling children don't race on a shared HOME-rooted file.
+        // Falls back to default ($XDG_CONFIG_HOME/bambu-bridge/port-map
+        // or $HOME/.config/bambu-bridge/port-map) when config_dir is
+        // empty (single-process mode).
+        m_port_map_path = !m_cfg.config_dir.empty()
+            ? (m_cfg.config_dir + "/port-map")
+            : default_port_map_path();
         load_port_map(m_port_map_path, m_pinned_offset);
         bool changed = false;
         if (m_pinned_offset.empty() && !env_keep_order.empty()) {
