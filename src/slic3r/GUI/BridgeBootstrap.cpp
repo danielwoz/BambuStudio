@@ -39,12 +39,15 @@
 #include <boost/log/trivial.hpp>
 #include "nlohmann/json.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -78,6 +81,46 @@ bool is_invisible_gui()
     }();
     return cached;
 }
+
+// ============================================================================
+// Proof-of-life: per-dev_id inbound-message observation.
+//
+// The bridge's on_message / on_local_message handlers fan inbound MQTT
+// reports into DeviceManager. We add a sibling tap that records the
+// last-seen timestamp per dev_id so the cascade's tail can synchronously
+// wait for proof that a printer's cloud tunnel is actually alive
+// (vs. plugin sessions that report login=1/server=1 but in fact have
+// no usable route to the printer — see project_bridge_cloud_tunnel).
+// ============================================================================
+
+namespace {
+std::mutex                                                       g_inbound_mu;
+std::map<std::string, std::chrono::steady_clock::time_point>     g_inbound_at;
+
+void note_inbound(const std::string& dev_id)
+{
+    std::lock_guard<std::mutex> lk(g_inbound_mu);
+    g_inbound_at[dev_id] = std::chrono::steady_clock::now();
+}
+
+// Returns true if note_inbound(dev_id) was called at-or-after `since`,
+// polling every 100ms until `timeout` elapses.
+bool wait_for_inbound(const std::string&                         dev_id,
+                      std::chrono::steady_clock::time_point      since,
+                      std::chrono::milliseconds                  timeout)
+{
+    const auto deadline = since + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        {
+            std::lock_guard<std::mutex> lk(g_inbound_mu);
+            auto it = g_inbound_at.find(dev_id);
+            if (it != g_inbound_at.end() && it->second >= since) return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+} // namespace
 
 // ============================================================================
 // register_app_factory — IMPLEMENT_APP replacement.
@@ -1080,6 +1123,87 @@ void install_gui_worker(GUI_App* app)
                         "route through plugin send_message_to_printer\n",
                         dev_ids.size());
                     std::fflush(stderr);
+
+                    // -------- Proof-of-life ---------------------------------
+                    // The cascade's success log above is misleading on its
+                    // own: login=1/server=1 plus connect_printer rc=0 does
+                    // NOT prove the printer is reachable through the
+                    // plugin's cloud or LAN route. In practice the cloud
+                    // tunnel can silently fail to activate per-dev_id
+                    // (see project_bridge_cloud_tunnel) — slicers then see
+                    // "Failed to connect" hours later. Probe at boot: send
+                    // info.get_version (qos=1) and pushing.pushall (qos=0)
+                    // per dev_id and wait for ANY inbound message keyed to
+                    // that dev_id within 10s. If nothing arrives, log a
+                    // loud failure so the operator sees the broken state
+                    // immediately rather than via a slicer timeout later.
+                    // Detached so we don't extend cascade-thread lifetime.
+                    std::thread([app, dev_ids] {
+                        using namespace std::chrono_literals;
+                        auto* ag = app->m_agent;
+                        if (!ag) return;
+                        static std::atomic<uint64_t> s_seq{50000};
+                        for (const auto& d : dev_ids) {
+                            // -- get_version round-trip --------------------
+                            const std::string seq1 = std::to_string(s_seq.fetch_add(1));
+                            const std::string pv =
+                                std::string("{\"info\":{\"command\":\"get_version\",")
+                              + "\"sequence_id\":\"" + seq1 + "\"}}";
+                            const auto t1 = std::chrono::steady_clock::now();
+                            const int rcv = ag->send_message(d, pv, /*qos=*/1, /*timeout_ms=*/0);
+                            if (rcv != 0) {
+                                std::fprintf(stderr,
+                                    "[proof-of-life] dev=%s FAILED step=get_version "
+                                    "send rc=%d (cloud route refused — plugin has "
+                                    "no usable cloud tunnel for this printer)\n",
+                                    d.c_str(), rcv);
+                                std::fflush(stderr);
+                                continue;
+                            }
+                            if (!wait_for_inbound(d, t1, 10s)) {
+                                std::fprintf(stderr,
+                                    "[proof-of-life] dev=%s FAILED step=get_version "
+                                    "send rc=0 but no inbound reply in 10s (one-way "
+                                    "tunnel? printer offline from cloud?)\n",
+                                    d.c_str());
+                                std::fflush(stderr);
+                                continue;
+                            }
+                            std::fprintf(stderr,
+                                "[proof-of-life] dev=%s step=get_version OK "
+                                "(reply received)\n", d.c_str());
+                            std::fflush(stderr);
+
+                            // -- pushing.pushall round-trip ---------------
+                            const std::string seq2 = std::to_string(s_seq.fetch_add(1));
+                            const std::string pp =
+                                std::string("{\"pushing\":{\"command\":\"pushall\",")
+                              + "\"push_target\":1,\"sequence_id\":\"" + seq2 + "\"}}";
+                            const auto t2 = std::chrono::steady_clock::now();
+                            const int rcp = ag->send_message(d, pp, /*qos=*/0, /*timeout_ms=*/0);
+                            if (rcp != 0) {
+                                std::fprintf(stderr,
+                                    "[proof-of-life] dev=%s FAILED step=pushall "
+                                    "send rc=%d\n", d.c_str(), rcp);
+                                std::fflush(stderr);
+                                continue;
+                            }
+                            if (!wait_for_inbound(d, t2, 10s)) {
+                                std::fprintf(stderr,
+                                    "[proof-of-life] dev=%s FAILED step=pushall "
+                                    "send rc=0 but no push_status in 10s\n",
+                                    d.c_str());
+                                std::fflush(stderr);
+                                continue;
+                            }
+                            std::fprintf(stderr,
+                                "[proof-of-life] dev=%s OK — cloud tunnel alive, "
+                                "version + push_status received\n", d.c_str());
+                            std::fflush(stderr);
+                        }
+                    }).detach();
+                    // --------------------------------------------------------
+
                     return;
                 }
                 std::fprintf(stderr,
@@ -1349,6 +1473,11 @@ void install_networking_callbacks(GUI_App* app)
     // pump has accurate VirtualPrinter entries). No plater / sidebar
     // / dialog work — those belong to the full GUI path.
     app->m_agent->set_on_message_fn([app](std::string dev_id, std::string msg) {
+        // Proof-of-life observation — record any inbound for this dev_id
+        // so the cascade's tail probe can confirm cloud tunnel liveness.
+        // Must run unconditionally (i.e. even during shutdown) so we
+        // don't accidentally drop a probe-reply.
+        note_inbound(dev_id);
         if (app->is_closing()) return;
         app->CallAfter([app, dev_id, msg] {
             if (app->is_closing()) return;
@@ -1362,6 +1491,7 @@ void install_networking_callbacks(GUI_App* app)
     // Same idea for LAN push_status (real LAN printers, plus cloud
     // local-tunnelled). Bridge tap wraps this too.
     app->m_agent->set_on_local_message_fn([app](std::string dev_id, std::string msg) {
+        note_inbound(dev_id); // see cloud branch above
         if (app->is_closing()) return;
         app->CallAfter([app, dev_id, msg] {
             if (app->is_closing()) return;
