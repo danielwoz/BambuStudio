@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -287,7 +289,31 @@ int run_bridge_multi(int argc, char** argv) {
     install_signal_handlers();
     g_children.assign(printers.size(), 0);
 
+    // Cloud-login stagger (seconds). Bambu's cloud appears to
+    // rate-limit / deduplicate concurrent logins from the same
+    // account: when 2+ children call connect_server within a few
+    // seconds of each other the cloud sometimes leaves one session
+    // in a degraded "connect+subscribe OK but send_message refuses
+    // with rc_cloud=-2" state. Spacing the spawns lets each child's
+    // cloud_bringup complete and settle before the next one starts.
+    // Default 30s — empirically sufficient on a 3-printer account.
+    // Override via BAMBU_BRIDGE_MULTI_STAGGER_S=<n> for testing.
+    int stagger_s = 30;
+    if (const char* env = std::getenv("BAMBU_BRIDGE_MULTI_STAGGER_S");
+        env && *env) {
+        try { stagger_s = std::stoi(env); } catch (...) {}
+        if (stagger_s < 0) stagger_s = 0;
+    }
+
     for (size_t i = 0; i < printers.size(); ++i) {
+        if (i > 0 && stagger_s > 0) {
+            std::fprintf(stderr,
+                "[bridge-multi] stagger sleep %ds before spawning %s "
+                "(prevents concurrent-cloud-login rate-limit)\n",
+                stagger_s, printers[i].c_str());
+            std::fflush(stderr);
+            std::this_thread::sleep_for(std::chrono::seconds(stagger_s));
+        }
         std::string cdir = prepare_child_config_dir(printers[i]);
         auto child = build_child_args(
             self_path, printers[i],
