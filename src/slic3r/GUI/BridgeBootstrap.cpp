@@ -1442,11 +1442,37 @@ void install_gui_worker(GUI_App* app)
                             "plugin fallback; next boot will use native path\n");
                         std::fflush(stderr);
                     } else {
+                        // LOUD: this is the silent killer. The plugin
+                        // logs in OK and reports is_user_login=1 /
+                        // is_server_connected=1, but bambu_network_send_message
+                        // ALSO needs a native access_token to be co-present
+                        // in BambuStudio.conf — without it every cloud
+                        // publish returns rc_cloud=-2 and slicers see
+                        // "Failed to connect" with no visible bridge error.
+                        // See project_bridge_cloud_tunnel memory.
                         std::fprintf(stderr,
-                            "[bridge-gui] plugin did not surface usable tokens "
-                            "via get_my_token; native session NOT persisted "
-                            "(access=%s refresh=%s) — next boot will "
-                            "fallback again\n",
+                            "\n"
+                            "============================================================\n"
+                            "  ⚠ BRIDGE WILL NOT RELAY CLOUD PUBLISHES UNTIL LOGIN\n"
+                            "------------------------------------------------------------\n"
+                            "  [bridge-gui] plugin did not surface usable tokens via\n"
+                            "  get_my_token; native session NOT persisted\n"
+                            "  (access=%s refresh=%s).\n"
+                            "\n"
+                            "  Symptom you will see in slicers:\n"
+                            "    'Failed to connect' / spinner stuck on Connecting.\n"
+                            "  Symptom you will see in this log:\n"
+                            "    [adapter] send_message ... rc_cloud=-2 rc_lan=-4\n"
+                            "    even though login=1 server=1.\n"
+                            "\n"
+                            "  How to fix:\n"
+                            "    1. Open the slicer GUI on this machine (Linux\n"
+                            "       BambuStudio), Account → Log in. The slicer\n"
+                            "       writes access_token+refresh_token into:\n"
+                            "         ~/.config/BambuStudio/BambuStudio.conf\n"
+                            "    2. Restart the bridge.\n"
+                            "    3. This warning should disappear.\n"
+                            "============================================================\n",
                             d.access_token.empty() ? "empty" : "present",
                             d.refresh_token.empty() ? "empty" : "present");
                         std::fflush(stderr);
