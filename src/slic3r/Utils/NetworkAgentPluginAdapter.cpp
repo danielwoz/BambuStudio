@@ -92,14 +92,21 @@ int NetworkAgentPluginAdapter::publish_to_device(
 
 int NetworkAgentPluginAdapter::upload_gcode_to_sdcard(
         const CloudUploadParams& params) {
-    // Bridge the LanUploadSink/CloudUploadSink ➜ NetworkAgent path
-    // by translating the adapter's CloudUploadParams into the slicer's
-    // PrintParams struct and calling through. Returning -2 here was a
-    // long-standing stub that masqueraded as "plugin missing export" —
-    // it made every FFFP gcode upload through the bridge fail with
-    // 551 at the FTPS server, leaving the slicer to fall back to the
-    // "Connect the printer using IP and access code" dialog with no
-    // useful diagnostic.
+    // Mirror what the GUI's PrintJob does: try the LAN-FTPS-to-printer
+    // path first (start_send_gcode_to_sdcard), and on failure fall back
+    // to the cloud-relay path (start_print) — the same one PrintJob
+    // uses for cloud-bound printers and for printers like A1 that have
+    // no LAN FTPS server.
+    //
+    // Why both: not all real Bambu printers run an FTPS endpoint. H2S,
+    // H2D, X1, P1 do; A1/N2S does NOT (per printers.yaml — port 6000
+    // on A1 is MJPEG, no file tunnel, no SD-card FTPS). For A1 the
+    // start_send_gcode_to_sdcard call returns -5010
+    // (BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED) because the
+    // plugin can't open the FTPS connection to 192.168.1.6:990. The
+    // GUI's PrintJob handles this by routing through start_print
+    // (cloud-relay); the bridge needs to do the same so the FFFP
+    // FTPS-into-bridge flow remains transparent end-to-end.
     if (!m_agent) return -1;
     PrintParams pp{};
     pp.dev_id           = params.dev_id;
@@ -118,10 +125,21 @@ int NetworkAgentPluginAdapter::upload_gcode_to_sdcard(
     int rc = m_agent->start_send_gcode_to_sdcard(
         pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
     std::fprintf(stderr,
-        "[adapter] upload_gcode_to_sdcard dev=%s ip=%s rc=%d\n",
+        "[adapter] upload_gcode_to_sdcard primary "
+        "(start_send_gcode_to_sdcard) dev=%s ip=%s rc=%d\n",
         pp.dev_id.c_str(), pp.dev_ip.c_str(), rc);
     std::fflush(stderr);
-    return rc;
+    if (rc == 0) return 0;
+    // Cloud-relay fallback. PrintJob for cloud-bound + FTPS-less
+    // printers does this same call.
+    int rc2 = m_agent->start_print(
+        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
+    std::fprintf(stderr,
+        "[adapter] upload_gcode_to_sdcard fallback "
+        "(start_print / cloud-relay) dev=%s ip=%s rc=%d\n",
+        pp.dev_id.c_str(), pp.dev_ip.c_str(), rc2);
+    std::fflush(stderr);
+    return rc2;
 }
 
 int NetworkAgentPluginAdapter::connect_printer(
@@ -220,10 +238,23 @@ int NetworkAgentPluginAdapter::start_local_print_with_record(
     int rc = m_agent->start_local_print_with_record(
         pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
     std::fprintf(stderr,
-        "[adapter] start_local_print_with_record dev=%s ip=%s rc=%d\n",
+        "[adapter] start_local_print_with_record primary "
+        "(LAN+FTPS) dev=%s ip=%s rc=%d\n",
         pp.dev_id.c_str(), pp.dev_ip.c_str(), rc);
     std::fflush(stderr);
-    return rc;
+    if (rc == 0) return 0;
+    // Same fallback as upload_gcode_to_sdcard: for printers without an
+    // FTPS endpoint (A1) the LAN-with-record path fails with -2130; the
+    // GUI's PrintJob recovers by routing through start_print
+    // (cloud-relay), and so does the bridge.
+    int rc2 = m_agent->start_print(
+        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
+    std::fprintf(stderr,
+        "[adapter] start_local_print_with_record fallback "
+        "(start_print / cloud-relay) dev=%s ip=%s rc=%d\n",
+        pp.dev_id.c_str(), pp.dev_ip.c_str(), rc2);
+    std::fflush(stderr);
+    return rc2;
 }
 
 int NetworkAgentPluginAdapter::get_camera_url(
