@@ -410,6 +410,62 @@ bool run_headless(GUI_App* app)
                         d.c_str());
                     std::fflush(stderr);
                 }
+
+                // -- Post-LAN enc_msg gate-open cascade --
+                //
+                // Mirror what the GUI bridge bringup (install_gui_worker
+                // → finish_cascade in this same file) does. Without this,
+                // device_pub_key_map[dev_id] stays empty in the plugin and
+                // every print.* publish (start_print, start_local_print_
+                // with_record cloud-relay, send_message_to_printer for
+                // control commands) is rejected — the plugin returns
+                // SEND_MSG_FAILED (-4) or PRINT_SP_ENC_FLAG_NOT_READY
+                // (-3140), and the printer itself returns
+                // err_code=84033543 / reason="mqtt message verify failed"
+                // for any direct-MQTT bypass that lacks the per-message
+                // signature.
+                //
+                // The cascade is what populates device_pub_key_map:
+                //   set_user_selected_machine(d) → install_device_cert(d,
+                //   false) → wait for printer's cert_report reply → plugin
+                //   parses, stores the per-device pub key.
+                //
+                // A single install_device_cert is timing-flaky (~1/3 LAN
+                // races on H2S per EXP-{A..E}). The GUI loops 3 rounds ×
+                // 5s. Headless was previously doing ONLY the initial
+                // single install_device_cert above; on cold-start
+                // --bridge-only / --bridge-multi children the gate stayed
+                // shut, which is what the user-visible "the bridge can't
+                // start a print" symptom traces back to. Headless now
+                // matches GUI exactly.
+                //
+                // See project_plugin_enc_gate memory + EXP-{A..E}-RESULTS
+                // for the empirical / RE paths.
+                using namespace std::chrono_literals;
+                std::this_thread::sleep_for(15s);
+                std::fprintf(stderr,
+                    "[bridge] post-LAN enc_msg gate-open cycle "
+                    "(%zu dev_ids; 3 rounds × 5s each)\n",
+                    dev_ids.size());
+                std::fflush(stderr);
+                for (int round = 0; round < 3; ++round) {
+                    for (const auto& d : dev_ids) {
+                        int sel_rc2 = ag->set_user_selected_machine(d);
+                        ag->install_device_cert(d, /*lan_only=*/false);
+                        std::fprintf(stderr,
+                            "[bridge] (gate-cycle r%d) dev=%s "
+                            "set_user_selected_machine rc=%d + "
+                            "install_device_cert; waiting 5s for cert_report\n",
+                            round, d.c_str(), sel_rc2);
+                        std::fflush(stderr);
+                        std::this_thread::sleep_for(5s);
+                    }
+                }
+                std::fprintf(stderr,
+                    "[bridge] enc_msg gate cycle complete for %zu dev_ids; "
+                    "print.* publishes should now route through plugin\n",
+                    dev_ids.size());
+                std::fflush(stderr);
             }
 
             const auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
