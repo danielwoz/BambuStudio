@@ -12,6 +12,76 @@
 
 namespace Slic3r {
 
+namespace {
+
+// Copy every GUI-equivalent field from the bridge's adapter-side
+// param struct (LocalPrintParams or CloudUploadParams — they share the
+// same set of GUI-mirror fields, see BambuNetworkingPluginHandle.hpp)
+// into the upstream slicer-side PrintParams struct that NetworkAgent's
+// start_print / start_local_print / start_send_gcode_to_sdcard expect.
+//
+// Templated on SrcT so one helper handles both bridge-side structs
+// without dragging their private definitions into NetworkAgent's
+// header. Defaults match what each call site was doing inline before
+// this refactor, so behaviour is preserved when callers leave the new
+// fields at their default values.
+template <typename SrcT>
+void fill_print_params(const SrcT&        src,
+                       PrintParams&       dst,
+                       const std::string& default_connection,
+                       const std::string& filename_override = {}) {
+    dst.dev_id           = src.dev_id;
+    dst.dev_ip           = src.dev_ip;
+    dst.username         = "bblp";
+    dst.password         = src.access_code;
+    dst.filename         = filename_override.empty()
+                           ? src.local_file_path : filename_override;
+    dst.project_name     = src.project_name.empty()
+                           ? src.local_file_path : src.project_name;
+    dst.connection_type  = src.connection_type.empty()
+                           ? default_connection : src.connection_type;
+    dst.use_ssl_for_ftp  = src.use_ssl_for_ftp;
+    dst.use_ssl_for_mqtt = src.use_ssl_for_mqtt;
+
+    // GUI-equivalent PrintParams fields. The bridge mirrors the GUI's
+    // PrintJob exactly when these are plumbed through; when callers
+    // leave them at their defaults the resulting PrintParams looks
+    // the same as the pre-refactor inline copy did.
+    dst.task_name                  = src.task_name;
+    dst.preset_name                = src.preset_name;
+    dst.config_filename            = src.config_filename;
+    dst.plate_index                = src.plate_index;
+    dst.nozzle_mapping             = src.nozzle_mapping;
+    dst.ams_mapping                = src.ams_mapping;
+    dst.ams_mapping2               = src.ams_mapping2;
+    dst.ams_mapping_info           = src.ams_mapping_info;
+    dst.nozzles_info               = src.nozzles_info;
+    dst.comments                   = src.comments;
+    dst.origin_profile_id          = src.origin_profile_id;
+    dst.stl_design_id              = src.stl_design_id;
+    dst.origin_model_id            = src.origin_model_id;
+    dst.print_type                 = src.print_type;
+    dst.dst_file                   = src.dst_file;
+    dst.dev_name                   = src.dev_name;
+    dst.task_bed_leveling          = src.task_bed_leveling;
+    dst.task_flow_cali             = src.task_flow_cali;
+    dst.task_vibration_cali        = src.task_vibration_cali;
+    dst.task_layer_inspect         = src.task_layer_inspect;
+    dst.task_record_timelapse      = src.task_record_timelapse;
+    dst.task_timelapse_use_internal= src.task_timelapse_use_internal;
+    dst.task_use_ams               = src.task_use_ams;
+    dst.task_bed_type              = src.task_bed_type;
+    dst.extra_options              = src.extra_options;
+    dst.auto_bed_leveling          = src.auto_bed_leveling;
+    dst.auto_flow_cali             = src.auto_flow_cali;
+    dst.auto_offset_cali           = src.auto_offset_cali;
+    dst.extruder_cali_manual_mode  = src.extruder_cali_manual_mode;
+    dst.task_ext_change_assist     = src.task_ext_change_assist;
+    dst.try_emmc_print             = src.try_emmc_print;
+}
+
+} // namespace
+
 NetworkAgentPluginAdapter::NetworkAgentPluginAdapter(NetworkAgent* agent)
     : bridge::BambuNetworkingPluginHandle(bridge::PluginHandleConfig{}),
       m_agent(agent)
@@ -109,19 +179,7 @@ int NetworkAgentPluginAdapter::upload_gcode_to_sdcard(
     // FTPS-into-bridge flow remains transparent end-to-end.
     if (!m_agent) return -1;
     PrintParams pp{};
-    pp.dev_id           = params.dev_id;
-    pp.dev_ip           = params.dev_ip;
-    pp.username         = "bblp";
-    pp.password         = params.access_code;
-    pp.filename         = params.local_file_path;
-    pp.project_name     = params.project_name.empty()
-                          ? params.local_file_path
-                          : params.project_name;
-    pp.connection_type  = params.connection_type.empty()
-                          ? std::string("cloud")
-                          : params.connection_type;
-    pp.use_ssl_for_ftp  = params.use_ssl_for_ftp;
-    pp.use_ssl_for_mqtt = params.use_ssl_for_mqtt;
+    fill_print_params(params, pp, /*default_connection=*/"cloud");
     int rc = m_agent->start_send_gcode_to_sdcard(
         pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
     std::fprintf(stderr,
@@ -222,19 +280,7 @@ int NetworkAgentPluginAdapter::start_local_print_with_record(
     // dialog reappearing after a successful slice + Send click.
     if (!m_agent) return -1;
     PrintParams pp{};
-    pp.dev_id           = params.dev_id;
-    pp.dev_ip           = params.dev_ip;
-    pp.username         = "bblp";
-    pp.password         = params.access_code;
-    pp.filename         = params.local_file_path;
-    pp.project_name     = params.project_name.empty()
-                          ? params.local_file_path
-                          : params.project_name;
-    pp.connection_type  = params.connection_type.empty()
-                          ? std::string("lan")
-                          : params.connection_type;
-    pp.use_ssl_for_ftp  = params.use_ssl_for_ftp;
-    pp.use_ssl_for_mqtt = params.use_ssl_for_mqtt;
+    fill_print_params(params, pp, /*default_connection=*/"lan");
     int rc = m_agent->start_local_print_with_record(
         pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
     std::fprintf(stderr,
@@ -255,6 +301,40 @@ int NetworkAgentPluginAdapter::start_local_print_with_record(
         pp.dev_id.c_str(), pp.dev_ip.c_str(), rc2);
     std::fflush(stderr);
     return rc2;
+}
+
+// LAN print (no slicer-side record). The wider PrintParams that ths
+// GUI fills (AMS mapping, task flags, etc.) flow through here when
+// they're plumbed end-to-end; for now we fill what we have.
+int NetworkAgentPluginAdapter::start_local_print(const LocalPrintParams& params) {
+    if (!m_agent) return -1;
+    PrintParams pp{};
+    fill_print_params(params, pp, /*default_connection=*/"lan");
+    int rc = m_agent->start_local_print(
+        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr);
+    std::fprintf(stderr,
+        "[adapter] start_local_print dev=%s ip=%s rc=%d\n",
+        pp.dev_id.c_str(), pp.dev_ip.c_str(), rc);
+    std::fflush(stderr);
+    return rc;
+}
+
+// Re-print a 3MF that's already resident on the printer's SD card.
+// `local_file_path` carries the on-printer path here, not a local
+// upload — same convention as the upstream plugin's start_sdcard_print.
+int NetworkAgentPluginAdapter::start_sdcard_print(const LocalPrintParams& params) {
+    if (!m_agent) return -1;
+    PrintParams pp{};
+    // local_file_path here carries the on-printer path (e.g.
+    // "/sdcard/Metadata/plate_1.3mf") — the helper preserves it.
+    fill_print_params(params, pp, /*default_connection=*/"lan");
+    int rc = m_agent->start_sdcard_print(
+        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr);
+    std::fprintf(stderr,
+        "[adapter] start_sdcard_print dev=%s ip=%s on_printer_path=%s rc=%d\n",
+        pp.dev_id.c_str(), pp.dev_ip.c_str(), pp.filename.c_str(), rc);
+    std::fflush(stderr);
+    return rc;
 }
 
 int NetworkAgentPluginAdapter::get_camera_url(

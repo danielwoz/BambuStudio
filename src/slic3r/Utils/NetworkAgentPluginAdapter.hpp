@@ -78,6 +78,8 @@ public:
                                 int                qos) override;
 
     int start_local_print_with_record(const LocalPrintParams& params) override;
+    int start_local_print            (const LocalPrintParams& params) override;
+    int start_sdcard_print           (const LocalPrintParams& params) override;
 
     int get_camera_url(const std::string& dev_id,
                        std::string*       url_out,

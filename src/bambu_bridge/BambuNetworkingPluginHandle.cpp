@@ -171,6 +171,26 @@ extern "C++" {
         std::function<bool()>                                       cancel_fn,
         std::function<bool(int status, std::string job_info)>       wait_fn);
 
+    // Same upstream shape as start_local_print_with_record (3 callbacks).
+    using func_start_local_print = int (*)(
+        void* agent,
+        PluginPrintParams params,
+        std::function<void(int status, int code, std::string msg)> update_fn,
+        std::function<bool()>                                       cancel_fn);
+
+    using func_start_sdcard_print = int (*)(
+        void* agent,
+        PluginPrintParams params,
+        std::function<void(int status, int code, std::string msg)> update_fn,
+        std::function<bool()>                                       cancel_fn);
+
+    using func_start_print = int (*)(
+        void* agent,
+        PluginPrintParams params,
+        std::function<void(int status, int code, std::string msg)> update_fn,
+        std::function<bool()>                                       cancel_fn,
+        std::function<bool(int status, std::string job_info)>       wait_fn);
+
     using func_start_local_print_with_record = int (*)(
         void* agent,
         PluginPrintParams params,
@@ -287,6 +307,9 @@ struct BambuNetworkingPluginHandle::Impl {
     func_connect_server        connect_server        = nullptr;
     func_start_send_gcode_to_sdcard      start_send_gcode_to_sdcard      = nullptr;
     func_start_local_print_with_record   start_local_print_with_record   = nullptr;
+    func_start_local_print               start_local_print               = nullptr;
+    func_start_sdcard_print              start_sdcard_print              = nullptr;
+    func_start_print                     start_print                     = nullptr;
     func_connect_printer                 connect_printer                 = nullptr;
     func_disconnect_printer              disconnect_printer              = nullptr;
     func_set_user_selected_machine       set_user_selected_machine       = nullptr;
@@ -366,6 +389,12 @@ struct BambuNetworkingPluginHandle::Impl {
             "bambu_network_start_send_gcode_to_sdcard");
         start_local_print_with_record = lib.sym<func_start_local_print_with_record>(
             "bambu_network_start_local_print_with_record");
+        start_local_print = lib.sym<func_start_local_print>(
+            "bambu_network_start_local_print");
+        start_sdcard_print = lib.sym<func_start_sdcard_print>(
+            "bambu_network_start_sdcard_print");
+        start_print = lib.sym<func_start_print>(
+            "bambu_network_start_print");
         connect_printer     = lib.sym<func_connect_printer>   ("bambu_network_connect_printer");
         disconnect_printer  = lib.sym<func_disconnect_printer>("bambu_network_disconnect_printer");
         set_user_selected_machine = lib.sym<func_set_user_selected_machine>(
@@ -399,11 +428,11 @@ struct BambuNetworkingPluginHandle::Impl {
         if (init_log) init_log(agent);
 
         if (set_cert_file && !cfg.cert_dir.empty() && !cfg.cert_file.empty()) {
-            int rc = set_cert_file(agent, cfg.cert_dir, cfg.cert_file);
+            (void) set_cert_file(agent, cfg.cert_dir, cfg.cert_file);
         }
 
         if (set_extra_http_header && !cfg.extra_http_headers.empty()) {
-            int rc = set_extra_http_header(agent, cfg.extra_http_headers);
+            (void) set_extra_http_header(agent, cfg.extra_http_headers);
         }
 
         // Install our callbacks BEFORE start() so we don't race against
@@ -664,32 +693,101 @@ int BambuNetworkingPluginHandle::send_message_to_printer(const std::string& dev_
                                          json_payload, qos, 0);
 }
 
+namespace {
+// Copy the GUI-equivalent PrintParams fields from any of the bridge's
+// upload-param structs into the PluginPrintParams that we feed to the
+// proprietary plugin. Templated on both source and destination so it
+// works without needing to name the (private) nested Impl type.
+template <typename SrcT, typename DstT>
+void copy_gui_fields_into_plugin_params(
+        const SrcT&                                         src,
+        DstT&                                               dst,
+        const std::string&                                  default_connection) {
+    dst.dev_id           = src.dev_id;
+    dst.dev_ip           = src.dev_ip;
+    dst.username         = "bblp";
+    dst.password         = src.access_code;
+    dst.filename         = src.local_file_path;
+    dst.project_name     = src.project_name.empty()
+                           ? src.local_file_path : src.project_name;
+    dst.connection_type  = src.connection_type.empty()
+                           ? default_connection : src.connection_type;
+    dst.use_ssl_for_ftp  = src.use_ssl_for_ftp;
+    dst.use_ssl_for_mqtt = src.use_ssl_for_mqtt;
+    // GUI-PrintJob fields. Pass through verbatim. Empty / zero is a
+    // no-op so unchanged callers stay equivalent to the prior behaviour.
+    dst.task_name                  = src.task_name;
+    dst.preset_name                = src.preset_name;
+    dst.config_filename            = src.config_filename;
+    dst.plate_index                = src.plate_index;
+    dst.nozzle_mapping             = src.nozzle_mapping;
+    dst.ams_mapping                = src.ams_mapping;
+    dst.ams_mapping2               = src.ams_mapping2;
+    dst.ams_mapping_info           = src.ams_mapping_info;
+    dst.nozzles_info               = src.nozzles_info;
+    dst.comments                   = src.comments;
+    dst.origin_profile_id          = src.origin_profile_id;
+    dst.stl_design_id              = src.stl_design_id;
+    dst.origin_model_id            = src.origin_model_id;
+    dst.print_type                 = src.print_type;
+    dst.dst_file                   = src.dst_file;
+    dst.dev_name                   = src.dev_name;
+    dst.task_bed_leveling          = src.task_bed_leveling;
+    dst.task_flow_cali             = src.task_flow_cali;
+    dst.task_vibration_cali        = src.task_vibration_cali;
+    dst.task_layer_inspect         = src.task_layer_inspect;
+    dst.task_record_timelapse      = src.task_record_timelapse;
+    dst.task_timelapse_use_internal= src.task_timelapse_use_internal;
+    dst.task_use_ams               = src.task_use_ams;
+    dst.task_bed_type              = src.task_bed_type;
+    dst.extra_options              = src.extra_options;
+    dst.auto_bed_leveling          = src.auto_bed_leveling;
+    dst.auto_flow_cali             = src.auto_flow_cali;
+    dst.auto_offset_cali           = src.auto_offset_cali;
+    dst.extruder_cali_manual_mode  = src.extruder_cali_manual_mode;
+    dst.task_ext_change_assist     = src.task_ext_change_assist;
+    dst.try_emmc_print             = src.try_emmc_print;
+}
+} // namespace
+
 int BambuNetworkingPluginHandle::start_local_print_with_record(
         const LocalPrintParams& params) {
     if (!m_impl->agent)                            return -1;
     if (!m_impl->start_local_print_with_record)    return -2;
-
     PluginPrintParams pp{};
-    pp.dev_id           = params.dev_id;
-    pp.dev_ip           = params.dev_ip;
-    pp.username         = "bblp";
-    pp.password         = params.access_code;
-    pp.filename         = params.local_file_path;
-    pp.project_name     = params.project_name.empty()
-                          ? params.local_file_path
-                          : params.project_name;
-    pp.connection_type  = params.connection_type.empty()
-                          ? std::string("lan")
-                          : params.connection_type;
-    pp.use_ssl_for_ftp  = params.use_ssl_for_ftp;
-    pp.use_ssl_for_mqtt = params.use_ssl_for_mqtt;
-
+    copy_gui_fields_into_plugin_params(params, pp, /*default*/ "lan");
     // No progress reporting; the bridge synchronously waits for the
     // upload to finish before responding 226 to the slicer. Empty
     // std::function objects tell the plugin "no callbacks".
     return m_impl->start_local_print_with_record(
         m_impl->agent, std::move(pp),
         /*update_fn*/ {}, /*cancel_fn*/ {}, /*wait_fn*/ {});
+}
+
+// Translate LocalPrintParams → PluginPrintParams and call the plugin's
+// start_local_print export (LAN print, no slicer-side record).
+int BambuNetworkingPluginHandle::start_local_print(
+        const LocalPrintParams& params) {
+    if (!m_impl->agent)            return -1;
+    if (!m_impl->start_local_print) return -2;
+    PluginPrintParams pp{};
+    copy_gui_fields_into_plugin_params(params, pp, /*default*/ "lan");
+    return m_impl->start_local_print(
+        m_impl->agent, std::move(pp),
+        /*update_fn*/ {}, /*cancel_fn*/ {});
+}
+
+// Print a 3MF already on the printer's SD card. `local_file_path` is
+// reused as the on-printer path (e.g. "/sdcard/Metadata/plate_1.3mf").
+int BambuNetworkingPluginHandle::start_sdcard_print(
+        const LocalPrintParams& params) {
+    if (!m_impl->agent)             return -1;
+    if (!m_impl->start_sdcard_print) return -2;
+    PluginPrintParams pp{};
+    copy_gui_fields_into_plugin_params(params, pp, /*default*/ "lan");
+    return m_impl->start_sdcard_print(
+        m_impl->agent, std::move(pp),
+        /*update_fn*/ {}, /*cancel_fn*/ {});
 }
 
 bool BambuNetworkingPluginHandle::is_local_connected() const {

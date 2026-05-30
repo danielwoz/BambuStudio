@@ -166,6 +166,41 @@ public:
         std::string connection_type;    // "cloud" | "lan" — plugin routes accordingly
         bool        use_ssl_for_ftp  = true;
         bool        use_ssl_for_mqtt = true;
+
+        // Same forward-plumbing as LocalPrintParams above — see there
+        // for the rationale. Default values reproduce the prior
+        // behaviour so an unchanged caller is unaffected.
+        std::string task_name;
+        std::string preset_name;
+        std::string config_filename;
+        int         plate_index            = 0;
+        std::string nozzle_mapping;
+        std::string ams_mapping;
+        std::string ams_mapping2;
+        std::string ams_mapping_info;
+        std::string nozzles_info;
+        std::string comments;
+        int         origin_profile_id      = 0;
+        int         stl_design_id          = 0;
+        std::string origin_model_id;
+        std::string print_type;
+        std::string dst_file;
+        std::string dev_name;
+        bool        task_bed_leveling          = false;
+        bool        task_flow_cali             = false;
+        bool        task_vibration_cali        = false;
+        bool        task_layer_inspect         = false;
+        bool        task_record_timelapse      = false;
+        bool        task_timelapse_use_internal= false;
+        bool        task_use_ams               = false;
+        std::string task_bed_type;
+        std::string extra_options;
+        int         auto_bed_leveling          = 0;
+        int         auto_flow_cali              = 0;
+        int         auto_offset_cali            = 0;
+        int         extruder_cali_manual_mode  = -1;
+        bool        task_ext_change_assist     = false;
+        bool        try_emmc_print             = false;
     };
     virtual int upload_gcode_to_sdcard(const CloudUploadParams& params);
 
@@ -255,8 +290,64 @@ public:
         std::string connection_type;    // "lan" for the LAN route
         bool        use_ssl_for_ftp  = true;
         bool        use_ssl_for_mqtt = true;
+
+        // ---- Optional GUI-PrintJob equivalents ------------------------------
+        //
+        // Empty / zero values are a no-op (matches the prior behaviour
+        // before this batch). When the slicer plumbs them through (e.g.
+        // by encoding them on top of the FFFP gcode_file MQTT command),
+        // the bridge passes them straight to the proprietary plugin so
+        // the resulting print honours the user's choices (AMS map,
+        // calibration toggles, plate index, etc).
+        std::string task_name;
+        std::string preset_name;
+        std::string config_filename;
+        int         plate_index            = 0;
+        std::string nozzle_mapping;
+        std::string ams_mapping;
+        std::string ams_mapping2;
+        std::string ams_mapping_info;
+        std::string nozzles_info;
+        std::string comments;
+        int         origin_profile_id      = 0;
+        int         stl_design_id          = 0;
+        std::string origin_model_id;
+        std::string print_type;
+        std::string dst_file;
+        std::string dev_name;
+        bool        task_bed_leveling          = false;
+        bool        task_flow_cali             = false;
+        bool        task_vibration_cali        = false;
+        bool        task_layer_inspect         = false;
+        bool        task_record_timelapse      = false;
+        bool        task_timelapse_use_internal= false;
+        bool        task_use_ams               = false;
+        std::string task_bed_type;
+        std::string extra_options;
+        int         auto_bed_leveling          = 0;
+        int         auto_flow_cali              = 0;
+        int         auto_offset_cali            = 0;
+        int         extruder_cali_manual_mode  = -1;
+        bool        task_ext_change_assist     = false;
+        bool        try_emmc_print             = false;  // hint for the plugin's
+                                                          // FTPS-vs-BambuTunnel
+                                                          // decision (X1C/P1S).
     };
     virtual int start_local_print_with_record(const LocalPrintParams& params);
+
+    // Stage a LAN print via `start_local_print` (the GUI's bare-LAN
+    // variant — no slicer-side record, no cloud-side record). Plugin
+    // handles the FTPS / BambuTunnel choice internally, same as
+    // start_local_print_with_record. Default impl returns -2 so the
+    // upload sinks decode it as "plugin missing export".
+    virtual int start_local_print(const LocalPrintParams& params);
+
+    // Stage a print from an already-on-printer .3mf file (re-print from
+    // SD card). `local_file_path` here is the path ON THE PRINTER (e.g.
+    // "/sdcard/Metadata/plate_1.3mf") rather than a local upload.
+    // Plugin sends the print-start MQTT command directly. Default
+    // returns -2.
+    virtual int start_sdcard_print(const LocalPrintParams& params);
 
     // True iff the LAN connection driven by `connect_printer` is currently
     // up. Maintained via the OnLocalConnectedFn callback the plugin fires
