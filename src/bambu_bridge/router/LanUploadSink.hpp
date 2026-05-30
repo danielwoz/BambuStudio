@@ -46,6 +46,15 @@ struct LanUploadSinkDevice {
     uint16_t                printer_port    = 990;
     std::chrono::seconds    connect_timeout{10};
     std::chrono::seconds    io_timeout{120};
+
+    // Printer model — propagated from `--model` on the CLI / from the
+    // cloud inventory's `model_code` when --bridge-multi spawns this
+    // worker. Used by the sink to set `try_emmc_print` (X1C/P1S only)
+    // and to gate the port-6000 BambuTunnel preflight probe (the
+    // BambuTunnel server is only present on firmware that supports it —
+    // H2/H2S/H2D unconditionally, X1C/P1S when the user has flashed
+    // recent firmware, A1 never).
+    std::string             printer_model;
 };
 
 class LanUploadSink : public server::IUploadSink {
@@ -67,6 +76,18 @@ private:
     mutable std::mutex                                    m_mu;
     std::shared_ptr<BambuNetworkingPluginHandle>          m_handle;
     std::unordered_map<std::string, LanUploadSinkDevice>  m_devices;
+
+    // Per-device port-6000 BambuTunnel reachability cache. Populated by
+    // a one-shot TCP-connect probe on the first upload for a dev_id and
+    // refreshed at most once per `kTunnelProbeTtl`. Used to gate the
+    // `try_emmc_print` hint we pass to the plugin: on X1C/P1S the plugin
+    // honours the hint by routing through the BambuTunnel on port 6000
+    // (eMMC target) instead of legacy FTPS on 990 (SD-card target).
+    struct TunnelProbeResult {
+        bool                                  reachable = false;
+        std::chrono::steady_clock::time_point probed_at{};
+    };
+    std::unordered_map<std::string, TunnelProbeResult>    m_tunnel_probes;
 };
 
 } // namespace router

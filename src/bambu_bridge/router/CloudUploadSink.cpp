@@ -17,6 +17,7 @@
 #include "../BambuNetworkingPluginHandle.hpp"
 #include "UploadSpool.hpp"
 
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -37,6 +38,26 @@ const char* err_for_rc(int rc) {
         case -2: return "plugin missing bambu_network_start_send_gcode_to_sdcard export (older plugin?)";
         default: return "plugin reported upload error";
     }
+}
+
+// Same X1/P1-family gate as LanUploadSink — for cloud uploads the
+// plugin still honours `try_emmc_print` (the printer-side download
+// trigger picks eMMC over SD when the flag is set). H2/H2S/H2D ignore
+// it; A1 has no storage so it falls through to the cloud-relay print
+// route the adapter handles in upload_gcode_to_sdcard.
+bool model_supports_emmc(const std::string& model) {
+    if (model.empty()) return false;
+    std::string up;
+    up.reserve(model.size());
+    for (char c : model) up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    auto has = [&](const char* needle) {
+        return up.find(needle) != std::string::npos;
+    };
+    if (up.find("X1") != std::string::npos) return true;
+    if (has("C11") || has("C12")) return true;
+    if (up.find("P1") != std::string::npos) return true;
+    if (has("C13") || has("C14")) return true;
+    return false;
 }
 
 } // namespace
@@ -88,14 +109,21 @@ server::UploadResult CloudUploadSink::deliver(server::UploadJob job) {
     // libbambu_networking 02.06.01.55 in May 2026). If we don't have
     // them yet — e.g. SSDP hasn't fired for this dev_id — leave empty
     // and let the plugin do its best.
+    std::string printer_model;
     {
         std::lock_guard<std::mutex> lk(m_mu);
         auto it = m_devices.find(job.dev_id);
         if (it != m_devices.end()) {
-            cu.dev_ip      = it->second.printer_ip;
-            cu.access_code = it->second.access_code;
+            cu.dev_ip       = it->second.printer_ip;
+            cu.access_code  = it->second.access_code;
+            printer_model   = it->second.printer_model;
         }
     }
+    // GUI parity for X1C/P1S: prefer eMMC over SD when the model
+    // supports it. The cloud-relay path doesn't need a port-6000 probe
+    // (the printer does the download itself), so we set the flag
+    // purely model-conditionally here.
+    cu.try_emmc_print = model_supports_emmc(printer_model);
 
     int rc = m_handle->upload_gcode_to_sdcard(cu);
 

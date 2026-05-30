@@ -56,6 +56,11 @@ public:
         std::string dev_id;
         std::string printer_ip;    // real printer LAN IP
         std::string access_code;
+        // Same role as LanUploadSinkDevice::printer_model — drives the
+        // GUI-equivalent `try_emmc_print` choice when the upload is
+        // routed cloud-side (X1C/P1S → eMMC if the printer reports it
+        // available; everything else → SD-card).
+        std::string printer_model;
     };
     void add_device   (Device dev);
     void remove_device(const std::string& dev_id);

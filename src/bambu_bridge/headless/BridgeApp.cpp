@@ -1239,9 +1239,10 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
             m_lan_uplink->add_device(u);
 
             router::LanUploadSinkDevice s;
-            s.dev_id      = dev_id;
-            s.printer_ip  = lan_ip;
-            s.access_code = access_code;
+            s.dev_id        = dev_id;
+            s.printer_ip    = lan_ip;
+            s.access_code   = access_code;
+            s.printer_model = vp.model;
             m_lan_sink->add_device(s);
 
             // CloudUploadSink also wants dev_ip + access_code so the
@@ -1251,9 +1252,10 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
             // work, period.
             if (m_cloud_sink) {
                 router::CloudUploadSink::Device cs;
-                cs.dev_id      = dev_id;
-                cs.printer_ip  = lan_ip;
-                cs.access_code = access_code;
+                cs.dev_id        = dev_id;
+                cs.printer_ip    = lan_ip;
+                cs.access_code   = access_code;
+                cs.printer_model = vp.model;
                 m_cloud_sink->add_device(std::move(cs));
             }
         }
@@ -1297,16 +1299,18 @@ void BridgeApp::update_lan_ip_locked(DeviceState&       state,
         m_lan_uplink->add_device(u);
 
         router::LanUploadSinkDevice s;
-        s.dev_id      = state.dev_id;
-        s.printer_ip  = lan_ip;
-        s.access_code = state.access_code;
+        s.dev_id        = state.dev_id;
+        s.printer_ip    = lan_ip;
+        s.access_code   = state.access_code;
+        s.printer_model = state.model;
         m_lan_sink->add_device(s);
 
         if (m_cloud_sink) {
             router::CloudUploadSink::Device cs;
-            cs.dev_id      = state.dev_id;
-            cs.printer_ip  = lan_ip;
-            cs.access_code = state.access_code;
+            cs.dev_id        = state.dev_id;
+            cs.printer_ip    = lan_ip;
+            cs.access_code   = state.access_code;
+            cs.printer_model = state.model;
             m_cloud_sink->add_device(std::move(cs));
         }
     }

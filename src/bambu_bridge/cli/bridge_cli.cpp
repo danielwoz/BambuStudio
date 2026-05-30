@@ -1103,10 +1103,11 @@ int cmd_proxy(int argc, char** argv) {
     auto lan_sink = std::make_shared<router::LanUploadSink>();
     if (plugin) lan_sink->attach_plugin(plugin);
     router::LanUploadSinkDevice lsd;
-    lsd.dev_id       = dev_id;
-    lsd.printer_ip   = printer_ip;
-    lsd.printer_port = static_cast<uint16_t>(printer_ftps_port);
-    lsd.access_code  = access_code;
+    lsd.dev_id        = dev_id;
+    lsd.printer_ip    = printer_ip;
+    lsd.printer_port  = static_cast<uint16_t>(printer_ftps_port);
+    lsd.access_code   = access_code;
+    lsd.printer_model = model;
     lan_sink->add_device(lsd);
 
     std::shared_ptr<router::CloudUploadSink> cloud_sink;
