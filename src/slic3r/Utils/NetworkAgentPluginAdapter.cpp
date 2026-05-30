@@ -91,13 +91,37 @@ int NetworkAgentPluginAdapter::publish_to_device(
 }
 
 int NetworkAgentPluginAdapter::upload_gcode_to_sdcard(
-        const CloudUploadParams& /*params*/) {
-    // Not yet implemented — needs a PrintParams construction that lines
-    // up with what GUI_App's SendJob feeds the plugin. The slicer's
-    // virtual storage tunnel goes through VirtualTunnelServer, not this
-    // path. Stub returns the same code the base uses for missing
-    // exports so CloudUploadSink falls back gracefully.
-    return -2;
+        const CloudUploadParams& params) {
+    // Bridge the LanUploadSink/CloudUploadSink ➜ NetworkAgent path
+    // by translating the adapter's CloudUploadParams into the slicer's
+    // PrintParams struct and calling through. Returning -2 here was a
+    // long-standing stub that masqueraded as "plugin missing export" —
+    // it made every FFFP gcode upload through the bridge fail with
+    // 551 at the FTPS server, leaving the slicer to fall back to the
+    // "Connect the printer using IP and access code" dialog with no
+    // useful diagnostic.
+    if (!m_agent) return -1;
+    PrintParams pp{};
+    pp.dev_id           = params.dev_id;
+    pp.dev_ip           = params.dev_ip;
+    pp.username         = "bblp";
+    pp.password         = params.access_code;
+    pp.filename         = params.local_file_path;
+    pp.project_name     = params.project_name.empty()
+                          ? params.local_file_path
+                          : params.project_name;
+    pp.connection_type  = params.connection_type.empty()
+                          ? std::string("cloud")
+                          : params.connection_type;
+    pp.use_ssl_for_ftp  = params.use_ssl_for_ftp;
+    pp.use_ssl_for_mqtt = params.use_ssl_for_mqtt;
+    int rc = m_agent->start_send_gcode_to_sdcard(
+        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
+    std::fprintf(stderr,
+        "[adapter] upload_gcode_to_sdcard dev=%s ip=%s rc=%d\n",
+        pp.dev_id.c_str(), pp.dev_ip.c_str(), rc);
+    std::fflush(stderr);
+    return rc;
 }
 
 int NetworkAgentPluginAdapter::connect_printer(
@@ -171,8 +195,35 @@ int NetworkAgentPluginAdapter::send_message_to_printer(
 }
 
 int NetworkAgentPluginAdapter::start_local_print_with_record(
-        const LocalPrintParams& /*params*/) {
-    return -2;
+        const LocalPrintParams& params) {
+    // Same fix as upload_gcode_to_sdcard above — translate the adapter
+    // params into PrintParams and delegate to the host NetworkAgent's
+    // implementation. The stub return of -2 made every LanUploadSink
+    // upload fail with the "plugin missing export" 551 reply at the
+    // bridge's FTPS server, which surfaced to Orca as the IP+code
+    // dialog reappearing after a successful slice + Send click.
+    if (!m_agent) return -1;
+    PrintParams pp{};
+    pp.dev_id           = params.dev_id;
+    pp.dev_ip           = params.dev_ip;
+    pp.username         = "bblp";
+    pp.password         = params.access_code;
+    pp.filename         = params.local_file_path;
+    pp.project_name     = params.project_name.empty()
+                          ? params.local_file_path
+                          : params.project_name;
+    pp.connection_type  = params.connection_type.empty()
+                          ? std::string("lan")
+                          : params.connection_type;
+    pp.use_ssl_for_ftp  = params.use_ssl_for_ftp;
+    pp.use_ssl_for_mqtt = params.use_ssl_for_mqtt;
+    int rc = m_agent->start_local_print_with_record(
+        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
+    std::fprintf(stderr,
+        "[adapter] start_local_print_with_record dev=%s ip=%s rc=%d\n",
+        pp.dev_id.c_str(), pp.dev_ip.c_str(), rc);
+    std::fflush(stderr);
+    return rc;
 }
 
 int NetworkAgentPluginAdapter::get_camera_url(
