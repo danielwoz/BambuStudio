@@ -13,6 +13,7 @@
 #include "slic3r/GUI/DeviceCore/DevUtil.h"
 
 #include "slic3r/Utils/FileTransferUtils.hpp"
+#include "slic3r/Utils/PrintDispatcher.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -220,37 +221,18 @@ void PrintJob::process()
     params.username = "bblp";
     params.password = m_access_code;
 
-    // check access code and ip address
-    if (this->connection_type == "lan" && m_print_type == "from_normal") {
-        bool emmc_ok = false;
-        bool ftp_ok = false;
-        if (could_emmc_print) {
-            std::string devIP = m_dev_ip;
-            std::string accessCode = m_access_code;
-            std::string url = "bambu:///local/" + devIP + "?port=6000&user=" + "bblp" + "&passwd=" + accessCode;
-            std::unique_ptr<FileTransferTunnel> tunnel = std::make_unique<FileTransferTunnel>(module(), url);
-            emmc_ok = tunnel->sync_start_connect();
-        }
-        {
-            params.dev_id = m_dev_id;
-            params.project_name = "verify_job";
-            params.filename = job_data._temp_path.string();
-            params.connection_type = this->connection_type;
-
-            result = m_agent->start_send_gcode_to_sdcard(params, nullptr, nullptr, nullptr);
-
-            ftp_ok = result == 0;
-        }
-        if (!emmc_ok && !ftp_ok) {
-            BOOST_LOG_TRIVIAL(error) << "access code is invalid";
-            m_enter_ip_address_fun_fail();
-            m_job_finished = true;
-            return;
-        }
-
-        params.project_name = "";
-        params.filename = "";
-    }
+    // LAN-mode access-code verification used to live here (probe via
+    // eMMC tunnel + start_send_gcode_to_sdcard(check_access_code.txt)).
+    // Moved into `PrintDispatcher::dispatch()` so the bridge can re-use
+    // it. On verify failure, the dispatcher returns rc != 0 with
+    // Result.verify_job_failed=true, which we handle below by calling
+    // m_enter_ip_address_fun_fail() — same UX as before.
+    //
+    // params.dev_id needs to be set BEFORE dispatch so verify_job can
+    // address the right printer; the rest of params is filled in the
+    // block immediately below.
+    params.dev_id          = m_dev_id;
+    params.connection_type = this->connection_type;
 
     params.dev_id               = m_dev_id;
     params.ftp_folder           = m_ftp_folder;
@@ -547,78 +529,56 @@ void PrintJob::process()
             return true;
     };
 
-    if (m_print_type == "from_sdcard_view") {
-        BOOST_LOG_TRIVIAL(info) << "print_job: try to send with cloud, model is sdcard view";
-        this->update_status(curr_percent, _L("Sending print job through cloud service"));
-        result = m_agent->start_sdcard_print(params, update_fn, cancel_fn);
-    } else if (params.connection_type != "lan") {
-        if (params.dev_ip.empty())
-            params.comments = "no_ip";
-        else if (this->cloud_print_only)
-            params.comments = "low_version";
-        else if (!this->has_sdcard)
-            params.comments = "no_sdcard";
-        else if (params.password.empty())
-            params.comments = "no_password";
+    // Print dispatch tree extracted to PrintDispatcher::dispatch(),
+    // shared with the bridge's LanUploadSink. Both call sites walk the
+    // same tree so a BambuStudio update to the dispatch logic flows
+    // through to the bridge automatically.
+    //
+    // The dispatcher also handles the LAN-mode verify-job pre-probe
+    // that used to live further up in this function (eMMC tunnel +
+    // start_send_gcode_to_sdcard(check_access_code.txt)). On verify
+    // failure it returns Result.verify_job_failed=true.
+    {
+        PrintDispatcher::Inputs in{};
+        in.cloud_print_only  = this->cloud_print_only;
+        in.has_sdcard        = this->has_sdcard;
+        in.could_emmc_print  = this->could_emmc_print;
+        in.app_lan_mode_only =
+            !wxGetApp().app_config->get("lan_mode_only").empty() &&
+            wxGetApp().app_config->get("lan_mode_only") == "1";
+        in.verify_temp_path  = job_data._temp_path.string();
 
-
-        //use ftp only
-        if (!wxGetApp().app_config->get("lan_mode_only").empty() && wxGetApp().app_config->get("lan_mode_only") == "1") {
-
-            if (params.password.empty() || params.dev_ip.empty()) {
-                error_text = wxString::Format("Access code:%s Ip address:%s", params.password, params.dev_ip);
-                result = BAMBU_NETWORK_ERR_FTP_UPLOAD_FAILED;
-            }
-            else {
-                BOOST_LOG_TRIVIAL(info) << "print_job: use ftp send print only";
+        auto pre_status = [&](const std::string& key) {
+            if      (key == "sending_print_job_lan")
                 this->update_status(curr_percent, _L("Sending print job over LAN"));
-                is_try_lan_mode = true;
-                result = m_agent->start_local_print_with_record(params, update_fn, cancel_fn, wait_fn);
-                if (result < 0) {
-                    error_text = wxString::Format("Access code:%s Ip address:%s", params.password, params.dev_ip);
-                    // try to send with cloud
-                    BOOST_LOG_TRIVIAL(warning) << "print_job: use ftp send print failed";
-                }
-            }
-        }
-        else {
-            if (!this->cloud_print_only
-                && !params.password.empty()
-                && !params.dev_ip.empty()
-                && this->has_sdcard) {
-                // try to send local with record
-                BOOST_LOG_TRIVIAL(info) << "print_job: try to start local print with record";
-                this->update_status(curr_percent, _L("Sending print job over LAN"));
-                result = m_agent->start_local_print_with_record(params, update_fn, cancel_fn, wait_fn);
-                if (result == 0) {
-                    params.comments = "";
-                }
-                else if (result == BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_FTP_FAILED) {
-                    params.comments = "upload_failed";
-                }
-                else {
-                    params.comments = (boost::format("failed(%1%)") % result).str();
-                }
-                if (result < 0) {
-                    is_try_lan_mode_failed = true;
-                    // try to send with cloud
-                    BOOST_LOG_TRIVIAL(warning) << "print_job: try to send with cloud";
-                    this->update_status(curr_percent, _L("Sending print job through cloud service"));
-                    result = m_agent->start_print(params, update_fn, cancel_fn, wait_fn);
-                }
-            }
-            else {
-                BOOST_LOG_TRIVIAL(info) << "print_job: send with cloud";
+            else if (key == "sending_print_job_cloud")
                 this->update_status(curr_percent, _L("Sending print job through cloud service"));
-                result = m_agent->start_print(params, update_fn, cancel_fn, wait_fn);
-            }
+            else if (key == "storage_needs_to_be_inserted")
+                this->update_status(curr_percent, _L("Storage needs to be inserted before printing via LAN."));
+        };
+
+        PrintDispatcher::Result r = PrintDispatcher{}.dispatch(
+            params, m_agent, in, update_fn, cancel_fn, wait_fn, pre_status);
+
+        result          = r.rc;
+        is_try_lan_mode = r.tried_lan;
+        is_try_lan_mode_failed = r.lan_failed_used_cloud;
+
+        if (r.verify_job_failed) {
+            BOOST_LOG_TRIVIAL(error) << "access code is invalid";
+            m_enter_ip_address_fun_fail();
+            m_job_finished = true;
+            return;
         }
-    } else {
-        if (this->has_sdcard || this->could_emmc_print) {
-            this->update_status(curr_percent, _L("Sending print job over LAN"));
-            result = m_agent->start_local_print(params, update_fn, cancel_fn);
-        } else {
-            this->update_status(curr_percent, _L("Storage needs to be inserted before printing via LAN."));
+
+        // PrintJob's "storage needs to be inserted before printing via
+        // LAN" branch used to early-return without calling
+        // show_error_info. Preserve that: if the dispatcher hit the
+        // LAN-with-no-storage path, just finish silently.
+        if (result == BAMBU_NETWORK_ERR_FTP_UPLOAD_FAILED &&
+            params.connection_type == "lan" &&
+            !this->has_sdcard && !this->could_emmc_print) {
+            m_job_finished = true;
             return;
         }
     }
