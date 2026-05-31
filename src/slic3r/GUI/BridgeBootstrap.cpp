@@ -20,6 +20,7 @@
 #include "slic3r/Utils/Http.hpp"
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "slic3r/Utils/NetworkAgentPluginAdapter.hpp"
+#include "slic3r/Utils/PrintDispatcherInputs.hpp"
 #include "slic3r/Utils/bambu_virtual_client/VirtualLanPrinterStore.hpp"
 #include "slic3r/Utils/bambu_virtual_client/VirtualMqttClient.hpp"
 
@@ -56,6 +57,51 @@
 namespace Slic3r {
 namespace GUI {
 namespace BridgeBootstrap {
+
+// Install the per-printer capability resolver on a freshly-constructed
+// NetworkAgentPluginAdapter. Three sites in this file construct an
+// adapter (and one more in BridgeOnlyConsoleApp.cpp); each needs to
+// install the same resolver so the bridge sees what the GUI sees.
+//
+// Helper kept here rather than on the adapter itself because it
+// reaches into GUI_App / wxGetApp().app_config / DeviceManager — none
+// of which the adapter (which lives in slic3r/Utils) should depend on.
+static void install_print_dispatcher_resolver(
+        Slic3r::NetworkAgentPluginAdapter& adapter,
+        GUI_App*                           app) {
+    if (!app) return;
+    adapter.set_dispatcher_inputs_resolver(
+        [app](const std::string&                       dev_id,
+              Slic3r::PrintDispatcher::Inputs&         inputs_out,
+              std::string&                              ftp_folder_out) {
+            // Per-printer caps from the live MachineObject. Same call
+            // paths as SelectMachine.cpp:3070, 3113, 3114.
+            auto* dm = app->getDeviceManager();
+            inputs_out = Slic3r::PrintDispatcherInputsFromMachineObject::
+                from_dev_id(
+                    dm,
+                    dev_id,
+                    /*app_lan_mode_only=*/
+                        app->app_config &&
+                        !app->app_config->get("lan_mode_only").empty() &&
+                        app->app_config->get("lan_mode_only") == "1",
+                    /*verify_temp_path=*/
+                        Slic3r::resources_dir() + "/check_access_code.txt");
+
+            // Per-printer ftp_folder from the model JSON. Same call
+            // path as SelectMachine.cpp:3060 (via
+            // obj->get_ftp_folder()).
+            if (dm) {
+                auto list = dm->get_user_machinelist();
+                auto it = list.find(dev_id);
+                if (it != list.end() && it->second) {
+                    ftp_folder_out =
+                        Slic3r::PrintDispatcherInputsFromMachineObject::
+                        get_ftp_folder_for_model(it->second->printer_type);
+                }
+            }
+        });
+}
 
 // ============================================================================
 // is_bridge_only — cheap shim around the CLI-prepass global.
@@ -643,6 +689,7 @@ bool run_headless(GUI_App* app)
         if (app->m_agent) {
             auto adapter =
                 std::make_shared<Slic3r::NetworkAgentPluginAdapter>(app->m_agent);
+            install_print_dispatcher_resolver(*adapter, app);
             app->m_bridge_app->attach_plugin_handle(std::move(adapter));
         } else {
             BOOST_LOG_TRIVIAL(warning)
@@ -916,6 +963,7 @@ void install_gui_worker(GUI_App* app)
         if (app->m_agent) {
             auto adapter =
                 std::make_shared<Slic3r::NetworkAgentPluginAdapter>(app->m_agent);
+            install_print_dispatcher_resolver(*adapter, app);
             app->m_bridge_app->attach_plugin_handle(std::move(adapter));
         }
 
@@ -1711,29 +1759,82 @@ void shutdown_hooks(GUI_App* app)
 // doesn't log them; kept as scaffolding for ad-hoc print-debug.
 // ============================================================================
 
+// Gated on BAMBU_BRIDGE_GUI_EVENT_TRACE=1 (separate from PLUGIN_TRACE
+// because GUI event volume is high — wxEVT_PAINT, MOTION, IDLE fire
+// constantly). Emits `[gui_event] HH:MM:SS.mmm tid=<n> <type> widget=…`
+// so the operator's UI actions can be correlated with the [plugincall]
+// stream by timestamp. Mirrors the [plugincall] line shape exactly so
+// `sort` keeps them interleaved chronologically.
+static bool gui_event_trace_enabled() {
+    static const bool on = []{
+        const char* e = std::getenv("BAMBU_BRIDGE_GUI_EVENT_TRACE");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+// Whitelist: only event types that map cleanly to user actions in the
+// PROTOCOL.md test sequence. Everything else (PAINT, MOTION, IDLE, etc.)
+// is suppressed to keep the trace readable.
+static const char* gui_event_name(wxEventType t) {
+    if (t == wxEVT_LEFT_DOWN)               return "LEFT_DOWN";
+    if (t == wxEVT_LEFT_DCLICK)             return "LEFT_DCLICK";
+    if (t == wxEVT_BUTTON)                  return "BUTTON";
+    if (t == wxEVT_TOGGLEBUTTON)            return "TOGGLEBUTTON";
+    if (t == wxEVT_COMBOBOX)                return "COMBOBOX";
+    if (t == wxEVT_CHOICE)                  return "CHOICE";
+    if (t == wxEVT_NOTEBOOK_PAGE_CHANGED)   return "NOTEBOOK_PAGE_CHANGED";
+    if (t == wxEVT_MENU)                    return "MENU";
+    if (t == wxEVT_TOOL)                    return "TOOL";
+    if (t == wxEVT_CHECKBOX)                return "CHECKBOX";
+    if (t == wxEVT_RADIOBUTTON)             return "RADIOBUTTON";
+    if (t == wxEVT_TEXT_ENTER)              return "TEXT_ENTER";
+    return nullptr;
+}
+
 int on_filter_event(wxEvent& event)
 {
-    // Log left-button DOWN events with the target widget. Useful for
-    // human-in-the-loop testing — pair each "[click] ..." line with the
-    // bridge MQTT relay activity that follows. Skip wxEVT_LEFT_UP to
-    // halve the noise; the DOWN is enough to locate the widget.
+    if (!gui_event_trace_enabled()) return -1;
     const wxEventType t = event.GetEventType();
-    if (t == wxEVT_LEFT_DOWN) {
-        wxObject* obj = event.GetEventObject();
-        const auto* w = wxDynamicCast(obj, wxWindow);
-        wxString label = w ? w->GetLabel()    : wxString();
-        wxString name  = w ? w->GetName()     : wxString();
-        wxClassInfo* ci = w ? w->GetClassInfo() : nullptr;
-        wxString klass = ci ? wxString(ci->GetClassName()) : wxString("?");
-        wxPoint pos    = w ? w->GetScreenPosition() : wxPoint(-1, -1);
-        wxSize  sz     = w ? w->GetSize()           : wxSize(0, 0);
-        // wxMouseEvent inherits from wxEvent; cast for click coords.
-        wxPoint mp(-1, -1);
-        if (auto* me = wxDynamicCast(&event, wxMouseEvent))
-            mp = me->GetPosition();
-        (void)label; (void)name; (void)klass; (void)pos; (void)sz; (void)mp;
-    }
-    return -1; // continue normal dispatch
+    const char* tname = gui_event_name(t);
+    if (!tname) return -1;
+
+    wxObject* obj = event.GetEventObject();
+    const auto* w = wxDynamicCast(obj, wxWindow);
+    wxString label = w ? w->GetLabel() : wxString();
+    wxString name  = w ? w->GetName()  : wxString();
+    wxClassInfo* ci = w ? w->GetClassInfo() : nullptr;
+    wxString klass = ci ? wxString(ci->GetClassName()) : wxString("?");
+    wxPoint pos    = w ? w->GetScreenPosition() : wxPoint(-1, -1);
+    wxSize  sz     = w ? w->GetSize()           : wxSize(0, 0);
+    wxPoint mp(-1, -1);
+    if (auto* me = wxDynamicCast(&event, wxMouseEvent))
+        mp = me->GetPosition();
+
+    // Match the [plugincall] line prefix so the two streams interleave
+    // by timestamp. Distinguished from plugin calls by `[gui_event]`.
+    auto now = std::chrono::system_clock::now();
+    auto tt  = std::chrono::system_clock::to_time_t(now);
+    auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now.time_since_epoch()).count() % 1000;
+    struct tm lt;
+    localtime_r(&tt, &lt);
+    char ts[16];
+    std::snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03lld",
+        lt.tm_hour, lt.tm_min, lt.tm_sec, (long long) ms);
+    unsigned long tid = (unsigned long) pthread_self() & 0xFFFFF;
+
+    std::fprintf(stderr,
+        "[gui_event] %s tid=%lu %s class=%s name=%s label=%s "
+        "scr_pos=(%d,%d) widget_size=(%d,%d) click_xy=(%d,%d)\n",
+        ts, tid, tname,
+        std::string(klass.mb_str()).c_str(),
+        std::string(name.mb_str()).c_str(),
+        std::string(label.mb_str()).c_str(),
+        pos.x, pos.y, sz.GetWidth(), sz.GetHeight(),
+        mp.x, mp.y);
+    std::fflush(stderr);
+    return -1;
 }
 
 } // namespace BridgeBootstrap

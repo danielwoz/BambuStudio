@@ -26,8 +26,11 @@
 #define SLIC3R_NETWORK_AGENT_PLUGIN_ADAPTER_HPP
 
 #include "../../bambu_bridge/BambuNetworkingPluginHandle.hpp"
+#include "PrintDispatcher.hpp"
 
 #include <atomic>
+#include <functional>
+#include <mutex>
 #include <string>
 
 namespace Slic3r {
@@ -85,9 +88,29 @@ public:
                        std::string*       url_out,
                        int                timeout_ms = 10000) override;
 
+    // Source-of-truth bridge for `PrintDispatcher::Inputs`. The adapter
+    // calls this immediately before invoking the dispatcher; the
+    // installer is responsible for reading from the live MachineObject
+    // (or whatever per-printer capability source is available). See
+    // PrintDispatcherInputs.hpp for the reusable from_dev_id() helper
+    // that reads exactly what the GUI's PrintJob reads.
+    //
+    // If no resolver is installed, the adapter falls back to safe
+    // defaults (cloud_print_only=false, has_sdcard=false,
+    // could_emmc_print=false; ftp_folder=""). That matches what the
+    // GUI sees for a brand-new printer before pushall has run.
+    using DispatcherInputsResolver = std::function<void(
+        const std::string&         dev_id,
+        PrintDispatcher::Inputs&   inputs_out,
+        std::string&               ftp_folder_out)>;
+    void set_dispatcher_inputs_resolver(DispatcherInputsResolver r);
+
 private:
     NetworkAgent*       m_agent { nullptr };  // non-owning, GUI_App owns it
     std::atomic<bool>   m_local_connected { false };
+
+    mutable std::mutex          m_resolver_mu;
+    DispatcherInputsResolver    m_inputs_resolver; // optional; nullptr-safe
 };
 
 } // namespace Slic3r

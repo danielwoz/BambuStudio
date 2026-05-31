@@ -30,6 +30,7 @@
 #include "Printer/BridgeStorageBackend.hpp"
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "slic3r/Utils/NetworkAgentPluginAdapter.hpp"
+#include "slic3r/Utils/PrintDispatcherInputs.hpp"
 #include "slic3r/Utils/Http.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "libslic3r/Utils.hpp"
@@ -330,6 +331,34 @@ bool BridgeOnlyConsoleApp::OnInit()
             // from the raw pointer — the adapter borrows it.
             auto adapter =
                 std::make_shared<Slic3r::NetworkAgentPluginAdapter>(m_agent);
+
+            // Install the same per-printer capability resolver
+            // BridgeBootstrap uses, sourced from THIS path's
+            // DeviceManager / app_config / resources_dir. See
+            // PrintDispatcherInputs.hpp.
+            auto* dm = m_device_manager.get();
+            adapter->set_dispatcher_inputs_resolver(
+                [dm](const std::string&                  dev_id,
+                     Slic3r::PrintDispatcher::Inputs&    inputs_out,
+                     std::string&                        ftp_folder_out) {
+                    inputs_out = Slic3r::PrintDispatcherInputsFromMachineObject::
+                        from_dev_id(
+                            dm,
+                            dev_id,
+                            /*app_lan_mode_only=*/false, // headless: no UI pref
+                            /*verify_temp_path=*/
+                                Slic3r::resources_dir() + "/check_access_code.txt");
+                    if (dm) {
+                        auto list = dm->get_user_machinelist();
+                        auto it = list.find(dev_id);
+                        if (it != list.end() && it->second) {
+                            ftp_folder_out =
+                                Slic3r::PrintDispatcherInputsFromMachineObject::
+                                get_ftp_folder_for_model(it->second->printer_type);
+                        }
+                    }
+                });
+
             m_bridge_app->attach_plugin_handle(std::move(adapter));
         } else {
             BOOST_LOG_TRIVIAL(warning)

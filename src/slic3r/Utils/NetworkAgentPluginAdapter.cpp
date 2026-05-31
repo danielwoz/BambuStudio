@@ -1,6 +1,7 @@
 #include "NetworkAgentPluginAdapter.hpp"
 
 #include "NetworkAgent.hpp"
+#include "PrintDispatcher.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -11,6 +12,12 @@
 
 
 namespace Slic3r {
+
+void NetworkAgentPluginAdapter::set_dispatcher_inputs_resolver(
+        DispatcherInputsResolver r) {
+    std::lock_guard<std::mutex> lk(m_resolver_mu);
+    m_inputs_resolver = std::move(r);
+}
 
 namespace {
 
@@ -78,6 +85,50 @@ void fill_print_params(const SrcT&        src,
     dst.extruder_cali_manual_mode  = src.extruder_cali_manual_mode;
     dst.task_ext_change_assist     = src.task_ext_change_assist;
     dst.try_emmc_print             = src.try_emmc_print;
+}
+
+// Plugin callback stubs for the four PrintParams-taking plugin calls
+// the bridge issues from headless / --bridge-only mode. The proprietary
+// plugin (libbambu_networking 02.06.01.55) does NOT guard against null
+// std::function callbacks — passing nullptr makes its state machine
+// either skip critical phases or abort outright with errors that look
+// nothing like the underlying cause (observed: -3070 PRINT_SP_FILE_NOT_
+// EXIST returned even when the .3mf file is on disk and readable, because
+// the wait phase couldn't run).
+//
+// Mirror what the GUI's PrintJob would pass:
+//   - update_fn: progress reporter, fold to a bridge-side log line so we
+//     see the plugin's stage transitions.
+//   - cancel_fn: "user cancelled?" — always false in headless. The GUI
+//     wires this to ctl.was_canceled().
+//   - wait_fn:   "the printer acked the job, ok to proceed?" — always
+//     true in headless. The GUI does a 60s wait-for-job_id-match loop
+//     here, but in --bridge-only we have no UI to time-out and the
+//     downstream slicer (Orca) is already showing its own progress, so
+//     a synchronous true is correct.
+static BBL::OnUpdateStatusFn make_update_fn(const char*       tag,
+                                            const std::string& dev_id) {
+    return [tag, dev_id](int stage, int code, std::string info) {
+        std::fprintf(stderr,
+            "[adapter:%s] dev=%s stage=%d code=%d info=%s\n",
+            tag, dev_id.c_str(), stage, code, info.c_str());
+        std::fflush(stderr);
+    };
+}
+
+static BBL::WasCancelledFn make_cancel_fn() {
+    return []() -> bool { return false; };
+}
+
+static BBL::OnWaitFn make_wait_fn(const char*        tag,
+                                   const std::string& dev_id) {
+    return [tag, dev_id](int state, std::string job_info) -> bool {
+        std::fprintf(stderr,
+            "[adapter:%s] dev=%s wait state=%d job_info=%s -> ack\n",
+            tag, dev_id.c_str(), state, job_info.c_str());
+        std::fflush(stderr);
+        return true;
+    };
 }
 
 } // namespace
@@ -181,7 +232,10 @@ int NetworkAgentPluginAdapter::upload_gcode_to_sdcard(
     PrintParams pp{};
     fill_print_params(params, pp, /*default_connection=*/"cloud");
     int rc = m_agent->start_send_gcode_to_sdcard(
-        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
+        pp,
+        make_update_fn("upload_gcode_to_sdcard.primary", pp.dev_id),
+        make_cancel_fn(),
+        make_wait_fn("upload_gcode_to_sdcard.primary", pp.dev_id));
     std::fprintf(stderr,
         "[adapter] upload_gcode_to_sdcard primary "
         "(start_send_gcode_to_sdcard) dev=%s ip=%s rc=%d\n",
@@ -191,7 +245,10 @@ int NetworkAgentPluginAdapter::upload_gcode_to_sdcard(
     // Cloud-relay fallback. PrintJob for cloud-bound + FTPS-less
     // printers does this same call.
     int rc2 = m_agent->start_print(
-        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
+        pp,
+        make_update_fn("upload_gcode_to_sdcard.fallback", pp.dev_id),
+        make_cancel_fn(),
+        make_wait_fn("upload_gcode_to_sdcard.fallback", pp.dev_id));
     std::fprintf(stderr,
         "[adapter] upload_gcode_to_sdcard fallback "
         "(start_print / cloud-relay) dev=%s ip=%s rc=%d\n",
@@ -272,35 +329,54 @@ int NetworkAgentPluginAdapter::send_message_to_printer(
 
 int NetworkAgentPluginAdapter::start_local_print_with_record(
         const LocalPrintParams& params) {
-    // Same fix as upload_gcode_to_sdcard above — translate the adapter
-    // params into PrintParams and delegate to the host NetworkAgent's
-    // implementation. The stub return of -2 made every LanUploadSink
-    // upload fail with the "plugin missing export" 551 reply at the
-    // bridge's FTPS server, which surfaced to Orca as the IP+code
-    // dialog reappearing after a successful slice + Send click.
+    // Delegates to the shared PrintDispatcher (Slic3r/Utils/PrintDispatcher.cpp)
+    // which is the exact same decision tree the GUI's PrintJob walks.
+    // Behaviour observed across all four captured (model × mode)
+    // scenarios — see docs/plugin-trace/{H2D,A1}-{cloud,lan}.yaml — is
+    // produced by that single dispatcher, so the bridge stops needing
+    // its own fallback chain.
+    //
+    // What this method used to do inline (start_local_print_with_record
+    // primary → on -2130 fall back to start_print) is now case 2 of the
+    // dispatcher's cloud branch. The dispatcher additionally handles
+    // the A1-cloud (start_print direct with comments="low_version"),
+    // LAN-mode verify_job, and LAN-mode start_local_print branches —
+    // none of which were correctly covered by the previous inline
+    // logic.
     if (!m_agent) return -1;
+
     PrintParams pp{};
     fill_print_params(params, pp, /*default_connection=*/"lan");
-    int rc = m_agent->start_local_print_with_record(
-        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
+
+    // Resolve per-printer capability info + ftp_folder via the
+    // installed resolver. The resolver reads from MachineObject and
+    // the per-model JSON in resources/printers/ — see
+    // PrintDispatcherInputs.hpp for the bridge-from-GUI mapping.
+    PrintDispatcher::Inputs in;
+    std::string             ftp_folder;
+    {
+        std::lock_guard<std::mutex> lk(m_resolver_mu);
+        if (m_inputs_resolver) m_inputs_resolver(pp.dev_id, in, ftp_folder);
+    }
+    if (!ftp_folder.empty()) pp.ftp_folder = ftp_folder;
+
+    auto rr = PrintDispatcher{}.dispatch(
+        pp, m_agent, in,
+        make_update_fn("start_local_print_with_record", pp.dev_id),
+        make_cancel_fn(),
+        make_wait_fn("start_local_print_with_record", pp.dev_id),
+        /*pre_status=*/nullptr);
+
     std::fprintf(stderr,
-        "[adapter] start_local_print_with_record primary "
-        "(LAN+FTPS) dev=%s ip=%s rc=%d\n",
-        pp.dev_id.c_str(), pp.dev_ip.c_str(), rc);
+        "[adapter] dispatch start_local_print_with_record dev=%s ip=%s "
+        "connection_type=%s comments=%s tried_lan=%d "
+        "lan_failed_used_cloud=%d verify_job_failed=%d rc=%d\n",
+        pp.dev_id.c_str(), pp.dev_ip.c_str(),
+        pp.connection_type.c_str(), pp.comments.c_str(),
+        int(rr.tried_lan), int(rr.lan_failed_used_cloud),
+        int(rr.verify_job_failed), rr.rc);
     std::fflush(stderr);
-    if (rc == 0) return 0;
-    // Same fallback as upload_gcode_to_sdcard: for printers without an
-    // FTPS endpoint (A1) the LAN-with-record path fails with -2130; the
-    // GUI's PrintJob recovers by routing through start_print
-    // (cloud-relay), and so does the bridge.
-    int rc2 = m_agent->start_print(
-        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
-    std::fprintf(stderr,
-        "[adapter] start_local_print_with_record fallback "
-        "(start_print / cloud-relay) dev=%s ip=%s rc=%d\n",
-        pp.dev_id.c_str(), pp.dev_ip.c_str(), rc2);
-    std::fflush(stderr);
-    return rc2;
+    return rr.rc;
 }
 
 // LAN print (no slicer-side record). The wider PrintParams that ths
@@ -311,7 +387,9 @@ int NetworkAgentPluginAdapter::start_local_print(const LocalPrintParams& params)
     PrintParams pp{};
     fill_print_params(params, pp, /*default_connection=*/"lan");
     int rc = m_agent->start_local_print(
-        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr);
+        pp,
+        make_update_fn("start_local_print", pp.dev_id),
+        make_cancel_fn());
     std::fprintf(stderr,
         "[adapter] start_local_print dev=%s ip=%s rc=%d\n",
         pp.dev_id.c_str(), pp.dev_ip.c_str(), rc);
@@ -329,7 +407,9 @@ int NetworkAgentPluginAdapter::start_sdcard_print(const LocalPrintParams& params
     // "/sdcard/Metadata/plate_1.3mf") — the helper preserves it.
     fill_print_params(params, pp, /*default_connection=*/"lan");
     int rc = m_agent->start_sdcard_print(
-        pp, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr);
+        pp,
+        make_update_fn("start_sdcard_print", pp.dev_id),
+        make_cancel_fn());
     std::fprintf(stderr,
         "[adapter] start_sdcard_print dev=%s ip=%s on_printer_path=%s rc=%d\n",
         pp.dev_id.c_str(), pp.dev_ip.c_str(), pp.filename.c_str(), rc);
