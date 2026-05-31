@@ -608,6 +608,8 @@ set(SLIC3R_GUI_SOURCES
     Utils/NetworkAgent.hpp
     Utils/PrintDispatcher.cpp
     Utils/PrintDispatcher.hpp
+    Utils/PrintDispatcherInputs.cpp
+    Utils/PrintDispatcherInputs.hpp
     Utils/MKS.hpp
     Utils/MKS.cpp
     Utils/CpuMemory.cpp
