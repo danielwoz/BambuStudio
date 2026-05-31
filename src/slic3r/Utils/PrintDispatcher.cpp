@@ -10,10 +10,8 @@
 
 #include "PrintDispatcher.hpp"
 
-#include "FileTransferUtils.hpp"
-
 #include <boost/format.hpp>
-#include <boost/log/trivial.hpp>
+#include <cstdio>
 #include <memory>
 
 using namespace BBL;
@@ -21,28 +19,22 @@ using namespace BBL;
 namespace Slic3r {
 
 bool PrintDispatcher::lan_verify_job(
-        BBL::PrintParams& params,
-        NetworkAgent*     agent,
-        const Inputs&     inputs,
-        Result&           result_out) {
+        BBL::PrintParams&   params,
+        IPluginPrintEntry*  entry,
+        const Inputs&       inputs,
+        Result&             result_out) {
     // Mirrors PrintJob.cpp:224-253. Only fires when connection is LAN
     // and the print is a normal (slicer-driven) print.
     if (params.connection_type != "lan" || params.print_type != "from_normal")
         return true; // nothing to verify; treat as pass
 
-    bool emmc_ok = false;
-    bool ftp_ok  = false;
-
-    if (inputs.could_emmc_print) {
-        // Try the printer's eMMC tunnel on port 6000. Same URL shape
-        // the GUI uses (PrintJob.cpp:230).
-        const std::string url =
-            "bambu:///local/" + params.dev_ip +
-            "?port=6000&user=bblp&passwd=" + params.password;
-        std::unique_ptr<FileTransferTunnel> tunnel =
-            std::make_unique<FileTransferTunnel>(::Slic3r::module(), url);
-        emmc_ok = tunnel->sync_start_connect();
-    }
+    // The eMMC tunnel handshake (PrintJob.cpp:227-233 in the original)
+    // is performed by the CALLER and passed in via inputs.emmc_handshake_ok.
+    // Keeping the network probe out of the dispatcher makes it testable
+    // without a real network — see PrintDispatcher.hpp's Inputs comment
+    // for the contract.
+    const bool emmc_ok = inputs.could_emmc_print && inputs.emmc_handshake_ok;
+    bool       ftp_ok  = false;
 
     {
         // Save the caller's main-print fields so we can restore them
@@ -53,7 +45,7 @@ bool PrintDispatcher::lan_verify_job(
         params.project_name = "verify_job";
         params.filename     = inputs.verify_temp_path;
 
-        int result = agent->start_send_gcode_to_sdcard(
+        int result = entry->start_send_gcode_to_sdcard(
             params, /*update_fn=*/nullptr, /*cancel_fn=*/nullptr, /*wait_fn=*/nullptr);
         ftp_ok = (result == 0);
 
@@ -66,8 +58,9 @@ bool PrintDispatcher::lan_verify_job(
         result_out.rc = BAMBU_NETWORK_ERR_FTP_UPLOAD_FAILED;
         result_out.error_diagnostic =
             "verify_job failed: neither eMMC tunnel nor FTPS probe succeeded";
-        BOOST_LOG_TRIVIAL(error)
-            << "PrintDispatcher: LAN verify_job failed (emmc_ok=0, ftp_ok=0)";
+        std::fprintf(stderr,
+            "PrintDispatcher: LAN verify_job failed (emmc_ok=0, ftp_ok=0)\n");
+        std::fflush(stderr);
         return false;
     }
 
@@ -76,7 +69,7 @@ bool PrintDispatcher::lan_verify_job(
 
 PrintDispatcher::Result PrintDispatcher::dispatch(
         BBL::PrintParams&     params,
-        NetworkAgent*         agent,
+        IPluginPrintEntry*    entry,
         const Inputs&         inputs,
         BBL::OnUpdateStatusFn update_fn,
         BBL::WasCancelledFn   cancel_fn,
@@ -84,9 +77,9 @@ PrintDispatcher::Result PrintDispatcher::dispatch(
         PreCallStatus         pre_status) {
     Result out;
 
-    if (!agent) {
+    if (!entry) {
         out.rc = -1;
-        out.error_diagnostic = "PrintDispatcher: agent is null";
+        out.error_diagnostic = "PrintDispatcher: entry is null";
         return out;
     }
 
@@ -94,7 +87,7 @@ PrintDispatcher::Result PrintDispatcher::dispatch(
     //
     // Mirrors PrintJob.cpp:224-253. Fires before the main print call
     // when connection_type==lan && print_type==from_normal.
-    if (!lan_verify_job(params, agent, inputs, out)) {
+    if (!lan_verify_job(params, entry, inputs, out)) {
         return out; // verify_job_failed already set
     }
 
@@ -112,7 +105,7 @@ PrintDispatcher::Result PrintDispatcher::dispatch(
     if (params.print_type == "from_sdcard_view") {
         // Reprint a file already on the printer's SD card.
         announce("sending_print_job_cloud");
-        result = agent->start_sdcard_print(params, update_fn, cancel_fn);
+        result = entry->start_sdcard_print(params, update_fn, cancel_fn);
     }
     else if (params.connection_type != "lan") {
         // ===== CLOUD MODE =============================================
@@ -139,7 +132,7 @@ PrintDispatcher::Result PrintDispatcher::dispatch(
             } else {
                 announce("sending_print_job_lan");
                 out.tried_lan = true;
-                result = agent->start_local_print_with_record(
+                result = entry->start_local_print_with_record(
                     params, update_fn, cancel_fn, wait_fn);
             }
         } else {
@@ -155,7 +148,7 @@ PrintDispatcher::Result PrintDispatcher::dispatch(
                 // comments="upload_failed".
                 announce("sending_print_job_lan");
                 out.tried_lan = true;
-                result = agent->start_local_print_with_record(
+                result = entry->start_local_print_with_record(
                     params, update_fn, cancel_fn, wait_fn);
                 if (result == 0) {
                     params.comments = "";
@@ -168,7 +161,7 @@ PrintDispatcher::Result PrintDispatcher::dispatch(
                 if (result < 0) {
                     out.lan_failed_used_cloud = true;
                     announce("sending_print_job_cloud");
-                    result = agent->start_print(
+                    result = entry->start_print(
                         params, update_fn, cancel_fn, wait_fn);
                 }
             } else {
@@ -176,7 +169,7 @@ PrintDispatcher::Result PrintDispatcher::dispatch(
                 // `comments` value was set above (most commonly
                 // "low_version" for A1 because cloud_print_only=true).
                 announce("sending_print_job_cloud");
-                result = agent->start_print(
+                result = entry->start_print(
                     params, update_fn, cancel_fn, wait_fn);
             }
         }
@@ -189,7 +182,7 @@ PrintDispatcher::Result PrintDispatcher::dispatch(
         // flash is what the slicer considers "sdcard" here).
         if (inputs.has_sdcard || inputs.could_emmc_print) {
             announce("sending_print_job_lan");
-            result = agent->start_local_print(
+            result = entry->start_local_print(
                 params, update_fn, cancel_fn);
         } else {
             announce("storage_needs_to_be_inserted");

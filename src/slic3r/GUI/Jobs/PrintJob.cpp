@@ -548,6 +548,20 @@ void PrintJob::process()
             wxGetApp().app_config->get("lan_mode_only") == "1";
         in.verify_temp_path  = job_data._temp_path.string();
 
+        // eMMC tunnel handshake — moved here from inside the dispatcher
+        // to keep PrintDispatcher network-free (and therefore unit-
+        // testable). Same probe shape as the original PrintJob.cpp:
+        // 227-233 — bambu:///local/<ip>?port=6000.
+        if (this->connection_type == "lan" && m_print_type == "from_normal" &&
+            this->could_emmc_print) {
+            const std::string url =
+                "bambu:///local/" + m_dev_ip +
+                "?port=6000&user=bblp&passwd=" + m_access_code;
+            std::unique_ptr<FileTransferTunnel> tunnel =
+                std::make_unique<FileTransferTunnel>(module(), url);
+            in.emmc_handshake_ok = tunnel->sync_start_connect();
+        }
+
         auto pre_status = [&](const std::string& key) {
             if      (key == "sending_print_job_lan")
                 this->update_status(curr_percent, _L("Sending print job over LAN"));

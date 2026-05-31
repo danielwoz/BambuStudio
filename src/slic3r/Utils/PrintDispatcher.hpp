@@ -27,6 +27,73 @@
 
 namespace Slic3r {
 
+// Abstract plugin-entry interface used by `PrintDispatcher`. Production
+// path wraps the slicer's NetworkAgent (see `NetworkAgentPrintEntry`
+// below); tests can implement this directly to record calls without
+// dragging in the real plugin.
+//
+// Each method maps 1:1 to the equivalent NetworkAgent function. The
+// dispatcher only ever needs these five — it never reaches back into
+// NetworkAgent for anything else.
+class IPluginPrintEntry {
+public:
+    virtual ~IPluginPrintEntry() = default;
+
+    virtual int start_print                 (BBL::PrintParams& params,
+                                             BBL::OnUpdateStatusFn update_fn,
+                                             BBL::WasCancelledFn   cancel_fn,
+                                             BBL::OnWaitFn         wait_fn) = 0;
+
+    virtual int start_local_print_with_record(BBL::PrintParams& params,
+                                              BBL::OnUpdateStatusFn update_fn,
+                                              BBL::WasCancelledFn   cancel_fn,
+                                              BBL::OnWaitFn         wait_fn) = 0;
+
+    virtual int start_send_gcode_to_sdcard  (BBL::PrintParams& params,
+                                             BBL::OnUpdateStatusFn update_fn,
+                                             BBL::WasCancelledFn   cancel_fn,
+                                             BBL::OnWaitFn         wait_fn) = 0;
+
+    virtual int start_local_print           (BBL::PrintParams& params,
+                                             BBL::OnUpdateStatusFn update_fn,
+                                             BBL::WasCancelledFn   cancel_fn) = 0;
+
+    virtual int start_sdcard_print          (BBL::PrintParams& params,
+                                             BBL::OnUpdateStatusFn update_fn,
+                                             BBL::WasCancelledFn   cancel_fn) = 0;
+};
+
+// Production adapter — wraps a NetworkAgent so production callers
+// (PrintJob, NetworkAgentPluginAdapter) get a thin pass-through.
+class NetworkAgentPrintEntry : public IPluginPrintEntry {
+public:
+    explicit NetworkAgentPrintEntry(NetworkAgent* agent) : m_agent(agent) {}
+
+    int start_print(BBL::PrintParams& p, BBL::OnUpdateStatusFn u,
+                    BBL::WasCancelledFn c, BBL::OnWaitFn w) override {
+        return m_agent ? m_agent->start_print(p, u, c, w) : -1;
+    }
+    int start_local_print_with_record(BBL::PrintParams& p, BBL::OnUpdateStatusFn u,
+                                       BBL::WasCancelledFn c, BBL::OnWaitFn w) override {
+        return m_agent ? m_agent->start_local_print_with_record(p, u, c, w) : -1;
+    }
+    int start_send_gcode_to_sdcard(BBL::PrintParams& p, BBL::OnUpdateStatusFn u,
+                                    BBL::WasCancelledFn c, BBL::OnWaitFn w) override {
+        return m_agent ? m_agent->start_send_gcode_to_sdcard(p, u, c, w) : -1;
+    }
+    int start_local_print(BBL::PrintParams& p, BBL::OnUpdateStatusFn u,
+                          BBL::WasCancelledFn c) override {
+        return m_agent ? m_agent->start_local_print(p, u, c) : -1;
+    }
+    int start_sdcard_print(BBL::PrintParams& p, BBL::OnUpdateStatusFn u,
+                           BBL::WasCancelledFn c) override {
+        return m_agent ? m_agent->start_sdcard_print(p, u, c) : -1;
+    }
+
+private:
+    NetworkAgent* m_agent;
+};
+
 class PrintDispatcher {
 public:
     // Capabilities the GUI's PrintJob reads from `MachineObject` /
@@ -50,6 +117,20 @@ public:
         //                      bridge supplies a small file path with
         //                      the same role.
         std::string verify_temp_path;
+
+        // Caller-performed eMMC tunnel handshake result. The GUI's
+        // PrintJob.cpp:227-233 opens a `bambu:///local/<ip>?port=6000`
+        // FileTransferTunnel and records whether it landed (true if
+        // sync_start_connect returned true). The dispatcher uses this
+        // OR the start_send_gcode_to_sdcard FTPS probe to decide
+        // whether the access code is valid.
+        //
+        // Caller is responsible for doing the handshake (it touches
+        // network; keeping it out of the dispatcher makes the
+        // dispatcher testable without a real network stack). Pass
+        // `false` if you don't want to attempt it — the dispatcher
+        // will fall back to the FTPS probe only.
+        bool emmc_handshake_ok = false;
     };
 
     // What the dispatcher did, for the caller's UI / log.
@@ -73,15 +154,30 @@ public:
 
     // Walks the print-dispatch decision tree. May mutate `params.comments`,
     // `params.project_name`, and `params.filename` (around the LAN verify
-    // step). The dispatcher does NOT take ownership of `agent`; the caller
-    // must keep it alive for the duration of dispatch.
+    // step). The dispatcher does NOT take ownership of the entry; the
+    // caller must keep it alive for the duration of dispatch.
+    Result dispatch(BBL::PrintParams&       params,
+                    IPluginPrintEntry*      entry,
+                    const Inputs&           inputs,
+                    BBL::OnUpdateStatusFn   update_fn,
+                    BBL::WasCancelledFn     cancel_fn,
+                    BBL::OnWaitFn           wait_fn,
+                    PreCallStatus           pre_status = nullptr);
+
+    // Back-compat overload — wraps the agent in a NetworkAgentPrintEntry
+    // and forwards. Lets existing callers keep their `agent->dispatch(...)`
+    // shape until they're updated to use IPluginPrintEntry directly.
     Result dispatch(BBL::PrintParams&       params,
                     NetworkAgent*           agent,
                     const Inputs&           inputs,
                     BBL::OnUpdateStatusFn   update_fn,
                     BBL::WasCancelledFn     cancel_fn,
                     BBL::OnWaitFn           wait_fn,
-                    PreCallStatus           pre_status = nullptr);
+                    PreCallStatus           pre_status = nullptr) {
+        NetworkAgentPrintEntry e(agent);
+        return dispatch(params, &e, inputs, update_fn, cancel_fn, wait_fn,
+                        pre_status);
+    }
 
 private:
     // The LAN verify-job sub-step. Returns true iff verification passed
@@ -89,10 +185,10 @@ private:
     // ret=0). Resets params.filename + params.project_name to "" on
     // success so the caller's subsequent main-print params take effect.
     // Sets `result_out.verify_job_failed = true` on failure.
-    bool lan_verify_job(BBL::PrintParams& params,
-                        NetworkAgent*     agent,
-                        const Inputs&     inputs,
-                        Result&           result_out);
+    bool lan_verify_job(BBL::PrintParams&  params,
+                        IPluginPrintEntry* entry,
+                        const Inputs&      inputs,
+                        Result&            result_out);
 };
 
 } // namespace Slic3r

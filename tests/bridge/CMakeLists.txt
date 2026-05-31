@@ -87,6 +87,24 @@ set_target_properties(EncMsgEnvelopeTest PROPERTIES
 )
 add_test(NAME EncMsgEnvelopeTest COMMAND EncMsgEnvelopeTest)
 
+# PrintDispatcherScenarioTest — pins the dispatcher's plugin-call
+# sequence against the four reference (model × mode) captures in
+# docs/plugin-trace/{H2D,A1}-{cloud,lan}.yaml. Compiles PrintDispatcher
+# directly to avoid pulling in libslic3r_gui (which would drag wx).
+add_executable(PrintDispatcherScenarioTest
+    PrintDispatcherScenarioTest.cpp
+    ${CMAKE_SOURCE_DIR}/src/slic3r/Utils/PrintDispatcher.cpp
+)
+target_include_directories(PrintDispatcherScenarioTest PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/slic3r/Utils
+)
+set_target_properties(PrintDispatcherScenarioTest PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+add_test(NAME PrintDispatcherScenarioTest COMMAND PrintDispatcherScenarioTest)
+
 add_executable(SsdpResponderUnitTest SsdpResponderUnitTest.cpp)
 target_link_libraries(SsdpResponderUnitTest PRIVATE bambu_bridge)
 set_target_properties(SsdpResponderUnitTest PROPERTIES
