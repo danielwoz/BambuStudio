@@ -8,12 +8,21 @@
 #include <dlfcn.h>
 #endif
 
+#include <atomic>
+#include <set>
+#include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
+#include <miniz.h>
+#include <nlohmann/json.hpp>
 #include "libslic3r/Utils.hpp"
 #include "slic3r/Utils/BBLUtil.hpp"
 #include "NetworkAgent.hpp"
 #include "NetworkAgentBridgeHooks.hpp"
 #include "PluginTrace.hpp"
+#include "bambu_virtual_client/VirtualFtpsClient.hpp"
+#include "bambu_virtual_client/VirtualMqttClient.hpp"
+#include "bambu_virtual_client/VirtualSsdpDiscovery.hpp"
+#include "bambu_virtual_client/VirtualLanPrinterStore.hpp"
 
 #include "slic3r/Utils/FileTransferUtils.hpp"
 #include "slic3r/Utils/CertificateVerify.hpp"
@@ -1338,8 +1347,292 @@ int NetworkAgent::set_user_selected_machine(std::string dev_id)
     return ret;
 }
 
+// ============================================================================
+// Virtual-LAN print path — FFFF dev_id detection short-circuit.
+//
+// Ported from OrcaSlicer-bridge's NetworkAgent.cpp (the same helpers Orca
+// uses to route FFFF prints through VirtualFtpsClient/VirtualMqttClient
+// instead of through the plugin's printer-IP:990 path). Without these,
+// BambuStudio-bridge sends 3mf uploads to <printer_ip>:990 — but for FFFF
+// dev_ids that's the BRIDGE's IP, and the bridge listens on the offset
+// port 39990 + N. The user sees "Failed to connect to 192.168.1.151:990".
+//
+// See docs/plugin-trace/H2D-{cloud,lan}.yaml § threemf_payload for the
+// canonical gcode_file MQTT payload shape these helpers reproduce.
+// ============================================================================
+
+static int virtual_print_normalise_plate_to_zero(const std::string& threemf_path);
+
+int virtual_ftps_upload_(const PrintParams& params,
+                         OnUpdateStatusFn  update_fn,
+                         WasCancelledFn    cancel_fn) {
+    BOOST_LOG_TRIVIAL(info)
+        << "[ORCA-TRACE] virtual_ftps_upload_ entered "
+        << " dev_id=" << params.dev_id
+        << " dev_ip=" << params.dev_ip
+        << " ftp_folder=" << params.ftp_folder
+        << " ftp_file=" << params.ftp_file
+        << " dst_file=" << params.dst_file
+        << " filename=" << params.filename
+        << " username=" << params.username
+        << " pass_len=" << params.password.size();
+    Slic3r::virtual_ftps::UploadParams up;
+    up.host        = params.dev_ip;
+    up.port        = Slic3r::VirtualSsdpDiscovery::port_for(params.dev_id, 39990, params.dev_ip);
+    BOOST_LOG_TRIVIAL(info)
+        << "[ORCA-TRACE] virtual_ftps_upload_ resolved "
+        << " host=" << up.host << " port=" << up.port;
+    up.user        = params.username.empty() ? std::string("bblp") : params.username;
+    up.pass        = params.password;
+    up.local_path  = params.filename;
+    // Compose remote name with the exact fallback chain BambuStudio's OSS
+    // LocalPrintOrchestrator::compose_remote_path uses:
+    //   dst_file (set only by from_sdcard_view)
+    //     -> ftp_file (rarely set in this codebase)
+    //     -> basename of the local filename
+    //     -> "lan_print.3mf" (hardcoded last resort)
+    // Without this chain, normal calibration / object prints arrive with
+    // an empty STOR name → bridge stores under a generic path → the
+    // subsequent gcode_file MQTT command can't reference a real file →
+    // print never starts. This is the symptom observed 2026-06-01 14:31.
+    {
+        std::string fname = params.dst_file;
+        if (fname.empty()) fname = params.ftp_file;
+        if (fname.empty()) {
+            try {
+                fname = boost::filesystem::path(params.filename).filename().string();
+            } catch (...) {}
+        }
+        if (fname.empty()) fname = "lan_print.3mf";
+        up.remote_name = std::move(fname);
+    }
+    Slic3r::virtual_ftps::ProgressFn  prog = nullptr;
+    Slic3r::virtual_ftps::CancelledFn canc = nullptr;
+    if (update_fn) prog = [update_fn](int pct, std::string msg){ update_fn(pct, 0, msg); };
+    if (cancel_fn) canc = [cancel_fn]() -> bool { return cancel_fn(); };
+    BOOST_LOG_TRIVIAL(info) << "virtual_ftps_upload: dev=" << params.dev_id
+                            << " ftps_port=" << up.port
+                            << " remote=" << up.remote_name;
+    return Slic3r::virtual_ftps::upload(up, prog, canc);
+}
+
+int virtual_lan_print_(const PrintParams& params,
+                       OnUpdateStatusFn  update_fn,
+                       WasCancelledFn    cancel_fn) {
+    // Renumber Metadata/plate_<N>.* → plate_0.* before the FTPS upload so
+    // the printer can open the file. Operates on params.filename in place;
+    // a non-zero return is logged but doesn't block the upload (the bridge-
+    // side rewriter is the fallback).
+    (void) virtual_print_normalise_plate_to_zero(params.filename);
+
+    int rc = virtual_ftps_upload_(params, update_fn, cancel_fn);
+    if (rc != 0) {
+        BOOST_LOG_TRIVIAL(warning) << "virtual_lan_print: FTPS upload failed rc=" << rc;
+        return rc;
+    }
+    // Mirror BambuStudio OSS LocalPrintOrchestrator::compose_remote_path so
+    // the path here is identical to the one virtual_ftps_upload_ just sent
+    // as STOR remote_name. Both ends must agree or the printer can't find
+    // the file the bridge stored.
+    std::string folder = params.ftp_folder.empty() ? std::string("/") : params.ftp_folder;
+    if (folder.empty() || folder.back() != '/') folder += '/';
+    std::string fname = params.dst_file;
+    if (fname.empty()) fname = params.ftp_file;
+    if (fname.empty()) {
+        try {
+            fname = boost::filesystem::path(params.filename).filename().string();
+        } catch (...) {}
+    }
+    if (fname.empty()) fname = "lan_print.3mf";
+    if (!fname.empty() && fname.front() == '/') fname.erase(0, 1);
+    const std::string remote_path = folder + fname;
+    static std::atomic<uint64_t> s_seq{1};
+    const std::string seq = std::to_string(s_seq.fetch_add(1));
+
+    // Build the gcode_file payload to mirror what BambuStudio's
+    // proprietary plugin's `start_local_print` produces — captured in
+    // docs/plugin-trace/H2D-lan.yaml (2026-05-30, the successful BBS LAN
+    // print). The bare 3-field payload (BBS OSS reference) works for
+    // some calibration files but not for AMS-equipped object prints,
+    // because the printer has no way to know which AMS slot to draw
+    // from. Adding the AMS map + bed-type + cali toggles brings the
+    // wire shape into line with what the H2D firmware sees in cloud-
+    // relay project_file ACKs.
+    nlohmann::json j;
+    j["print"]["command"]     = "gcode_file";
+    j["print"]["param"]       = remote_path;
+    j["print"]["sequence_id"] = seq;
+    // AMS routing. Source-of-truth example: "[3,-1,-1,-1,-1,-1,-1,-1]"
+    // (8-entry int array, -1 = unmapped). When PrintParams holds the
+    // stringified form, embed verbatim; the printer parses the same
+    // shape from project_file too.
+    auto emit_json_or_string = [&](const char* key, const std::string& s) {
+        if (s.empty()) return;
+        try { j["print"][key] = nlohmann::json::parse(s); }
+        catch (...) { j["print"][key] = s; }
+    };
+    emit_json_or_string("ams_mapping",      params.ams_mapping);
+    emit_json_or_string("ams_mapping2",     params.ams_mapping2);
+    emit_json_or_string("ams_mapping_info", params.ams_mapping_info);
+    emit_json_or_string("nozzles_info",     params.nozzles_info);
+    emit_json_or_string("nozzle_mapping",   params.nozzle_mapping);
+    if (!params.task_bed_type.empty())
+        j["print"]["task_bed_type"]    = params.task_bed_type;
+    j["print"]["use_ams"]              = params.task_use_ams;
+    j["print"]["task_use_ams"]         = params.task_use_ams;
+    j["print"]["bed_leveling"]         = params.task_bed_leveling;
+    j["print"]["flow_cali"]            = params.task_flow_cali;
+    j["print"]["vibration_cali"]       = params.task_vibration_cali;
+    j["print"]["layer_inspect"]        = params.task_layer_inspect;
+    j["print"]["timelapse"]            = params.task_record_timelapse;
+    j["print"]["auto_bed_leveling"]    = params.auto_bed_leveling;
+    j["print"]["auto_flow_cali"]       = params.auto_flow_cali;
+    j["print"]["auto_offset_cali"]     = params.auto_offset_cali;
+    if (params.plate_index > 0)
+        j["print"]["plate_idx"]        = std::to_string(params.plate_index);
+    if (params.origin_profile_id > 0)
+        j["print"]["profile_id"]       = std::to_string(params.origin_profile_id);
+    if (!params.origin_model_id.empty())
+        j["print"]["model_id"]         = params.origin_model_id;
+    if (!params.project_name.empty())
+        j["print"]["project_name"]     = params.project_name;
+    if (!params.task_name.empty())
+        j["print"]["task_name"]        = params.task_name;
+    // try_emmc_print isn't observed as an MQTT field in any trace; it's a
+    // slicer-side flag the plugin uses to pick the upload transport. Keep
+    // out of the wire payload.
+
+    const std::string cmd = j.dump();
+    BOOST_LOG_TRIVIAL(info) << "virtual_lan_print: dev=" << params.dev_id
+                            << " gcode_file " << remote_path
+                            << " bytes=" << cmd.size()
+                            << " ams_mapping=" << params.ams_mapping
+                            << " use_ams=" << int(params.task_use_ams);
+    int pubrc = Slic3r::VirtualMqttClient::instance().send_message(params.dev_id, cmd, /*qos=*/0);
+    if (pubrc != 0) {
+        BOOST_LOG_TRIVIAL(warning) << "virtual_lan_print: MQTT send rc=" << pubrc;
+        return -1;
+    }
+    return 0;
+}
+
+static int virtual_print_normalise_plate_to_zero(const std::string& threemf_path) {
+    if (threemf_path.empty()) return 0;
+    mz_zip_archive in{};
+    if (!mz_zip_reader_init_file(&in, threemf_path.c_str(), 0)) {
+        // Not a .3mf / not readable — silently let downstream FTPS proceed
+        // with whatever the slicer prepared; the bridge-side rewriter is
+        // the fallback for non-Orca slicers anyway.
+        return 0;
+    }
+    int src_idx = -1;
+    mz_uint n_files = mz_zip_reader_get_num_files(&in);
+    for (mz_uint i = 0; i < n_files; ++i) {
+        char name[512];
+        if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
+        std::string nm(name);
+        if (nm.size() <= 15) continue;
+        if (nm.compare(0, 15, "Metadata/plate_") != 0) continue;
+        if (nm.size() < 6 || nm.compare(nm.size() - 6, 6, ".gcode") != 0) continue;
+        std::size_t dot = nm.find('.', 15);
+        if (dot == std::string::npos) continue;
+        try { src_idx = std::stoi(nm.substr(15, dot - 15)); break; } catch (...) {}
+    }
+    if (src_idx <= 0) {                       // already plate_0 or no gcode
+        mz_zip_reader_end(&in);
+        return 0;
+    }
+
+    const std::string src_tag = "plate_" + std::to_string(src_idx);
+    const std::string dst_tag = "plate_0";
+    const std::string out_path = threemf_path + ".rewrite.tmp";
+    ::unlink(out_path.c_str());
+
+    mz_zip_archive out{};
+    if (!mz_zip_writer_init_file(&out, out_path.c_str(), 0)) {
+        mz_zip_reader_end(&in);
+        return -1;
+    }
+
+    auto rename_entry = [&](const std::string& nm) {
+        std::string o = nm;
+        auto subst = [&](const std::string& needle, const std::string& with) {
+            std::size_t p = 0;
+            while ((p = o.find(needle, p)) != std::string::npos) {
+                o.replace(p, needle.size(), with);
+                p += with.size();
+            }
+        };
+        subst(src_tag, dst_tag);
+        const std::string n = std::to_string(src_idx);
+        subst("plate_no_light_" + n, "plate_no_light_0");
+        subst("top_"  + n, "top_0");
+        subst("pick_" + n, "pick_0");
+        return o;
+    };
+
+    bool ok = true;
+    int n_renamed = 0;
+    for (mz_uint i = 0; i < n_files; ++i) {
+        char name[512];
+        if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
+        std::string nm(name);
+        std::string new_nm = rename_entry(nm);
+
+        std::vector<unsigned char> buf;
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&in, i, &st)) { ok = false; break; }
+        buf.resize(static_cast<std::size_t>(st.m_uncomp_size));
+        if (st.m_uncomp_size > 0
+            && !mz_zip_reader_extract_to_mem(&in, i, buf.data(), buf.size(), 0)) {
+            ok = false; break;
+        }
+
+        if (new_nm == "Metadata/model_settings.config") {
+            std::string xml(buf.begin(), buf.end());
+            auto subst_all = [&](const std::string& needle, const std::string& with) {
+                std::size_t p = 0;
+                while ((p = xml.find(needle, p)) != std::string::npos) {
+                    xml.replace(p, needle.size(), with);
+                    p += with.size();
+                }
+            };
+            const std::string n = std::to_string(src_idx);
+            subst_all(src_tag, dst_tag);
+            subst_all("plate_no_light_" + n, "plate_no_light_0");
+            subst_all("top_"  + n, "top_0");
+            subst_all("pick_" + n, "pick_0");
+            subst_all("plater_id\" value=\"" + n + "\"",
+                      "plater_id\" value=\"0\"");
+            buf.assign(xml.begin(), xml.end());
+        }
+
+        if (!mz_zip_writer_add_mem(&out, new_nm.c_str(),
+                                   buf.empty() ? nullptr : buf.data(),
+                                   buf.size(), MZ_DEFAULT_COMPRESSION)) {
+            ok = false; break;
+        }
+        if (new_nm != nm) ++n_renamed;
+    }
+    bool finalize_ok = ok && mz_zip_writer_finalize_archive(&out) && mz_zip_writer_end(&out);
+    mz_zip_reader_end(&in);
+    if (!finalize_ok) { ::unlink(out_path.c_str()); return -1; }
+    if (::rename(out_path.c_str(), threemf_path.c_str()) != 0) {
+        ::unlink(out_path.c_str()); return -1;
+    }
+    BOOST_LOG_TRIVIAL(info)
+        << "virtual_print_normalise_plate_to_zero: " << threemf_path
+        << " plate_" << src_idx << " -> plate_0 (renamed=" << n_renamed << ")";
+    return 0;
+}
+
+
 int NetworkAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+    if (is_virtual_dev_id(params.dev_id)) {
+        BOOST_LOG_TRIVIAL(info) << "[bbs-virtual] start_print FFFF dev_id=" << params.dev_id;
+        return virtual_lan_print_(params, update_fn, cancel_fn);
+    }
     int ret = 0;
     if (network_agent && start_print_ptr) {
         dump_print_params("start_print(pre)", params);
@@ -1353,6 +1646,10 @@ int NetworkAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, Wa
 
 int NetworkAgent::start_local_print_with_record(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+    if (is_virtual_dev_id(params.dev_id)) {
+        BOOST_LOG_TRIVIAL(info) << "[bbs-virtual] start_local_print_with_record FFFF dev_id=" << params.dev_id;
+        return virtual_lan_print_(params, update_fn, cancel_fn);
+    }
     int ret = 0;
     if (network_agent && start_local_print_with_record_ptr) {
         dump_print_params("start_local_print_with_record(pre)", params);
@@ -1365,6 +1662,10 @@ int NetworkAgent::start_local_print_with_record(PrintParams params, OnUpdateStat
 
 int NetworkAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+    if (is_virtual_dev_id(params.dev_id)) {
+        BOOST_LOG_TRIVIAL(info) << "[bbs-virtual] start_send_gcode_to_sdcard FFFF dev_id=" << params.dev_id;
+        return virtual_lan_print_(params, update_fn, cancel_fn);
+    }
     int rc = 0;
     if (bridge_hooks::Dispatcher::try_start_send_gcode_to_sdcard(
             params, update_fn, cancel_fn, &rc))
@@ -1381,6 +1682,10 @@ int NetworkAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusF
 
 int NetworkAgent::start_local_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
 {
+    if (is_virtual_dev_id(params.dev_id)) {
+        BOOST_LOG_TRIVIAL(info) << "[bbs-virtual] start_local_print FFFF dev_id=" << params.dev_id;
+        return virtual_lan_print_(params, update_fn, cancel_fn);
+    }
     int ret = 0;
     if (network_agent && start_local_print_ptr) {
         dump_print_params("start_local_print(pre)", params);
