@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <cstdarg>
+#include <cstdio>
 #if defined(_MSC_VER) || defined(_WIN32)
 #include <Windows.h>
 #else
@@ -11,6 +13,7 @@
 #include "slic3r/Utils/BBLUtil.hpp"
 #include "NetworkAgent.hpp"
 #include "NetworkAgentBridgeHooks.hpp"
+#include "PluginTrace.hpp"
 
 #include "slic3r/Utils/FileTransferUtils.hpp"
 #include "slic3r/Utils/CertificateVerify.hpp"
@@ -32,6 +35,88 @@ using namespace BBL;
 namespace Slic3r {
 
 #define BAMBU_SOURCE_LIBRARY "BambuSource"
+
+// ---- Full plugin-call trace (gated on env vars) ----------------------
+//
+//   BAMBU_BRIDGE_PLUGIN_TRACE=1     — emit `[plugincall] …` lines
+//   BAMBU_BRIDGE_PLUGIN_SNAPSHOT=1  — also hard-link/copy every .3mf
+//                                     PrintParams references into
+//                                     /tmp/plugin-trace-3mf-snapshots/
+//
+// Shared infrastructure lives in PluginTrace.hpp. Used by NetworkAgent,
+// BambuSourceHandle, PrinterFileSystem.
+namespace {
+
+using Slic3r::plugin_trace::log_event;
+using Slic3r::plugin_trace::truncate;
+using Slic3r::plugin_trace::snapshot_path;
+using Slic3r::plugin_trace::dump_stack;
+
+// Dumps every field on PrintParams that PrintJob / SendJob is known to
+// fill, in a fixed order so cross-scenario diffs are mechanical. Also
+// hard-links the .3mf at p.filename and p.config_filename into
+// /tmp/plugin-trace-3mf-snapshots/ when BAMBU_BRIDGE_PLUGIN_SNAPSHOT=1.
+// Called BEFORE the plugin export so the call args are logged even when
+// the plugin then deadlocks / returns -3070 / etc.
+void dump_print_params(const char* fn, const BBL::PrintParams& p) {
+    if (!Slic3r::plugin_trace::enabled()) return;
+    Slic3r::plugin_trace::write_prefix(stderr);
+    std::fprintf(stderr,
+        "%s "
+        "dev_id=%s dev_ip=%s username=%s "
+        "filename=%s config_filename=%s "
+        "project_name=%s task_name=%s preset_name=%s "
+        "plate_index=%d connection_type=%s "
+        "use_ssl_for_ftp=%d use_ssl_for_mqtt=%d "
+        "ftp_folder=%s ftp_file=%s ftp_file_md5=%s "
+        "nozzle_mapping=%s ams_mapping=%s ams_mapping2=%s "
+        "ams_mapping_info=%s nozzles_info=%s comments=%s "
+        "origin_profile_id=%d stl_design_id=%d "
+        "origin_model_id=%s print_type=%s dst_file=%s dev_name=%s "
+        "task_bed_leveling=%d task_flow_cali=%d task_vibration_cali=%d "
+        "task_layer_inspect=%d task_record_timelapse=%d "
+        "task_timelapse_use_internal=%d task_use_ams=%d "
+        "task_bed_type=%s extra_options=%s "
+        "auto_bed_leveling=%d auto_flow_cali=%d auto_offset_cali=%d "
+        "extruder_cali_manual_mode=%d task_ext_change_assist=%d "
+        "try_emmc_print=%d\n",
+        fn,
+        p.dev_id.c_str(), p.dev_ip.c_str(), p.username.c_str(),
+        p.filename.c_str(), p.config_filename.c_str(),
+        p.project_name.c_str(), p.task_name.c_str(), p.preset_name.c_str(),
+        p.plate_index, p.connection_type.c_str(),
+        int(p.use_ssl_for_ftp), int(p.use_ssl_for_mqtt),
+        p.ftp_folder.c_str(), p.ftp_file.c_str(), p.ftp_file_md5.c_str(),
+        p.nozzle_mapping.c_str(), p.ams_mapping.c_str(), p.ams_mapping2.c_str(),
+        p.ams_mapping_info.c_str(), p.nozzles_info.c_str(), p.comments.c_str(),
+        p.origin_profile_id, p.stl_design_id,
+        p.origin_model_id.c_str(), p.print_type.c_str(),
+        p.dst_file.c_str(), p.dev_name.c_str(),
+        int(p.task_bed_leveling), int(p.task_flow_cali),
+        int(p.task_vibration_cali), int(p.task_layer_inspect),
+        int(p.task_record_timelapse), int(p.task_timelapse_use_internal),
+        int(p.task_use_ams), p.task_bed_type.c_str(),
+        p.extra_options.c_str(),
+        p.auto_bed_leveling, p.auto_flow_cali, p.auto_offset_cali,
+        p.extruder_cali_manual_mode, int(p.task_ext_change_assist),
+        int(p.try_emmc_print));
+    std::fflush(stderr);
+
+    // Snapshot the referenced .3mf files so we can inspect their
+    // structure offline (zip listing, compare filename vs config_
+    // filename byte-for-byte etc.). Caller is responsible for not
+    // overlapping snapshot calls for the same path within 1 ms.
+    snapshot_path(fn, "filename",        p.filename);
+    snapshot_path(fn, "config_filename", p.config_filename);
+
+    // Call-tree dump (gated separately on BAMBU_BRIDGE_PLUGIN_STACK=1
+    // because backtrace + demangle is allocator-heavy). Tag with `fn`
+    // so the lines can be associated with this PrintParams dump.
+    Slic3r::plugin_trace::dump_stack(fn);
+}
+
+} // namespace
+
 
 #if defined(_MSC_VER) || defined(_WIN32)
 static HMODULE networking_module = NULL;
@@ -697,6 +782,8 @@ int NetworkAgent::set_on_ssdp_msg_fn(OnMsgArrivedFn fn)
 {
     int ret = 0;
     if (network_agent && set_on_ssdp_msg_fn_ptr) {
+        log_event("set_on_ssdp_msg_fn register");
+        dump_stack("set_on_ssdp_msg_fn");
         ret = set_on_ssdp_msg_fn_ptr(network_agent, fn);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
@@ -708,6 +795,8 @@ int NetworkAgent::set_on_user_login_fn(OnUserLoginFn fn)
 {
     int ret = 0;
     if (network_agent && set_on_user_login_fn_ptr) {
+        log_event("set_on_user_login_fn register");
+        dump_stack("set_on_user_login_fn");
         ret = set_on_user_login_fn_ptr(network_agent, fn);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
@@ -719,6 +808,8 @@ int NetworkAgent::set_on_printer_connected_fn(OnPrinterConnectedFn fn)
 {
     int ret = 0;
     if (network_agent && set_on_printer_connected_fn_ptr) {
+        log_event("set_on_printer_connected_fn register");
+        dump_stack("set_on_printer_connected_fn");
         ret = set_on_printer_connected_fn_ptr(network_agent, fn);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
@@ -730,6 +821,8 @@ int NetworkAgent::set_on_server_connected_fn(OnServerConnectedFn fn)
 {
     int ret = 0;
     if (network_agent && set_on_server_connected_fn_ptr) {
+        log_event("set_on_server_connected_fn register");
+        dump_stack("set_on_server_connected_fn");
         ret = set_on_server_connected_fn_ptr(network_agent, fn);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
@@ -741,6 +834,8 @@ int NetworkAgent::set_on_http_error_fn(OnHttpErrorFn fn)
 {
     int ret = 0;
     if (network_agent && set_on_http_error_fn_ptr) {
+        log_event("set_on_http_error_fn register");
+        dump_stack("set_on_http_error_fn");
         ret = set_on_http_error_fn_ptr(network_agent, fn);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
@@ -752,6 +847,8 @@ int NetworkAgent::set_get_country_code_fn(GetCountryCodeFn fn)
 {
     int ret = 0;
     if (network_agent && set_get_country_code_fn_ptr) {
+        log_event("set_get_country_code_fn register");
+        dump_stack("set_get_country_code_fn");
         ret = set_get_country_code_fn_ptr(network_agent, fn);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
@@ -763,6 +860,8 @@ int NetworkAgent::set_on_subscribe_failure_fn(GetSubscribeFailureFn fn)
 {
     int ret = 0;
     if (network_agent && set_on_subscribe_failure_fn_ptr) {
+        log_event("set_on_subscribe_failure_fn register");
+        dump_stack("set_on_subscribe_failure_fn");
         ret = set_on_subscribe_failure_fn_ptr(network_agent, fn);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") % network_agent % ret;
@@ -774,6 +873,8 @@ int NetworkAgent::set_on_message_fn(OnMessageFn fn)
 {
     int ret = 0;
     if (network_agent && set_on_message_fn_ptr) {
+        log_event("set_on_message_fn register (cloud-side OnMessageFn; wrapped via bridge_hooks)");
+        dump_stack("set_on_message_fn");
         ret = set_on_message_fn_ptr(network_agent,
             bridge_hooks::Dispatcher::make_on_message_wrapper(this, fn));
         if (ret)
@@ -786,6 +887,8 @@ int NetworkAgent::set_on_user_message_fn(OnMessageFn fn)
 {
     int ret = 0;
     if (network_agent && set_on_user_message_fn_ptr) {
+        log_event("set_on_user_message_fn register");
+        dump_stack("set_on_user_message_fn");
         ret = set_on_user_message_fn_ptr(network_agent, fn);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") % network_agent % ret;
@@ -798,6 +901,8 @@ int NetworkAgent::set_on_local_connect_fn(OnLocalConnectedFn fn)
     bridge_hooks::Dispatcher::capture_local_connect_cb(this, fn);
     int ret = 0;
     if (network_agent && set_on_local_connect_fn_ptr) {
+        log_event("set_on_local_connect_fn register (LAN session up/down; wrapped via bridge_hooks)");
+        dump_stack("set_on_local_connect_fn");
         ret = set_on_local_connect_fn_ptr(network_agent,
             bridge_hooks::Dispatcher::make_on_local_connect_wrapper(fn));
         if (ret)
@@ -811,6 +916,8 @@ int NetworkAgent::set_on_local_message_fn(OnMessageFn fn)
     bridge_hooks::Dispatcher::capture_local_message_cb(this, fn);
     int ret = 0;
     if (network_agent && set_on_local_message_fn_ptr) {
+        log_event("set_on_local_message_fn register (LAN-side OnMessageFn; wrapped via bridge_hooks)");
+        dump_stack("set_on_local_message_fn");
         ret = set_on_local_message_fn_ptr(network_agent,
             bridge_hooks::Dispatcher::make_on_local_message_wrapper(this, fn));
         if (ret)
@@ -839,7 +946,9 @@ int NetworkAgent::connect_server()
 {
     int ret = 0;
     if (network_agent && connect_server_ptr) {
+        log_event("connect_server");
         ret = connect_server_ptr(network_agent);
+        log_event("connect_server ret=%d", ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
     }
@@ -860,7 +969,9 @@ int NetworkAgent::refresh_connection()
 {
     int ret = 0;
     if (network_agent && refresh_connection_ptr) {
+        log_event("refresh_connection");
         ret = refresh_connection_ptr(network_agent);
+        log_event("refresh_connection ret=%d", ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%")%network_agent %ret;
     }
@@ -871,7 +982,9 @@ int NetworkAgent::start_subscribe(std::string module)
 {
     int ret = 0;
     if (network_agent && start_subscribe_ptr) {
+        log_event("start_subscribe module=%s", module.c_str());
         ret = start_subscribe_ptr(network_agent, module);
+        log_event("start_subscribe module=%s ret=%d", module.c_str(), ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%, module=%3%")%network_agent %ret %module ;
     }
@@ -882,7 +995,9 @@ int NetworkAgent::stop_subscribe(std::string module)
 {
     int ret = 0;
     if (network_agent && stop_subscribe_ptr) {
+        log_event("stop_subscribe module=%s", module.c_str());
         ret = stop_subscribe_ptr(network_agent, module);
+        log_event("stop_subscribe module=%s ret=%d", module.c_str(), ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%, module=%3%")%network_agent %ret %module ;
     }
@@ -893,7 +1008,12 @@ int NetworkAgent::add_subscribe(std::vector<std::string> dev_list)
 {
     int ret = 0;
     if (network_agent && add_subscribe_ptr) {
+        if (Slic3r::plugin_trace::enabled()) {
+            std::string ids; for (auto& d : dev_list) { if (!ids.empty()) ids += ","; ids += d; }
+            log_event("add_subscribe n=%zu ids=%s", dev_list.size(), ids.c_str());
+        }
         ret = add_subscribe_ptr(network_agent, dev_list);
+        log_event("add_subscribe n=%zu ret=%d", dev_list.size(), ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") %network_agent %ret;
     }
@@ -904,7 +1024,12 @@ int NetworkAgent::del_subscribe(std::vector<std::string> dev_list)
 {
     int ret = 0;
     if (network_agent && del_subscribe_ptr) {
+        if (Slic3r::plugin_trace::enabled()) {
+            std::string ids; for (auto& d : dev_list) { if (!ids.empty()) ids += ","; ids += d; }
+            log_event("del_subscribe n=%zu ids=%s", dev_list.size(), ids.c_str());
+        }
         ret = del_subscribe_ptr(network_agent, dev_list);
+        log_event("del_subscribe n=%zu ret=%d", dev_list.size(), ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") %network_agent %ret;
     }
@@ -922,7 +1047,10 @@ int NetworkAgent::send_message(std::string dev_id, std::string json_str, int qos
 {
     int ret = 0;
     if (network_agent && send_message_ptr) {
+        log_event("send_message CLOUD dev_id=%s qos=%d flag=%d bytes=%zu payload=%s",
+            dev_id.c_str(), qos, flag, json_str.size(), truncate(json_str).c_str());
         ret = send_message_ptr(network_agent, dev_id, json_str, qos, flag);
+        log_event("send_message CLOUD dev_id=%s ret=%d", dev_id.c_str(), ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ <<
             boost::format(" error: network_agent=%1%, ret=%2%, dev_id=%3%, json_str=%4%, qos=%5%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(dev_id) %json_str %qos;
@@ -938,7 +1066,10 @@ int NetworkAgent::connect_printer(std::string dev_id, std::string dev_ip, std::s
         return rc;
     int ret = 0;
     if (network_agent && connect_printer_ptr) {
+        log_event("connect_printer dev_id=%s dev_ip=%s username=%s use_ssl=%d",
+            dev_id.c_str(), dev_ip.c_str(), username.c_str(), int(use_ssl));
         ret = connect_printer_ptr(network_agent, dev_id, dev_ip, username, password, use_ssl);
+        log_event("connect_printer dev_id=%s ret=%d", dev_id.c_str(), ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ <<
             (boost::format(" error: network_agent=%1%, ret=%2%, dev_id=%3%, dev_ip=%4%, username=%5%, password=%6%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(dev_id) %BBLCrossTalk::Crosstalk_DevIP(dev_ip) %username %password).str();
@@ -955,7 +1086,9 @@ int NetworkAgent::disconnect_printer()
         return rc;
     int ret = 0;
     if (network_agent && disconnect_printer_ptr) {
+        log_event("disconnect_printer");
         ret = disconnect_printer_ptr(network_agent);
+        log_event("disconnect_printer ret=%d", ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") %network_agent %ret;
         else
@@ -972,7 +1105,10 @@ int NetworkAgent::send_message_to_printer(std::string dev_id, std::string json_s
         return rc;
     int ret = 0;
     if (network_agent && send_message_to_printer_ptr) {
+        log_event("send_message_to_printer LAN dev_id=%s qos=%d flag=%d bytes=%zu payload=%s",
+            dev_id.c_str(), qos, flag, json_str.size(), truncate(json_str).c_str());
         ret = send_message_to_printer_ptr(network_agent, dev_id, json_str, qos, flag);
+        log_event("send_message_to_printer LAN dev_id=%s ret=%d", dev_id.c_str(), ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%, dev_id=%3%, json_str=%4%, qos=%5%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(dev_id) %json_str %qos;
     }
@@ -993,6 +1129,8 @@ int NetworkAgent::check_cert()
 void NetworkAgent::install_device_cert(std::string dev_id, bool lan_only)
 {
     if (network_agent && install_device_cert_ptr) {
+        log_event("install_device_cert dev_id=%s lan_only=%d",
+            dev_id.c_str(), int(lan_only));
         install_device_cert_ptr(network_agent, dev_id, lan_only);
     }
 }
@@ -1191,7 +1329,9 @@ int NetworkAgent::set_user_selected_machine(std::string dev_id)
 {
     int ret = 0;
     if (network_agent && set_user_selected_machine_ptr) {
+        log_event("set_user_selected_machine dev_id=%s", dev_id.c_str());
         ret = set_user_selected_machine_ptr(network_agent, dev_id);
+        log_event("set_user_selected_machine dev_id=%s ret=%d", dev_id.c_str(), ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%, user_info=%3%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(dev_id);
     }
@@ -1202,7 +1342,9 @@ int NetworkAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, Wa
 {
     int ret = 0;
     if (network_agent && start_print_ptr) {
+        dump_print_params("start_print(pre)", params);
         ret = start_print_ptr(network_agent, params, update_fn, cancel_fn, wait_fn);
+        log_event("start_print dev_id=%s ret=%d", params.dev_id.c_str(), ret);
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__
                                 << boost::format(" : network_agent=%1%, ret=%2%, dev_id=%3%, task_name=%4%, project_name=%5%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(params.dev_id) %params.task_name %params.project_name;
     }
@@ -1213,7 +1355,9 @@ int NetworkAgent::start_local_print_with_record(PrintParams params, OnUpdateStat
 {
     int ret = 0;
     if (network_agent && start_local_print_with_record_ptr) {
+        dump_print_params("start_local_print_with_record(pre)", params);
         ret = start_local_print_with_record_ptr(network_agent, params, update_fn, cancel_fn, wait_fn);
+        log_event("start_local_print_with_record dev_id=%s ret=%d", params.dev_id.c_str(), ret);
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" : network_agent=%1%, ret=%2%, dev_id=%3%, task_name=%4%, project_name=%5%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(params.dev_id) %params.task_name %params.project_name;
     }
     return ret;
@@ -1227,7 +1371,9 @@ int NetworkAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusF
         return rc;
     int ret = 0;
     if (network_agent && start_send_gcode_to_sdcard_ptr) {
+        dump_print_params("start_send_gcode_to_sdcard(pre)", params);
         ret = start_send_gcode_to_sdcard_ptr(network_agent, params, update_fn, cancel_fn, wait_fn);
+        log_event("start_send_gcode_to_sdcard dev_id=%s ret=%d", params.dev_id.c_str(), ret);
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" : network_agent=%1%, ret=%2%, dev_id=%3%, task_name=%4%, project_name=%5%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(params.dev_id) %params.task_name %params.project_name;
     }
     return ret;
@@ -1237,7 +1383,9 @@ int NetworkAgent::start_local_print(PrintParams params, OnUpdateStatusFn update_
 {
     int ret = 0;
     if (network_agent && start_local_print_ptr) {
+        dump_print_params("start_local_print(pre)", params);
         ret = start_local_print_ptr(network_agent, params, update_fn, cancel_fn);
+        log_event("start_local_print dev_id=%s ret=%d", params.dev_id.c_str(), ret);
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" : network_agent=%1%, ret=%2%, dev_id=%3%, task_name=%4%, project_name=%5%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(params.dev_id) %params.task_name %params.project_name;
     }
     return ret;
@@ -1247,7 +1395,9 @@ int NetworkAgent::start_sdcard_print(PrintParams params, OnUpdateStatusFn update
 {
     int ret = 0;
     if (network_agent && start_sdcard_print_ptr) {
+        dump_print_params("start_sdcard_print(pre)", params);
         ret = start_sdcard_print_ptr(network_agent, params, update_fn, cancel_fn);
+        log_event("start_sdcard_print dev_id=%s ret=%d", params.dev_id.c_str(), ret);
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" : network_agent=%1%, ret=%2%, dev_id=%3%, task_name=%4%, project_name=%5%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(params.dev_id) %params.task_name %params.project_name;
     }
     return ret;
@@ -1363,7 +1513,10 @@ int NetworkAgent::get_user_print_info(unsigned int* http_code, std::string* http
 {
     int ret = 0;
     if (network_agent && get_user_print_info_ptr) {
+        log_event("get_user_print_info");
         ret = get_user_print_info_ptr(network_agent, http_code, http_body);
+        log_event("get_user_print_info ret=%d http_code=%u body_bytes=%zu",
+            ret, http_code ? *http_code : 0, http_body ? http_body->size() : 0);
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%, http_code=%3%")%network_agent %ret %(*http_code);
     }
     return ret;
@@ -1529,7 +1682,18 @@ int NetworkAgent::get_camera_url(std::string dev_id, std::function<void(std::str
 {
     int ret = 0;
     if (network_agent && get_camera_url_ptr) {
-        ret = get_camera_url_ptr(network_agent, dev_id, callback);
+        log_event("get_camera_url dev_id=%s", dev_id.c_str());
+        // Wrap the callback so we can log the resolved URL too — that's
+        // where the bambu:/// scheme + LAN/cloud routing decision shows
+        // up (essential for the camera/video scenario).
+        std::string did = dev_id;
+        auto wrapped = [cb = std::move(callback), did](std::string url) {
+            log_event("get_camera_url dev_id=%s -> url=%s",
+                did.c_str(), url.c_str());
+            cb(std::move(url));
+        };
+        ret = get_camera_url_ptr(network_agent, dev_id, std::move(wrapped));
+        log_event("get_camera_url dev_id=%s ret=%d", dev_id.c_str(), ret);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%, dev_id=%3%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(dev_id);
     }
@@ -1593,7 +1757,11 @@ int NetworkAgent::start_publish(PublishParams params, OnUpdateStatusFn update_fn
 {
     int ret = 0;
     if (network_agent && start_publish_ptr) {
+        log_event("start_publish");
+        Slic3r::plugin_trace::dump_stack("start_publish");
         ret = start_publish_ptr(network_agent, params, update_fn, cancel_fn, out);
+        log_event("start_publish ret=%d out_bytes=%zu",
+            ret, out ? out->size() : 0);
         if (ret)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") % network_agent % ret;
     }

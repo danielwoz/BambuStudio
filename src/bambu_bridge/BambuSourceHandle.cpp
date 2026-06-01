@@ -5,6 +5,9 @@
 
 #include "BambuSourceHandle.hpp"
 
+#include "../slic3r/Utils/PluginTrace.hpp"
+
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>     // getenv
@@ -248,8 +251,12 @@ bool BambuSourceHandle::library_ready() const {
 int BambuSourceHandle::bambu_create(void** out_tunnel, const std::string& url) {
     if (out_tunnel) *out_tunnel = nullptr;
     if (!m_impl->ready_flag.load() || !m_impl->p_create) return -1;
+    Slic3r::plugin_trace::log_event("BambuSource.bambu_create url=%s", url.c_str());
+    Slic3r::plugin_trace::dump_stack("bambu_create");
     MirrorBambu_Tunnel t = nullptr;
     int rc = m_impl->p_create(&t, url.c_str());
+    Slic3r::plugin_trace::log_event("BambuSource.bambu_create tunnel=%p rc=%d",
+        (void*) t, rc);
     if (out_tunnel) *out_tunnel = t;
     return rc;
 }
@@ -257,25 +264,35 @@ int BambuSourceHandle::bambu_create(void** out_tunnel, const std::string& url) {
 void BambuSourceHandle::bambu_destroy(void* tunnel) {
     if (!tunnel) return;
     if (!m_impl->ready_flag.load() || !m_impl->p_destroy) return;
+    Slic3r::plugin_trace::log_event("BambuSource.bambu_destroy tunnel=%p", tunnel);
     m_impl->p_destroy(tunnel);
 }
 
 int BambuSourceHandle::bambu_open(void* tunnel) {
     if (!tunnel) return -1;
     if (!m_impl->ready_flag.load() || !m_impl->p_open) return -1;
-    return m_impl->p_open(tunnel);
+    Slic3r::plugin_trace::log_event("BambuSource.bambu_open tunnel=%p", tunnel);
+    int rc = m_impl->p_open(tunnel);
+    Slic3r::plugin_trace::log_event("BambuSource.bambu_open tunnel=%p rc=%d", tunnel, rc);
+    return rc;
 }
 
 void BambuSourceHandle::bambu_close(void* tunnel) {
     if (!tunnel) return;
     if (!m_impl->ready_flag.load() || !m_impl->p_close) return;
+    Slic3r::plugin_trace::log_event("BambuSource.bambu_close tunnel=%p", tunnel);
     m_impl->p_close(tunnel);
 }
 
 int BambuSourceHandle::bambu_start_stream(void* tunnel, bool video) {
     if (!tunnel) return -1;
     if (!m_impl->ready_flag.load() || !m_impl->p_start_stream) return -1;
-    return m_impl->p_start_stream(tunnel, video);
+    Slic3r::plugin_trace::log_event("BambuSource.bambu_start_stream tunnel=%p video=%d",
+        tunnel, int(video));
+    int rc = m_impl->p_start_stream(tunnel, video);
+    Slic3r::plugin_trace::log_event("BambuSource.bambu_start_stream tunnel=%p rc=%d",
+        tunnel, rc);
+    return rc;
 }
 
 int BambuSourceHandle::bambu_get_stream_count(void* tunnel) {
@@ -299,13 +316,26 @@ int BambuSourceHandle::bambu_read_sample(void* tunnel, void* sample_out) {
 int BambuSourceHandle::bambu_start_stream_ex(void* tunnel, int type) {
     if (!tunnel) return -1;
     if (!m_impl->ready_flag.load() || !m_impl->p_start_stream_ex) return -1;
-    return m_impl->p_start_stream_ex(tunnel, type);
+    Slic3r::plugin_trace::log_event("BambuSource.bambu_start_stream_ex tunnel=%p type=%d",
+        tunnel, type);
+    int rc = m_impl->p_start_stream_ex(tunnel, type);
+    Slic3r::plugin_trace::log_event("BambuSource.bambu_start_stream_ex tunnel=%p rc=%d",
+        tunnel, rc);
+    return rc;
 }
 
 int BambuSourceHandle::bambu_send_message(void* tunnel, int ctrl,
                                           const char* data, int len) {
     if (!tunnel) return -1;
     if (!m_impl->ready_flag.load() || !m_impl->p_send_message) return -1;
+    if (Slic3r::plugin_trace::enabled()) {
+        std::string body = (data && len > 0)
+            ? std::string(data, std::min(len, 200))
+            : std::string{};
+        Slic3r::plugin_trace::log_event(
+            "BambuSource.bambu_send_message tunnel=%p ctrl=%d len=%d body=%s",
+            tunnel, ctrl, len, body.c_str());
+    }
     return m_impl->p_send_message(tunnel, ctrl, data, len);
 }
 

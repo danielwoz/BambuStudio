@@ -126,6 +126,8 @@ add_library(bambu_bridge STATIC
     router/UploadSinkRouter.hpp
     router/CameraSourceRouter.cpp
     router/CameraSourceRouter.hpp
+    router/CameraFrameFanout.cpp
+    router/CameraFrameFanout.hpp
     router/LocalControlTunnel.cpp
     router/LocalControlTunnel.hpp
     router/NativeStorageDelegate.cpp

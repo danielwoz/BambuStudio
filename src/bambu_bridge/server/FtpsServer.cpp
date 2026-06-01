@@ -856,6 +856,14 @@ void session_io_loop(FtpsServer::Device* dev,
             }
             const std::string remote = normalize_remote_path(cwd, args);
             const std::string fname  = basename_of(remote);
+            std::fprintf(stderr,
+                "[ftps] dev=%s STOR args='%s' cwd='%s' remote='%s' fname='%s'\n",
+                dev->spec.dev_id.c_str(),
+                args.c_str(),
+                cwd.c_str(),
+                remote.c_str(),
+                fname.c_str());
+            std::fflush(stderr);
             if (!reply(sess->ssl, 150, "Ok to send data.")) {
                 pasv.close();
                 return;

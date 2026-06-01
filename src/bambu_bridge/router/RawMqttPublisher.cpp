@@ -92,7 +92,9 @@ int tcp_connect(const std::string& ip, uint16_t port,
     return fd;
 }
 
-SSL_CTX* make_client_ctx() {
+SSL_CTX* make_client_ctx(const std::string& cert_path,
+                         const std::string& key_path,
+                         const std::string& dev_id) {
     ensure_openssl_init();
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) return nullptr;
@@ -100,6 +102,51 @@ SSL_CTX* make_client_ctx() {
     // Only thing we need is to disable verify since printer cert is
     // self-signed.
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    // The printer's TLS server is ECDHE-only. Without an explicit ECDH
+    // curve set the handshake aborts with
+    // `tls_process_ske_ecdhe:unable to find ecdh parameters`.
+    //
+    // Curve choice (P-521): the bridge's BUNDLED OpenSSL 1.1.1k was built
+    // with `no-asm` (see deps/OpenSSL/OpenSSL.cmake). In that
+    // configuration P-256 and P-384's curve parameter tables are
+    // corrupted — EC_GROUP_new_by_curve_name returns "unknown group" and
+    // `EC_POINT_set_affine_coordinates: point is not on curve` for them.
+    // P-521 uses the generic GFp_simple method which IS intact, and the
+    // printer accepts it (verified: `Server Temp Key: ECDH, secp521r1`).
+    // X25519 works in the bundled OpenSSL but the printer rejects it
+    // (TLS alert 40 = handshake failure). So P-521 is the one curve that
+    // both ends agree on.
+    //
+    // Don't add P-256/P-384 back without first verifying the bundled
+    // OpenSSL is rebuilt with-asm — see /tmp/ssl_repro.c for the
+    // reproducer that documented this.
+    //
+    // (SSL_CTX_set_ecdh_auto was deprecated in OpenSSL 1.1.0;
+    // SSL_CTX_set1_groups_list is the modern equivalent.)
+    SSL_CTX_set_options(ctx, SSL_OP_SINGLE_ECDH_USE);
+    SSL_CTX_set1_groups_list(ctx, "P-521");
+    // Optional mTLS: load the bridge-cached client cert + key so the
+    // printer's LAN broker accepts `print.command=*` and other
+    // mTLS-enforced control payloads. Empty paths = leave plain TLS in
+    // place (read-only paths don't need mTLS).
+    if (!cert_path.empty() && !key_path.empty()) {
+        if (SSL_CTX_use_certificate_chain_file(ctx, cert_path.c_str()) != 1) {
+            log_ssl_err("SSL_CTX_use_certificate_chain_file", dev_id);
+            SSL_CTX_free(ctx);
+            return nullptr;
+        }
+        if (SSL_CTX_use_PrivateKey_file(ctx, key_path.c_str(),
+                                        SSL_FILETYPE_PEM) != 1) {
+            log_ssl_err("SSL_CTX_use_PrivateKey_file", dev_id);
+            SSL_CTX_free(ctx);
+            return nullptr;
+        }
+        if (SSL_CTX_check_private_key(ctx) != 1) {
+            log_ssl_err("SSL_CTX_check_private_key", dev_id);
+            SSL_CTX_free(ctx);
+            return nullptr;
+        }
+    }
     return ctx;
 }
 
@@ -209,7 +256,9 @@ int raw_mqtt_publish_oneshot(const RawMqttPublishConfig& cfg,
         return -1;
     }
 
-    SSL_CTX* ctx = make_client_ctx();
+    SSL_CTX* ctx = make_client_ctx(cfg.mtls_cert_path,
+                                   cfg.mtls_key_path,
+                                   cfg.dev_id);
     if (!ctx) { ::close(fd); return -2; }
     SSL* ssl = SSL_new(ctx);
     if (!ssl) { SSL_CTX_free(ctx); ::close(fd); return -2; }

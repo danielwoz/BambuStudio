@@ -359,6 +359,24 @@ bool BridgeOnlyConsoleApp::OnInit()
                     }
                 });
 
+            // mTLS fallback resolver — same pattern install_mtls_resolver
+            // uses in BridgeBootstrap.cpp, inlined here because this path
+            // owns its own BridgeApp instance directly.
+            auto* bridge_app_raw = m_bridge_app.get();
+            adapter->set_mtls_resolver(
+                [bridge_app_raw](const std::string&                              dev_id,
+                                 Slic3r::NetworkAgentPluginAdapter::MtlsTarget&  out)
+                    -> bool {
+                    if (!bridge_app_raw) return false;
+                    Slic3r::bridge::headless::BridgeApp::MtlsInfo info;
+                    if (!bridge_app_raw->mtls_info_for(dev_id, info)) return false;
+                    out.printer_ip  = info.lan_ip;
+                    out.access_code = info.access_code;
+                    out.cert_path   = info.cert_path;
+                    out.key_path    = info.key_path;
+                    return true;
+                });
+
             m_bridge_app->attach_plugin_handle(std::move(adapter));
         } else {
             BOOST_LOG_TRIVIAL(warning)

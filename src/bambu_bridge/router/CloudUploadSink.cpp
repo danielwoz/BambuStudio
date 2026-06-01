@@ -57,6 +57,11 @@ bool model_supports_emmc(const std::string& model) {
     if (has("C11") || has("C12")) return true;
     if (up.find("P1") != std::string::npos) return true;
     if (has("C13") || has("C14")) return true;
+    // H2 family — see LanUploadSink.cpp's model_supports_emmc for the
+    // rationale (legacy /model/ FTPS path is broken on current firmware,
+    // try_emmc_print forces the BambuTunnel route).
+    if (up.find("H2") != std::string::npos) return true;
+    if (up.find("O1") != std::string::npos) return true;
     return false;
 }
 
@@ -79,6 +84,26 @@ void CloudUploadSink::remove_device(const std::string& dev_id) {
 
 server::UploadResult CloudUploadSink::deliver(server::UploadJob job) {
     server::UploadResult res;
+
+    // GUI parity — same access-code probe short-circuit as
+    // LanUploadSink. Identified by body content (16-byte literal
+    // "just a test file" — the verbatim resources/check_access_code.txt)
+    // because the plugin issues the STOR with an empty filename.
+    static constexpr const char  kProbeBody[]   = "just a test file";
+    static constexpr std::size_t kProbeBodySize = sizeof(kProbeBody) - 1;
+    if (job.content.size() == kProbeBodySize &&
+        std::memcmp(job.content.data(), kProbeBody, kProbeBodySize) == 0) {
+        res.ok         = true;
+        res.remote_url = "bambu-cloud:///model/check_access_code.txt";
+        std::fprintf(stderr,
+            "[cloud-upload] dev=%s access-code probe "
+            "(16-byte 'just a test file') accepted "
+            "without forwarding to plugin\n",
+            job.dev_id.c_str());
+        std::fflush(stderr);
+        return res;
+    }
+
     if (!m_handle) {
         res.ok = false;
         res.error_message =
@@ -129,8 +154,9 @@ server::UploadResult CloudUploadSink::deliver(server::UploadJob job) {
 
     // The plugin's `start_send_gcode_to_sdcard` is documented synchronous
     // (caller waits for the OSS POST + printer-side download trigger to
-    // complete), so it's safe to unlink the spool now.
-    ::unlink(tmp_path.c_str());
+    // complete), so it's safe to unlink the spool now. cleanup_upload_
+    // tempfile also rmdir's the per-job dir the spool created.
+    cleanup_upload_tempfile(tmp_path);
 
     res.ok = (rc == 0);
     if (res.ok) {

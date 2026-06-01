@@ -85,9 +85,12 @@ struct RtspVirtualDevice {
 
 struct RtspServerConfig {
     // Max concurrent slicer sessions per device. Real printers permit
-    // exactly one camera client at a time; we mirror that by default but
-    // expose a knob for tests / future fan-out.
-    int     max_sessions_per_device = 1;
+    // exactly one camera client at a time, but the bridge fans out a
+    // single upstream stream to multiple watchers via CameraFrameFanout
+    // (one SDK reader thread, N RTSP cursors). Default 4 covers the
+    // common case (slicer + a monitoring view + one or two recorders);
+    // tests can clamp this to 1 to exercise legacy behaviour.
+    int     max_sessions_per_device = 4;
 
     // listen(2) backlog.
     int     accept_backlog          = 4;

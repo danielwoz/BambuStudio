@@ -2,6 +2,7 @@
 
 #include "NetworkAgent.hpp"
 #include "PrintDispatcher.hpp"
+#include "../../bambu_bridge/router/RawMqttPublisher.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -17,6 +18,11 @@ void NetworkAgentPluginAdapter::set_dispatcher_inputs_resolver(
         DispatcherInputsResolver r) {
     std::lock_guard<std::mutex> lk(m_resolver_mu);
     m_inputs_resolver = std::move(r);
+}
+
+void NetworkAgentPluginAdapter::set_mtls_resolver(MtlsResolver r) {
+    std::lock_guard<std::mutex> lk(m_resolver_mu);
+    m_mtls_resolver = std::move(r);
 }
 
 namespace {
@@ -324,7 +330,56 @@ int NetworkAgentPluginAdapter::send_message_to_printer(
         int(m_agent->is_server_connected()),
         json_payload.c_str());
     std::fflush(stderr);
-    return rc_lan;
+    if (rc_lan == 0) return 0;
+
+    // Plugin's cloud + LAN paths both failed (the long-known
+    // "proprietary plugin won't send from non-UI contexts" issue —
+    // see project memory feedback_proprietary_lib.md). Fall back to
+    // raw OpenSSL + client-cert direct publish to the printer's LAN
+    // MQTT broker, which firmware accepts regardless of how the
+    // payload originated. Skipped when no resolver was installed
+    // (e.g. embedded GUI mode where the plugin path normally works).
+    MtlsResolver resolver;
+    {
+        std::lock_guard<std::mutex> lk(m_resolver_mu);
+        resolver = m_mtls_resolver;
+    }
+    if (!resolver) return rc_lan;
+
+    MtlsTarget tgt;
+    if (!resolver(dev_id, tgt)
+        || tgt.printer_ip.empty()
+        || tgt.cert_path.empty()
+        || tgt.key_path.empty()) {
+        std::fprintf(stderr,
+            "[adapter] mtls-fallback dev=%s skipped "
+            "(ip=%s cert=%s key=%s ac_len=%zu)\n",
+            dev_id.c_str(),
+            tgt.printer_ip.empty() ? "<empty>" : tgt.printer_ip.c_str(),
+            tgt.cert_path.empty()  ? "<empty>" : tgt.cert_path.c_str(),
+            tgt.key_path.empty()   ? "<empty>" : tgt.key_path.c_str(),
+            tgt.access_code.size());
+        std::fflush(stderr);
+        return rc_lan;
+    }
+
+    bridge::router::RawMqttPublishConfig cfg;
+    cfg.dev_id          = dev_id;
+    cfg.printer_ip      = tgt.printer_ip;
+    cfg.printer_port    = 8883;
+    cfg.access_code     = tgt.access_code;
+    cfg.mtls_cert_path  = tgt.cert_path;
+    cfg.mtls_key_path   = tgt.key_path;
+
+    const std::string topic = "device/" + dev_id + "/request";
+    std::vector<uint8_t> payload(json_payload.begin(), json_payload.end());
+    int rc_raw = bridge::router::raw_mqtt_publish_oneshot(
+        cfg, topic, payload, static_cast<uint8_t>(qos));
+    std::fprintf(stderr,
+        "[adapter] mtls-fallback dev=%s topic=%s bytes=%zu rc=%d\n",
+        dev_id.c_str(), topic.c_str(), payload.size(), rc_raw);
+    std::fflush(stderr);
+    return rc_raw;
 }
 
 int NetworkAgentPluginAdapter::start_local_print_with_record(

@@ -227,6 +227,15 @@ struct MqttBroker::Device {
 
         // Per-session client-id from CONNECT, for logging.
         std::string client_id;
+
+        // Lifetime sentinel held by both this Session AND the downstream
+        // publisher lambda. Flipped to true by Cleanup when this session
+        // tears down; the publisher checks it before touching `ssl`/`fd`,
+        // so a stale publisher entry that survives past session destruction
+        // (because attach_downstream stays wired until the NEXT session
+        // overwrites it — required to avoid the slicer-reconnect race that
+        // otherwise blackholes push_status for 30 s) can no-op safely.
+        std::shared_ptr<std::atomic<bool>> dead { std::make_shared<std::atomic<bool>>(false) };
     };
 
     // Pointers, not values, because std::thread inside Session makes
@@ -565,8 +574,22 @@ void session_io_loop(MqttBroker::Device* dev,
         bool                          notified = false;
         ~Cleanup() {
             sess->stopped.store(true);
+            // Flip the publisher's lifetime sentinel BEFORE notifying the
+            // uplink. A stale publisher lambda still in the downstreams
+            // map (because we deliberately don't call attach_downstream
+            // (nullptr) here — see the Session::dead comment) will now
+            // no-op instead of touching the soon-to-be-freed ssl/fd.
+            if (sess->dead) sess->dead->store(true);
             if (!notified && uplink) {
-                uplink->attach_downstream(dev->spec.dev_id, nullptr);
+                // Intentionally NOT clearing the downstream publisher:
+                // a concurrent new-session attach for this dev_id can land
+                // BEFORE this destructor runs (slicer set_selected_machine
+                // disconnect+reconnect is racey by design), and nulling
+                // here would overwrite the live wiring → 30 s push_status
+                // blackhole before the slicer gives up and re-clicks.
+                // The next session's attach_downstream naturally overwrites
+                // this entry; the captured `dead` flag guarantees the old
+                // lambda is a safe no-op until then.
                 uplink->on_disconnect(dev->spec.dev_id);
             }
         }
@@ -697,9 +720,16 @@ void session_io_loop(MqttBroker::Device* dev,
         // silently filtered out at the broker.
         const std::string real_sn    = dev->spec.dev_id;
         const std::string virtual_sn = dev->spec.virtual_dev_id;
+        // Capture the session's lifetime sentinel by VALUE (shared_ptr).
+        // The shared_ptr keeps the atomic<bool> alive even if this Session
+        // struct is reaped and destroyed — Cleanup flips it true before
+        // teardown, and this lambda short-circuits without touching the
+        // dangling sess pointer.
+        auto dead_flag = sess->dead;
         IUplink::DownstreamPublisher publisher =
-            [sess, real_sn, virtual_sn]
+            [sess, real_sn, virtual_sn, dead_flag]
             (std::string topic, std::vector<uint8_t> payload, uint8_t qos) {
+                if (dead_flag && dead_flag->load()) return;
                 if (sess->stopped.load()) return;
                 if (!virtual_sn.empty() && virtual_sn != real_sn) {
                     auto pos = topic.find(real_sn);

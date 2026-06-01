@@ -8,6 +8,7 @@
 #include "slic3r/GUI/I18N.hpp"
 
 #include "../../Utils/NetworkAgent.hpp"
+#include "../../Utils/PluginTrace.hpp"
 #include "../BitmapCache.hpp"
 
 #include <boost/algorithm/hex.hpp>
@@ -1451,6 +1452,19 @@ boost::uint32_t PrinterFileSystem::SendRequest(int type, json const &req, callba
     root["cmdtype"] = type;
     root["sequence"] = seq;
     root["req"] = req;
+    // [plugincall] trace — gated on BAMBU_BRIDGE_PLUGIN_TRACE=1 same as
+    // the NetworkAgent::* trace. Storage / file-browsing requests don't
+    // go through the plugin's send_message export; they ride on the
+    // bambu_source FileTransferTunnel, so they aren't visible there.
+    // Mirror them here so the trace captures the storage round-trips a
+    // user makes when visiting Timelapse / Models pages.
+    {
+        std::string req_str = Slic3r::plugin_trace::truncate(req.dump());
+        Slic3r::plugin_trace::log_event(
+            "PrinterFileSystem.SendRequest cmdtype=%d seq=%u req=%s param_bytes=%zu",
+            type, seq, req_str.c_str(), param.size());
+        Slic3r::plugin_trace::dump_stack("PrinterFileSystem.SendRequest");
+    }
     std::ostringstream oss;
     oss << root;
 

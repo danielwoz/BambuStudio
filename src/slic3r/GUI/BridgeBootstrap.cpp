@@ -58,6 +58,30 @@ namespace Slic3r {
 namespace GUI {
 namespace BridgeBootstrap {
 
+// Install the mTLS fallback resolver on a freshly-constructed adapter.
+// Lets `send_message_to_printer` dial the printer's LAN broker directly
+// when the proprietary plugin's cloud + LAN paths both fail (the long-
+// known "plugin won't send from non-UI contexts" issue documented in
+// project memory feedback_proprietary_lib.md). Sources lan_ip +
+// access_code + cert paths from BridgeApp's m_devices table.
+static void install_mtls_resolver(
+        Slic3r::NetworkAgentPluginAdapter& adapter,
+        Slic3r::bridge::headless::BridgeApp* bridge_app) {
+    if (!bridge_app) return;
+    adapter.set_mtls_resolver(
+        [bridge_app](const std::string&                                 dev_id,
+                     Slic3r::NetworkAgentPluginAdapter::MtlsTarget&     out)
+            -> bool {
+            Slic3r::bridge::headless::BridgeApp::MtlsInfo info;
+            if (!bridge_app->mtls_info_for(dev_id, info)) return false;
+            out.printer_ip  = info.lan_ip;
+            out.access_code = info.access_code;
+            out.cert_path   = info.cert_path;
+            out.key_path    = info.key_path;
+            return true;
+        });
+}
+
 // Install the per-printer capability resolver on a freshly-constructed
 // NetworkAgentPluginAdapter. Three sites in this file construct an
 // adapter (and one more in BridgeOnlyConsoleApp.cpp); each needs to
@@ -690,6 +714,7 @@ bool run_headless(GUI_App* app)
             auto adapter =
                 std::make_shared<Slic3r::NetworkAgentPluginAdapter>(app->m_agent);
             install_print_dispatcher_resolver(*adapter, app);
+            install_mtls_resolver(*adapter, app->m_bridge_app.get());
             app->m_bridge_app->attach_plugin_handle(std::move(adapter));
         } else {
             BOOST_LOG_TRIVIAL(warning)
@@ -964,6 +989,7 @@ void install_gui_worker(GUI_App* app)
             auto adapter =
                 std::make_shared<Slic3r::NetworkAgentPluginAdapter>(app->m_agent);
             install_print_dispatcher_resolver(*adapter, app);
+            install_mtls_resolver(*adapter, app->m_bridge_app.get());
             app->m_bridge_app->attach_plugin_handle(std::move(adapter));
         }
 

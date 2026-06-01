@@ -304,6 +304,17 @@ set_target_properties(NullCameraSourceTest PROPERTIES
 )
 add_test(NAME NullCameraSourceTest COMMAND NullCameraSourceTest)
 
+# CameraFrameFanoutTest — single-reader many-watcher contract for the
+# fan-out layer. Pure unit (no plugin / no network), uses NullCameraSource
+# upstream so the test is deterministic and fast (~1 s).
+add_executable(CameraFrameFanoutTest CameraFrameFanoutTest.cpp)
+target_link_libraries(CameraFrameFanoutTest PRIVATE bambu_bridge)
+set_target_properties(CameraFrameFanoutTest PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+add_test(NAME CameraFrameFanoutTest COMMAND CameraFrameFanoutTest)
+
 # ---- Phase 8 follow-up: LAN/Cloud camera source plugin route -----------
 #
 # LanCameraSourcePluginTest    — drives LanCameraSource against a mock

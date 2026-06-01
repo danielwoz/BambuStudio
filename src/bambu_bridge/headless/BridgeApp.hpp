@@ -156,12 +156,16 @@ struct BridgeAppConfig {
     std::string cert_dir;
     std::string cert_file;
 
-    // How long a device's lan_ip stays valid after the last SSDP
-    // NOTIFY from that printer. Real Bambu firmware announces every
-    // ~30 s; we give 4× that before assuming the printer left the LAN
-    // (or rebooted to cloud-only) and clear the field. Cleared lan_ips
-    // come back to non-empty the next time the listener hears the
-    // device.
+    // How long a device's lan_ip stays valid after the last
+    // confirmation. Real Bambu firmware announces every ~30 s via SSDP;
+    // cloud REST also reports lan_ip when the printer recently phoned
+    // home from inside the user's LAN. EITHER source acts as a
+    // freshness ping — the field is only cleared when neither has
+    // confirmed the lan_ip within this window. (Treating cloud REST as
+    // equivalent to SSDP NOTIFY matters for multi-process bridge
+    // topologies where SSDP multicast lands on a sibling process.)
+    // Cleared lan_ips come back to non-empty the next time either
+    // source reports the device.
     std::chrono::seconds lan_ip_stale_after{120};
 
     // If non-empty, reconcile_once silently drops every printer whose
@@ -424,6 +428,20 @@ public:
     };
     std::vector<DeviceBinding> device_bindings() const;
 
+    // Per-printer mTLS lookup — used by NetworkAgentPluginAdapter as
+    // its `send_message_to_printer` fallback. `lan_ip` + `access_code`
+    // come from m_devices (populated by reconcile_once / SSDP), and
+    // the cert paths are produced by the same resolve_mtls_paths()
+    // routine that update_lan_ip_locked uses. Returns false when the
+    // dev_id is unknown or the cert files don't exist.
+    struct MtlsInfo {
+        std::string lan_ip;
+        std::string access_code;
+        std::string cert_path;
+        std::string key_path;
+    };
+    bool mtls_info_for(const std::string& dev_id, MtlsInfo& out) const;
+
 private:
     struct DeviceState; // defined below as a nested type
     // Build the plugin / inventory / routers / servers. Returns true on
@@ -439,6 +457,14 @@ private:
     // Body of one poll iteration: refresh inventory, diff vs. our table,
     // apply add/remove/lan_ip-change.
     void reconcile_once();
+
+    // Clear DeviceState::lan_ip for entries whose lan_ip_last_seen is
+    // older than lan_ip_stale_after. Runs after the snapshot is applied
+    // so cloud-REST freshness pings get a chance to stamp the
+    // timestamp; running it BEFORE the snapshot causes a churn loop in
+    // SSDP-blocked topologies (see comment in reconcile_once).
+    // Takes m_devices_mu internally.
+    void expire_stale_lan_ips();
 
     // The thread function.
     void poll_loop();

@@ -43,6 +43,8 @@
 
 #include "RtspServer.hpp"
 
+#include "../router/CameraFrameFanout.hpp"
+
 #include "ICameraSource.hpp"
 #include "RtspJpegPacketiser.hpp"
 
@@ -852,6 +854,13 @@ struct RtspServer::Device {
     int               listen_fd  = -1;
     uint16_t          bound_port = 0;
 
+    // Single-reader fan-out wrapper around `spec.source`. One reader thread
+    // drains the upstream regardless of how many slicer sessions are
+    // currently watching (or zero) — solves the SDK-frame-drop issue
+    // observed empirically and lets `max_sessions_per_device > 1` actually
+    // serve concurrent watchers from the same upstream stream.
+    std::shared_ptr<router::CameraFrameFanout> fanout;
+
     std::atomic<bool> stopped{false};
     std::thread       accept_thread;
 
@@ -890,6 +899,9 @@ void RtspServer::add_device(RtspVirtualDevice dev) {
                                      + d->spec.dev_id);
         }
     }  // else: plain RTSP, no TLS context
+    if (d->spec.source) {
+        d->fanout = router::CameraFrameFanout::create(d->spec.source);
+    }
     Device* raw = d.get();
     {
         std::lock_guard<std::mutex> lk(m_devices_mu);
@@ -959,7 +971,18 @@ void session_io_loop(RtspServer::Device* dev,
     }
 
     auto src = dev->spec.source;
-    if (src && !src->is_open()) (void)src->open();
+    auto fanout = dev->fanout;
+    // Open the fanout (which opens the upstream source as a side effect)
+    // so the reader thread starts. Idempotent — concurrent sessions all
+    // hit the `m_running` short-circuit. We do NOT also call src->open()
+    // here: that would double-trigger the upstream's open() and (for
+    // CloudCameraSource) burn two 10 s plugin timeouts on failure.
+    if (fanout && !fanout->is_open()) (void)fanout->open();
+    if (!fanout && src && !src->is_open()) (void)src->open(); // legacy path
+    // Per-session cursor — allocated lazily on first PLAY so DESCRIBE-only
+    // sessions don't claim a cursor slot. Released when the session
+    // unwinds (cursor's dtor runs).
+    std::shared_ptr<router::CameraFrameFanout::Cursor> cursor;
 
     const auto rd_timeout = std::chrono::seconds(cfg.io_timeout_seconds > 0
                                                   ? cfg.io_timeout_seconds : 90);
@@ -1034,8 +1057,17 @@ void session_io_loop(RtspServer::Device* dev,
         // While PLAY-ing, pump frames between control reads. We use a
         // bounded sleep inside next_frame so the control channel stays
         // responsive (TEARDOWN should land within ~100ms).
-        if (playing && src) {
-            auto frame = src->next_frame(33);
+        if (playing && (cursor || src)) {
+            // Lazy-allocate the fanout cursor on the first PLAY iteration
+            // so DESCRIBE-only sessions don't take a slot. If no fanout is
+            // wired (legacy / test path), fall back to direct source pull.
+            if (!cursor && fanout) cursor = fanout->create_cursor();
+            std::optional<VideoFrame> frame;
+            if (cursor) {
+                frame = cursor->next_frame(33);
+            } else if (src) {
+                frame = src->next_frame(33);
+            }
             if (frame) {
                 if (!stream_one_frame(*frame)) {
                     return;
@@ -1274,6 +1306,10 @@ void RtspServer::stop_device(Device& d) {
         if (s->ssl) { SSL_free(s->ssl); s->ssl = nullptr; }
         if (s->fd >= 0) { ::close(s->fd); s->fd = -1; }
     }
+    // Stop the fanout reader thread BEFORE closing the upstream — the
+    // reader calls upstream->next_frame and we want it joined before
+    // the source vanishes. The fanout's close() is idempotent.
+    if (d.fanout) d.fanout->close();
     if (d.spec.source) d.spec.source->close();
 }
 

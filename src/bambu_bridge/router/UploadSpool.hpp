@@ -21,10 +21,18 @@ namespace Slic3r {
 namespace bridge {
 namespace router {
 
-// Spool the job's bytes to a fresh `${TMPDIR}/bridge-upload-XXXXXX`
-// tempfile (mode 0600 — print payloads may carry proprietary G-code).
+// Spool the job's bytes to a fresh `${TMPDIR}/bridge-upload-XXXXXX/<name>`
+// (mode 0600 — print payloads may carry proprietary G-code). `<name>`
+// is the slicer-supplied filename (sanitised — basename only, `.3mf`
+// suffix forced if missing) so the plugin sees the same file naming
+// the GUI's SendJob would feed it (`MyProject_plate_3.3mf`, …).
 // Returns the absolute path on success, empty string on failure.
 std::string spool_upload_to_tempfile(const server::UploadJob& job);
+
+// Counterpart cleanup — remove the spooled file AND the per-job
+// tempdir spool_upload_to_tempfile() created. Safe to call with an
+// empty string (no-op).
+void cleanup_upload_tempfile(const std::string& path);
 
 } // namespace router
 } // namespace bridge

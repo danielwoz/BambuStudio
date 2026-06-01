@@ -41,6 +41,14 @@ struct RawMqttPublishConfig {
     std::string access_code;         // 8-char printer access code (password)
     std::chrono::seconds connect_timeout{5};
     std::chrono::seconds io_timeout{5};
+    // Optional: client cert + key for mTLS. Both empty = plain TLS without
+    // client cert (current behaviour, fine for printer-side read-only LAN
+    // broker). For control commands (`print.command=*`) the printer's
+    // firmware ENFORCES client-cert auth — see feedback_proprietary_lib.md
+    // in project memory — and `raw_mqtt_publish_oneshot` is the entry
+    // point the adapter uses to bypass the proprietary plugin's gate.
+    std::string mtls_cert_path;
+    std::string mtls_key_path;
 };
 
 // Synchronous one-shot publish. Returns 0 on success, negative on

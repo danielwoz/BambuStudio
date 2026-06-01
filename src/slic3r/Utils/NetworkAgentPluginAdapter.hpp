@@ -105,12 +105,35 @@ public:
         std::string&               ftp_folder_out)>;
     void set_dispatcher_inputs_resolver(DispatcherInputsResolver r);
 
+    // Per-printer mTLS lookup. Used by `send_message_to_printer` as a
+    // FALLBACK when the proprietary plugin's cloud + LAN paths both
+    // fail (rc_cloud=-2 / rc_lan=-4 — the long-known
+    // "plugin won't send from non-UI contexts" issue documented in
+    // memory feedback_proprietary_lib.md). With these fields the
+    // adapter can dial the printer's LAN broker directly using raw
+    // OpenSSL + client cert, which the printer firmware accepts for
+    // every payload class (status reads, `print.command=*`, tier2, …).
+    //
+    // Resolver returns true and fills `out` when info is available for
+    // `dev_id`; returns false to skip the fallback (and the plugin's
+    // rc is propagated as-is).
+    struct MtlsTarget {
+        std::string printer_ip;     // e.g. "192.168.1.209"
+        std::string access_code;    // 8-char LAN access code (broker password)
+        std::string cert_path;      // absolute path to client cert chain (PEM)
+        std::string key_path;       // absolute path to client private key (PEM)
+    };
+    using MtlsResolver = std::function<bool(const std::string& dev_id,
+                                            MtlsTarget&        out)>;
+    void set_mtls_resolver(MtlsResolver r);
+
 private:
     NetworkAgent*       m_agent { nullptr };  // non-owning, GUI_App owns it
     std::atomic<bool>   m_local_connected { false };
 
     mutable std::mutex          m_resolver_mu;
     DispatcherInputsResolver    m_inputs_resolver; // optional; nullptr-safe
+    MtlsResolver                m_mtls_resolver;   // optional; nullptr-safe
 };
 
 } // namespace Slic3r

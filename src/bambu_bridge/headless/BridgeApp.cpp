@@ -652,28 +652,6 @@ void BridgeApp::teardown() {
 // ---------------------------------------------------------------------------
 
 void BridgeApp::reconcile_once() {
-    // Expire stale lan_ip entries before sourcing this tick's snapshot.
-    // The SsdpListener stamps DeviceState::lan_ip_last_seen on each
-    // heard NOTIFY; if we haven't heard from a printer in
-    // m_cfg.lan_ip_stale_after we assume it dropped off the LAN and
-    // clear the field. A subsequent broadcast will repopulate it.
-    {
-        std::lock_guard<std::mutex> lk(m_devices_mu);
-        const auto now = std::chrono::steady_clock::now();
-        for (auto& kv : m_devices) {
-            auto& s = kv.second;
-            if (s.lan_ip.empty()) continue;
-            // Devices added with a non-empty cloud-supplied lan_ip get
-            // their timestamp seeded at add time, so this check is
-            // safe even before the first listener NOTIFY arrives.
-            if (s.lan_ip_last_seen.time_since_epoch().count() == 0) continue;
-            if (now - s.lan_ip_last_seen <= m_cfg.lan_ip_stale_after)
-                continue;
-            s.lan_ip.clear();
-            s.lan_ip_last_seen = {};
-        }
-    }
-
     // Host-driven path: GUI hands us its DeviceManager snapshot via the
     // `printer_source` callback. Preferred when running inside
     // BambuStudio's GUI worker thread so the bridge never touches the
@@ -686,6 +664,7 @@ void BridgeApp::reconcile_once() {
             return;
         }
         set_virtual_printers(std::move(printers));
+        expire_stale_lan_ips();
         return;
     }
 
@@ -693,12 +672,18 @@ void BridgeApp::reconcile_once() {
     // polls cloud inventory directly. Only runs when host_drives_inventory
     // was off, which is what gates m_inventory's construction.
     if (!m_inventory) {
+        expire_stale_lan_ips();
         return;
     }
 
     const bool ok = m_inventory->refresh();
     m_inventory->probe_lan_reachability();
     auto snap = m_inventory->snapshot();
+    std::fprintf(stderr,
+        "[bridge-app] reconcile: inventory.refresh ok=%d snap.size=%zu "
+        "only_dev_ids.size=%zu\n",
+        int(ok), snap.size(), m_cfg.only_dev_ids.size());
+    std::fflush(stderr);
     // Lift CloudDevice -> VirtualPrinter and route through the common
     // host-driven path so we don't have two reconcile implementations.
     std::vector<VirtualPrinter> printers;
@@ -722,9 +707,49 @@ void BridgeApp::reconcile_once() {
         printers.push_back(std::move(p));
     }
     set_virtual_printers(std::move(printers));
+
+    // Expire stale lan_ip entries AFTER applying the snapshot. The
+    // snapshot loop stamps lan_ip_last_seen for any printer the cloud
+    // REST still vouches for — only entries that neither SSDP nor cloud
+    // REST has confirmed within lan_ip_stale_after get cleared here.
+    // Running the clear before the snapshot caused churn: state.lan_ip
+    // would expire to "", the very next snapshot would set it back to
+    // the same 192.168.1.x, and update_lan_ip_locked would tear down
+    // and rebuild the plugin LAN session every tick — blacking out
+    // push_status for several seconds at a time.
+    expire_stale_lan_ips();
+}
+
+void BridgeApp::expire_stale_lan_ips() {
+    std::lock_guard<std::mutex> lk(m_devices_mu);
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& kv : m_devices) {
+        auto& s = kv.second;
+        if (s.lan_ip.empty()) continue;
+        // Devices added with a non-empty cloud-supplied lan_ip get
+        // their timestamp seeded at add time, so this check is safe
+        // even before the first listener NOTIFY arrives.
+        if (s.lan_ip_last_seen.time_since_epoch().count() == 0) continue;
+        if (now - s.lan_ip_last_seen <= m_cfg.lan_ip_stale_after)
+            continue;
+        s.lan_ip.clear();
+        s.lan_ip_last_seen = {};
+    }
 }
 
 void BridgeApp::set_virtual_printers(std::vector<VirtualPrinter> printers) {
+    // Diagnostic: who is calling us with what.
+    {
+        std::string ids;
+        for (const auto& p : printers) {
+            if (!ids.empty()) ids += ",";
+            ids += p.dev_id;
+        }
+        std::fprintf(stderr,
+            "[bridge-app] set_virtual_printers count=%zu ids=[%s]\n",
+            printers.size(), ids.c_str());
+        std::fflush(stderr);
+    }
     // BAMBU_BRIDGE_PRINTER_ORDER (comma-separated dev_ids) forces the
     // index assignment order, which in turn fixes the per-printer MQTT
     // / FTPS / RTSP / vtun port assignments (port = base + index).
@@ -858,8 +883,21 @@ void BridgeApp::set_virtual_printers(std::vector<VirtualPrinter> printers) {
         if (it == m_devices.end()) {
             add_device_locked(p);
         } else {
-            if (!p.lan_ip.empty() && it->second.lan_ip != p.lan_ip)
-                update_lan_ip_locked(it->second, p.lan_ip);
+            if (!p.lan_ip.empty()) {
+                if (it->second.lan_ip != p.lan_ip)
+                    update_lan_ip_locked(it->second, p.lan_ip);
+                // Cloud-REST confirmation of the printer's lan_ip counts
+                // as a freshness ping equivalent to an SSDP NOTIFY. Without
+                // this, a printer behind SSDP-blocking topology (or one
+                // whose NOTIFYs are absorbed by a sibling bridge process in
+                // multi-process mode) gets its uplink torn down + rebuilt
+                // every `lan_ip_stale_after` — and each tear-down blacks
+                // out push_status for several seconds, tripping the
+                // slicer's 30 s monitor timeout when the user navigates to
+                // the Device page during a churn window.
+                it->second.lan_ip_last_seen =
+                    std::chrono::steady_clock::now();
+            }
             // Firmware version arrives later than the device add
             // (push_status from cloud has to land first). Keep the
             // tracked state and the vtun spec in sync on every push.
@@ -1457,6 +1495,24 @@ std::vector<BridgeApp::DeviceBinding> BridgeApp::device_bindings() const {
         out.push_back(std::move(b));
     }
     return out;
+}
+
+bool BridgeApp::mtls_info_for(const std::string& dev_id, MtlsInfo& out) const {
+    {
+        std::lock_guard<std::mutex> lk(m_devices_mu);
+        auto it = m_devices.find(dev_id);
+        if (it == m_devices.end()) return false;
+        out.lan_ip      = it->second.lan_ip;
+        out.access_code = it->second.access_code;
+    }
+    // resolve_mtls_paths is the same helper update_lan_ip_locked uses
+    // to wire LanUplink's mTLS config; sharing it keeps the cert lookup
+    // contract identical (env overrides, suffix match in
+    // /tmp/bbl_capture/mtls.fresh/paired/, …).
+    auto paths = resolve_mtls_paths(dev_id);
+    out.cert_path = paths.first;
+    out.key_path  = paths.second;
+    return !out.cert_path.empty() && !out.key_path.empty();
 }
 
 } // namespace headless
