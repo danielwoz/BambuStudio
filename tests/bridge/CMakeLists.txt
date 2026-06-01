@@ -249,7 +249,10 @@ add_test(NAME CloudUploadSinkTest COMMAND CloudUploadSinkTest)
 # instead of a raw FTPS client) against a MockPluginHandle that reads
 # back the spooled tempfile to byte-verify the upload payload.
 add_executable(LanUploadSinkPluginTest LanUploadSinkPluginTest.cpp)
-target_link_libraries(LanUploadSinkPluginTest PRIVATE bambu_bridge)
+# bambu_bridge's LanUploadSink uses miniz directly for the .3mf rewriters
+# (plate normalisation + filament_settings injection). The static lib
+# doesn't propagate that dependency, so add it here.
+target_link_libraries(LanUploadSinkPluginTest PRIVATE bambu_bridge miniz)
 set_target_properties(LanUploadSinkPluginTest PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON

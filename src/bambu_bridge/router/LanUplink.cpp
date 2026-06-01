@@ -448,29 +448,16 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
         dev_id.c_str(), rc);
     std::fflush(stderr);
     if (rc == 0) {
-        {
-            std::lock_guard<std::mutex> lk(m_impl->mu);
-            m_impl->current_connected_dev_id = dev_id;
-        }
-        // enc_msg gate-open, tied to the ACTUAL LAN-connect moment.
-        // The plugin's device_pub_key_map[dev_id] (read by
-        // apply_enc_msg_gate before signing print.*) only populates from
-        // the printer's cert_report reply to a cert_request, and that
-        // request must ride a LIVE LAN socket. The startup cascade fires
-        // install_device_cert on a timer that races (and the post-connect
-        // swap when a slicer attaches leaves a fresh session with no cert
-        // handshake) — so fire it here, on a short detached delay to let
-        // the just-opened session settle. See project_plugin_enc_gate.
-        std::thread([h, dev_id] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-            int sel = h->set_user_selected_machine(dev_id);
-            h->install_device_cert(dev_id, /*lan_only=*/false);
-            std::fprintf(stderr,
-                "[lan-uplink] post-connect enc_msg gate-open dev=%s "
-                "set_user_selected_machine rc=%d + install_device_cert\n",
-                dev_id.c_str(), sel);
-            std::fflush(stderr);
-        }).detach();
+        std::lock_guard<std::mutex> lk(m_impl->mu);
+        m_impl->current_connected_dev_id = dev_id;
+        // No timer-based set_user_selected_machine + install_device_cert
+        // here. The stock GUI fires those inside set_on_printer_connected_fn
+        // (GUI_App::init_networking_callbacks) when the plugin reports
+        // the device has connected — not on an arbitrary 1.5 s delay
+        // after our own add_device. The "be identical to the GUI"
+        // branch trusts the plugin's natural connected-event to drive
+        // them. See experiment/identical-to-gui branch rationale +
+        // project_plugin_enc_gate memory.
     }
 }
 

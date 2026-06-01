@@ -2071,6 +2071,8 @@ void GUI_App::init_networking_callbacks()
 
 
         m_agent->set_on_server_connected_fn([this](int return_code, int reason_code) {
+            std::fprintf(stderr, "[gui-callback] set_on_server_connected_fn FIRED rc=%d reason=%d\n", return_code, reason_code);
+            std::fflush(stderr);
             if (is_closing()) {
             return;
             }
@@ -2126,6 +2128,8 @@ void GUI_App::init_networking_callbacks()
             });
 
         m_agent->set_on_printer_connected_fn([this](std::string dev_id) {
+            std::fprintf(stderr, "[gui-callback] set_on_printer_connected_fn FIRED dev=%s\n", dev_id.c_str());
+            std::fflush(stderr);
             if (is_closing()) {
                 return;
             }
@@ -2135,6 +2139,11 @@ void GUI_App::init_networking_callbacks()
                 bool tunnel = boost::algorithm::starts_with(dev_id, "tunnel/");
                 /* request_pushing */
                 MachineObject* obj = m_device_manager->get_my_machine(tunnel ? dev_id.substr(7) : dev_id);
+                std::fprintf(stderr,
+                    "[gui-callback] set_on_printer_connected_fn callafter dev=%s "
+                    "tunnel=%d obj=%p\n",
+                    dev_id.c_str(), int(tunnel), (void*)obj);
+                std::fflush(stderr);
                 if (obj) {
 //#if !BBL_RELEASE_TO_PUBLIC && defined(__WINDOWS__)
 //                    if (obj->is_tunnel_mqtt && !tunnel)

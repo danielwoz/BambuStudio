@@ -833,6 +833,40 @@ void install_gui_worker(GUI_App* app)
         return;
     }
 
+    // Pin user_last_selected_machine = BAMBU_BRIDGE_TARGET_DEV so the
+    // stock GUI's natural startup path
+    // (m_load_last_machine.InnerLoad → DeviceManager::set_selected_machine
+    //  → m_agent->set_user_selected_machine → plugin cloud subscribe →
+    //  set_on_printer_connected_fn → bootstrap triplet)
+    // selects THIS child's printer without needing an interactive
+    // Device-tab click. Replaces the bridge-only "device-tab-sim"
+    // cascade that used to live downstream of here.
+    //
+    // app_config is wxWidgets-owned and persists keys we set via ->set
+    // here through subsequent slicer saves; pre-edits to BambuStudio
+    // .conf get clobbered on first save because the slicer's known-
+    // keys map drops anything it didn't explicitly set in-process.
+    if (const char* td = std::getenv("BAMBU_BRIDGE_TARGET_DEV");
+        td && *td && app && app->app_config) {
+        // BAMBU_BRIDGE_TARGET_DEV may carry a comma-separated list
+        // (multi-process launcher passes one dev_id per child but the
+        // legacy single-process mode allowed several); the GUI's
+        // user_last_selected_machine slot only holds one. Pick the
+        // first — that's the canonical printer for this child.
+        std::string val = td;
+        const auto comma = val.find(',');
+        if (comma != std::string::npos) val.resize(comma);
+        if (!val.empty()) {
+            app->app_config->set("user_last_selected_machine", val);
+            std::fprintf(stderr,
+                "[bridge-gui] pinned user_last_selected_machine=%s "
+                "(from BAMBU_BRIDGE_TARGET_DEV) so InnerLoad selects "
+                "this printer without a Device-tab click\n",
+                val.c_str());
+            std::fflush(stderr);
+        }
+    }
+
     // Bambu Bridge — GUI worker thread. Runs in the same process so other
     // slicers on the LAN see this BambuStudio's cloud-bound printers as
     // virtual LAN devices for the lifetime of the session.
@@ -1110,282 +1144,25 @@ void install_gui_worker(GUI_App* app)
         // _machine + install_device_cert + the post-LAN cycle) still
         // needs the plugin's agent — ship-2 only replaces the SESSION +
         // DEVICE-LIST steps, not the enc_msg gate cycle. So both paths
-        // converge into the same finish_cascade() helper below.
+        // converge to feed the plugin the user_machinelist; the bridge
+        // then trusts the GUI's natural set_on_server_connected_fn /
+        // set_on_printer_connected_fn callbacks (installed by
+        // GUI_App::init_networking_callbacks, identical to the stock
+        // GUI) to drive set_user_selected_machine + command_request_push_all
+        // / get_version / get_access_code / install_device_cert exactly
+        // as the GUI does on an interactive Device-tab click.
+        //
+        // Earlier revisions ran an explicit `finish_cascade` here that
+        // synthesised a per-printer cert_report retry cycle + a
+        // device-tab-sim + a proof-of-life probe. None of that exists
+        // in the stock GUI; empirically the proprietary plugin's
+        // send_message refuses publishes that originate from a non-GUI-
+        // driven code path with rc_cloud=-2 regardless of how aggressive
+        // the synthesised retries are. Removing the simulation lets the
+        // plugin's natural state machine run unmolested. See
+        // experiment/identical-to-gui branch rationale.
         if (app->m_agent) {
-            // Inner helper: after the userMachineList is populated by
-            // either path, run the per-dev plugin setup + post-LAN
-            // cycle + probe. Captures `app` from the surrounding scope.
-            auto finish_cascade = [app] {
-                using namespace std::chrono_literals;
-                for (int i = 0; i < 30; ++i) {
-                    std::this_thread::sleep_for(1000ms);
-                    if (!app->m_device_manager) continue;
-                    auto list = app->m_device_manager->get_user_machinelist();
-                    if (list.empty()) continue;
-                    std::vector<std::string> dev_ids;
-                    for (const auto& kv : list)
-                        if (!kv.first.empty()) dev_ids.push_back(kv.first);
-                    // Multi-process: when BAMBU_BRIDGE_TARGET_DEV pins this
-                    // process to specific printer(s), restrict the cert
-                    // cascade to those. Cycling non-served, non-LAN-connected
-                    // dev_ids (set_user_selected_machine on a printer this
-                    // process never connect_printer'd) churns the plugin's
-                    // active-machine state and races the served printer's
-                    // cert_report — leaving its device_pub_key_map empty.
-                    if (const char* td = std::getenv("BAMBU_BRIDGE_TARGET_DEV");
-                        td && *td) {
-                        std::vector<std::string> keep;
-                        const std::string s = td; size_t pos = 0;
-                        while (pos <= s.size()) {
-                            const size_t c = s.find(',', pos);
-                            const size_t e = (c == std::string::npos) ? s.size() : c;
-                            if (e > pos) keep.push_back(s.substr(pos, e - pos));
-                            if (c == std::string::npos) break;
-                            pos = c + 1;
-                        }
-                        dev_ids.erase(std::remove_if(dev_ids.begin(), dev_ids.end(),
-                            [&keep](const std::string& d){
-                                return std::find(keep.begin(), keep.end(), d) == keep.end();
-                            }), dev_ids.end());
-                    }
-                    std::fprintf(stderr,
-                        "[bridge-gui] cascade ready, %zu owned dev_ids; "
-                        "wiring per-printer plugin setup\n",
-                        dev_ids.size());
-                    std::fflush(stderr);
-                    auto* ag = app->m_agent;
-                    if (!dev_ids.empty()) {
-                        int add_rc = ag->add_subscribe(dev_ids);
-                        std::fprintf(stderr,
-                            "[bridge-gui] add_subscribe(%zu) rc=%d\n",
-                            dev_ids.size(), add_rc);
-                        std::fflush(stderr);
-                    }
-                    for (const auto& d : dev_ids) {
-                        int sel_rc = ag->set_user_selected_machine(d);
-                        ag->install_device_cert(d, /*lan_only=*/false);
-                        std::fprintf(stderr,
-                            "[bridge-gui] set_user_selected_machine(%s) "
-                            "rc=%d + install_device_cert(lan_only=false)\n",
-                            d.c_str(), sel_rc);
-                        std::fflush(stderr);
-                    }
-
-                    // ====================================================
-                    // Post-LAN enc_msg gate-open cycle.
-                    //
-                    // The proprietary plugin's `bambu_network_send_message`
-                    // (LAN path) gates print.* publishes through an
-                    // `apply_enc_msg_gate` check (RVA 0x1fa330 in the
-                    // unpacked .so). The gate reads the per-device public
-                    // key from `device_pub_key_map[dev_id]`, which is
-                    // populated by the `cert_report` MQTT round-trip
-                    // triggered by `install_device_cert` (RVA 0x247d10).
-                    // Until that map entry exists, send_message_to_printer
-                    // returns -4 (SEND_MSG_FAILED) and the publish is
-                    // silently dropped before it reaches the wire.
-                    //
-                    // After LAN sessions come up, a bulk refire of
-                    // install_device_cert opens the gate ONLY for the
-                    // last printer the plugin connected to (the plugin
-                    // keeps multiple TCP/TLS sockets open but only routes
-                    // the cert_report reply for the currently-active dev
-                    // selected via set_user_selected_machine). So we
-                    // cycle per dev_id:
-                    //
-                    //   1. set_user_selected_machine(d) — makes `d` the
-                    //      active LAN session in the plugin (the plugin's
-                    //      cloud send_message gate is also keyed off this).
-                    //   2. install_device_cert(d, false) — triggers a
-                    //      cert_report request on that session; the
-                    //      cert_report reply (printer → plugin) is what
-                    //      populates device_pub_key_map[d].
-                    //   3. Wait for the cert_report reply to land. 5s
-                    //      nominal — Exp A saw the prior 3s wait was
-                    //      flaky (-4 in ~1/3 launches) on H2S; 5s is
-                    //      well within typical LAN round-trip headroom
-                    //      and the cascade only runs once per bridge
-                    //      bring-up.
-                    //
-                    // No silent probe at the end of the wait: the only
-                    // way to probe via the plugin is to actually publish
-                    // a `print.*` payload, which firmware then schema-
-                    // checks and echoes back via `/report` with
-                    // result:"failed". Slicer observers subscribed to
-                    // `/report` would see those echoes. We trust the
-                    // wait window (Exp C/D both validated 3s was
-                    // sufficient when it didn't lose the race; 5s gives
-                    // margin) and only the rc of the install_device_cert
-                    // call is logged. If a downstream publish does
-                    // return -4 from send_message_to_printer, the
-                    // [lan-uplink] log line will surface it.
-                    //
-                    // See /mnt/cephfs/ssd/BambuBridge/EXP-{A..E}-RESULTS.md
-                    // and project_plugin_enc_gate memory for the
-                    // empirical / reverse-engineering paths that led here.
-                    // ====================================================
-                    std::this_thread::sleep_for(15s);
-                    std::fprintf(stderr,
-                        "[bridge-gui] post-LAN enc_msg gate-open cycle: "
-                        "select + install_cert per dev_id\n");
-                    std::fflush(stderr);
-                    // The cert_report round-trip is timing-flaky (a single
-                    // install_device_cert often loses the race and leaves
-                    // device_pub_key_map empty). It's idempotent, so retry a
-                    // few rounds per dev to make the gate-open reliable.
-                    for (int round = 0; round < 3; ++round) {
-                        for (const auto& d : dev_ids) {
-                            int sel_rc2 = ag->set_user_selected_machine(d);
-                            ag->install_device_cert(d, /*lan_only=*/false);
-                            std::fprintf(stderr,
-                                "[bridge-gui] (cycle r%d) dev=%s "
-                                "set_user_selected_machine rc=%d + "
-                                "install_device_cert; waiting 5s for cert_report\n",
-                                round, d.c_str(), sel_rc2);
-                            std::fflush(stderr);
-                            std::this_thread::sleep_for(5s);
-                        }
-                    }
-
-                    std::fprintf(stderr,
-                        "[bridge-gui] cascade ready: enc_msg gate cycle "
-                        "complete for %zu dev_ids; print.* writes will now "
-                        "route through plugin send_message_to_printer\n",
-                        dev_ids.size());
-                    std::fflush(stderr);
-
-                    // -------- Simulate GUI "device tab click" ---------------
-                    // The cascade above called m_agent->set_user_selected_machine
-                    // directly on the plugin handle. The real GUI flow goes
-                    // through DeviceManager::set_selected_machine which ALSO
-                    // calls obj->reset(), wxGetApp().on_start_subscribe_again,
-                    // and DeviceManager::check_pushing eventually fires the
-                    // first MachineObject::command_request_push_all (the
-                    // m_push_count==0 branch). Empirically, without that
-                    // fuller chain the plugin's per-dev cloud tunnel stays
-                    // inert — proof-of-life sees rc_cloud=-2 (or send-accept
-                    // / no-reply) even though login=1/server=1. Hop to the wx
-                    // main thread (DeviceManager + MachineObject are wx-owned)
-                    // and run the chain per dev_id BEFORE the proof-of-life
-                    // probe so the probe gets a fair test.
-                    app->CallAfter([app, dev_ids] {
-                        if (app->is_closing()) return;
-                        auto* dev = app->m_device_manager;
-                        if (!dev) {
-                            std::fprintf(stderr,
-                                "[bridge-gui] device-tab-sim: no DeviceManager\n");
-                            std::fflush(stderr);
-                            return;
-                        }
-                        for (const auto& d : dev_ids) {
-                            const bool ok = dev->set_selected_machine(d);
-                            MachineObject* obj = dev->get_my_machine(d);
-                            std::fprintf(stderr,
-                                "[bridge-gui] device-tab-sim dev=%s "
-                                "set_selected_machine=%d have_obj=%d\n",
-                                d.c_str(), int(ok), int(obj != nullptr));
-                            std::fflush(stderr);
-                            if (obj) {
-                                int rc = obj->command_request_push_all(/*request_now=*/true);
-                                std::fprintf(stderr,
-                                    "[bridge-gui] device-tab-sim dev=%s "
-                                    "command_request_push_all rc=%d\n",
-                                    d.c_str(), rc);
-                                std::fflush(stderr);
-                            }
-                        }
-                    });
-                    // Give the wx loop a beat to run the CallAfter (and the
-                    // pushall to fly) before the proof-of-life probe goes.
-                    std::this_thread::sleep_for(2s);
-                    // --------------------------------------------------------
-
-                    // -------- Proof-of-life ---------------------------------
-                    // The cascade's success log above is misleading on its
-                    // own: login=1/server=1 plus connect_printer rc=0 does
-                    // NOT prove the printer is reachable through the
-                    // plugin's cloud or LAN route. In practice the cloud
-                    // tunnel can silently fail to activate per-dev_id
-                    // (see project_bridge_cloud_tunnel) — slicers then see
-                    // "Failed to connect" hours later. Probe at boot: send
-                    // info.get_version (qos=1) and pushing.pushall (qos=0)
-                    // per dev_id and wait for ANY inbound message keyed to
-                    // that dev_id within 10s. If nothing arrives, log a
-                    // loud failure so the operator sees the broken state
-                    // immediately rather than via a slicer timeout later.
-                    // Detached so we don't extend cascade-thread lifetime.
-                    std::thread([app, dev_ids] {
-                        using namespace std::chrono_literals;
-                        auto* ag = app->m_agent;
-                        if (!ag) return;
-                        static std::atomic<uint64_t> s_seq{50000};
-                        for (const auto& d : dev_ids) {
-                            // -- get_version round-trip --------------------
-                            const std::string seq1 = std::to_string(s_seq.fetch_add(1));
-                            const std::string pv =
-                                std::string("{\"info\":{\"command\":\"get_version\",")
-                              + "\"sequence_id\":\"" + seq1 + "\"}}";
-                            const auto t1 = std::chrono::steady_clock::now();
-                            const int rcv = ag->send_message(d, pv, /*qos=*/1, /*timeout_ms=*/0);
-                            if (rcv != 0) {
-                                std::fprintf(stderr,
-                                    "[proof-of-life] dev=%s FAILED step=get_version "
-                                    "send rc=%d (cloud route refused — plugin has "
-                                    "no usable cloud tunnel for this printer)\n",
-                                    d.c_str(), rcv);
-                                std::fflush(stderr);
-                                continue;
-                            }
-                            if (!wait_for_inbound(d, t1, 10s)) {
-                                std::fprintf(stderr,
-                                    "[proof-of-life] dev=%s FAILED step=get_version "
-                                    "send rc=0 but no inbound reply in 10s (one-way "
-                                    "tunnel? printer offline from cloud?)\n",
-                                    d.c_str());
-                                std::fflush(stderr);
-                                continue;
-                            }
-                            std::fprintf(stderr,
-                                "[proof-of-life] dev=%s step=get_version OK "
-                                "(reply received)\n", d.c_str());
-                            std::fflush(stderr);
-
-                            // -- pushing.pushall round-trip ---------------
-                            const std::string seq2 = std::to_string(s_seq.fetch_add(1));
-                            const std::string pp =
-                                std::string("{\"pushing\":{\"command\":\"pushall\",")
-                              + "\"push_target\":1,\"sequence_id\":\"" + seq2 + "\"}}";
-                            const auto t2 = std::chrono::steady_clock::now();
-                            const int rcp = ag->send_message(d, pp, /*qos=*/0, /*timeout_ms=*/0);
-                            if (rcp != 0) {
-                                std::fprintf(stderr,
-                                    "[proof-of-life] dev=%s FAILED step=pushall "
-                                    "send rc=%d\n", d.c_str(), rcp);
-                                std::fflush(stderr);
-                                continue;
-                            }
-                            if (!wait_for_inbound(d, t2, 10s)) {
-                                std::fprintf(stderr,
-                                    "[proof-of-life] dev=%s FAILED step=pushall "
-                                    "send rc=0 but no push_status in 10s\n",
-                                    d.c_str());
-                                std::fflush(stderr);
-                                continue;
-                            }
-                            std::fprintf(stderr,
-                                "[proof-of-life] dev=%s OK — cloud tunnel alive, "
-                                "version + push_status received\n", d.c_str());
-                            std::fflush(stderr);
-                        }
-                    }).detach();
-                    // --------------------------------------------------------
-
-                    return;
-                }
-                std::fprintf(stderr,
-                    "[bridge-gui] cascade waited 30s but userMachineList "
-                    "stayed empty\n");
-                std::fflush(stderr);
+            auto finish_cascade = [] {
             };
 
             std::thread([app, finish_cascade]{
@@ -1499,6 +1276,96 @@ void install_gui_worker(GUI_App* app)
                     (long long) dt_ms, native_used ? "native" : "plugin-fallback");
                 std::fflush(stderr);
 
+                // PROBE: explicitly call get_user_print_info (the HTTP
+                // endpoint backing update_user_machine_list_info) so we
+                // can see whether the plugin's cookie/session auth
+                // works for HTTP even when get_my_token can't surface
+                // bearer tokens. If this returns rc=0 with non-empty
+                // body, the auth state IS workable — we just need to
+                // drive load_last_machine ourselves rather than relying
+                // on TryLoadFromHttpCB firing through the natural flow.
+                if (app->m_agent) {
+                    unsigned int probe_http = 0;
+                    std::string  probe_body;
+                    int probe_rc = app->m_agent->get_user_print_info(
+                        &probe_http, &probe_body);
+                    std::fprintf(stderr,
+                        "[bridge-gui] PROBE get_user_print_info "
+                        "rc=%d http=%u body_len=%zu body_head=%.120s\n",
+                        probe_rc, probe_http, probe_body.size(),
+                        probe_body.c_str());
+                    std::fflush(stderr);
+                    // If the probe gave us the device list, manually
+                    // drive what TryLoadFromHttpCB would have done: feed
+                    // DeviceManager + call load_last_machine which uses
+                    // our user_last_selected_machine pin to pick the
+                    // target dev_id and call set_selected_machine →
+                    // m_agent->set_user_selected_machine → plugin
+                    // subscribes → set_on_printer_connected_fn fires.
+                    if (probe_rc == 0 && !probe_body.empty()) {
+                        // Wait for is_server_connected before doing
+                        // load_last_machine + add_subscribe — set_on_server
+                        // _connected_fn fires from the plugin's cloud-MQTT
+                        // broker SUBACK and is what makes send_message
+                        // actually work. Without the wait we end up calling
+                        // add_subscribe before the cloud session is alive
+                        // and every subsequent publish gets rc_cloud=-2
+                        // server=0 even though the slicer-side bootstrap
+                        // (pushall/get_version) has already fired.
+                        for (int i = 0; i < 60; ++i) {
+                            if (app->m_agent && app->m_agent->is_server_connected())
+                                break;
+                            std::this_thread::sleep_for(500ms);
+                        }
+                        std::fprintf(stderr,
+                            "[bridge-gui] PROBE is_server_connected=%d "
+                            "(after wait)\n",
+                            app->m_agent ?
+                                int(app->m_agent->is_server_connected()) : -1);
+                        std::fflush(stderr);
+                        std::string body_copy = probe_body;
+                        app->CallAfter([app, body_copy = std::move(body_copy)]() mutable {
+                            if (!app->m_device_manager) return;
+                            try {
+                                app->m_device_manager->parse_user_print_info(body_copy);
+                                std::fprintf(stderr,
+                                    "[bridge-gui] PROBE parse_user_print_info OK "
+                                    "userMachineList.size=%zu\n",
+                                    app->m_device_manager->get_user_machinelist().size());
+                                app->m_device_manager->load_last_machine();
+                                auto* sel = app->m_device_manager->get_selected_machine();
+                                std::fprintf(stderr,
+                                    "[bridge-gui] PROBE load_last_machine fired; "
+                                    "selected=%s\n",
+                                    sel ? sel->get_dev_id().c_str() : "<none>");
+                                // GUI's set_on_server_connected_fn handler
+                                // explicitly calls subscribe_device_list /
+                                // add_subscribe in multi-machine mode; the
+                                // cascade we removed was doing the same thing
+                                // for single-machine bridge mode. Restore JUST
+                                // that one plugin call: add_subscribe for the
+                                // selected dev_id. set_user_selected_machine
+                                // alone isn't sufficient — the plugin needs
+                                // an explicit subscribe request for the cloud
+                                // broker to deliver SUBACK and fire
+                                // set_on_printer_connected_fn.
+                                if (sel && app->m_agent) {
+                                    std::vector<std::string> subs{ sel->get_dev_id() };
+                                    int sub_rc = app->m_agent->add_subscribe(subs);
+                                    std::fprintf(stderr,
+                                        "[bridge-gui] PROBE add_subscribe(%s) rc=%d\n",
+                                        sel->get_dev_id().c_str(), sub_rc);
+                                }
+                                std::fflush(stderr);
+                            } catch (const std::exception& ex) {
+                                std::fprintf(stderr,
+                                    "[bridge-gui] PROBE parse threw: %s\n", ex.what());
+                                std::fflush(stderr);
+                            }
+                        });
+                    }
+                }
+
                 // -- Ship-2: persist the resulting session for next boot --
                 // After the plugin-fallback path succeeds we want next
                 // boot to use the native session. Try
@@ -1509,11 +1376,28 @@ void install_gui_worker(GUI_App* app)
                 // by the plugin export surface, so we save what we have
                 // and let the refresh round-trip top up expiry on next
                 // boot).
+                //
+                // POLL: the plugin's login HTTP roundtrip (initiated by
+                // request_user_handle) takes seconds to complete.
+                // Calling get_my_token immediately gets rc=-1 because
+                // the in-memory token slot isn't populated yet. The
+                // pre-cascade-removal code accidentally papered over
+                // this with its 30 s of synthetic GUI-event sleeps;
+                // now that those are gone we have to wait deliberately.
+                // Poll every 1 s for up to 30 s — same total budget
+                // the removed cascade consumed, just spent on waiting
+                // rather than spamming set_user_selected_machine.
                 if (!native_used && app->m_agent && app->m_agent->is_user_login()) {
                     unsigned int http = 0;
                     std::string  body;
-                    int rc = app->m_agent->get_my_token(
-                        /*ticket=*/std::string(), &http, &body);
+                    int rc = -1;
+                    for (int i = 0; i < 30; ++i) {
+                        body.clear(); http = 0;
+                        rc = app->m_agent->get_my_token(
+                            /*ticket=*/std::string(), &http, &body);
+                        if (rc == 0 && !body.empty()) break;
+                        std::this_thread::sleep_for(1000ms);
+                    }
                     std::fprintf(stderr,
                         "[bridge-gui] post-fallback get_my_token rc=%d http=%u "
                         "body_len=%zu\n", rc, http, body.size());

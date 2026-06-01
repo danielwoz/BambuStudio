@@ -13,6 +13,8 @@
 
 #include "../../miniz/miniz.h"
 
+#include <nlohmann/json.hpp>
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -26,9 +28,11 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <string>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace Slic3r {
 namespace bridge {
@@ -511,7 +515,344 @@ static bool rewrite_plate_to_zero(const std::string& threemf_path,
     return true;
 }
 
+// Inject `Metadata/filament_settings_<K>.config` entries into the .3mf
+// when the slicer didn't ship them.
+//
+// Why: H2D firmware rejects prints with HMS error `0700700000020008`
+// ("Failed to get AMS mapping table; please select Resume to retry") when
+// the .3mf's project_settings has filament references the firmware can't
+// resolve to a per-slot filament profile inside the archive. BambuStudio
+// emits one `filament_settings_<K>.config` per active filament (see
+// `_add_project_embedded_presets_to_archive` in bbs_3mf.cpp:7730 and the
+// captured plugin trace in docs/plugin-trace/H2D-cloud.yaml section
+// `threemf_payload.contents`). OrcaSlicer only emits these files when
+// the user has user-overridden filament project presets — a "use Bambu
+// Lab PETG preset as-is" print ships zero filament_settings files and
+// the H2D bails on AMS-mapping validation.
+//
+// What we inject: for every filament index referenced by the print's
+// plate, synthesise a minimal `filament_settings_<K>.config` (K is the
+// 1-indexed position among ACTIVE filaments — first active = 1). The
+// content is the same JSON shape `ConfigBase::save_to_json` would emit
+// for a single embedded project preset: per-filament-array fields from
+// `Metadata/project_settings.config` narrowed to that filament's slot
+// (arrays of length N become 1-element; arrays of length 2N become
+// 2-element — one per extruder). Plus the identifying header fields
+// `name`/`inherits`/`from`/`version` so the firmware can validate the
+// AMS-mapping entry against a real filament profile.
+//
+// Returns true if the archive was rewritten; false on any failure or
+// when injection wasn't needed (already had filament_settings_*).
+//
+// Idempotent: re-running on a .3mf that already contains any
+// `Metadata/filament_settings_*.config` is a no-op.
+static bool inject_filament_settings(const std::string& threemf_path,
+                                     const std::string& dev_id) {
+    using nlohmann::json;
+
+    mz_zip_archive in{};
+    if (!mz_zip_reader_init_file(&in, threemf_path.c_str(), 0)) {
+        std::fprintf(stderr,
+            "[filament-inject] dev=%s open input %s failed\n",
+            dev_id.c_str(), threemf_path.c_str());
+        std::fflush(stderr);
+        return false;
+    }
+
+    // First pass — locate project_settings.config, a plate_*.json, the
+    // slice_info.config, and detect any pre-existing filament_settings_*
+    // entries.
+    int     project_idx     = -1;
+    int     plate_json_idx  = -1;
+    int     slice_info_idx  = -1;
+    bool    already_present = false;
+    mz_uint n_files         = mz_zip_reader_get_num_files(&in);
+    for (mz_uint i = 0; i < n_files; ++i) {
+        char name[512];
+        if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
+        std::string nm(name);
+        if (nm.size() > 17 &&
+            nm.compare(0, 26, "Metadata/filament_settings") == 0) {
+            already_present = true;
+            break;
+        }
+        if (nm == "Metadata/project_settings.config") project_idx = static_cast<int>(i);
+        else if (nm == "Metadata/slice_info.config")  slice_info_idx = static_cast<int>(i);
+        else if (plate_json_idx < 0 &&
+                 nm.size() > 14 &&
+                 nm.compare(0, 15, "Metadata/plate_") == 0 &&
+                 nm.size() > 5 &&
+                 nm.compare(nm.size() - 5, 5, ".json") == 0) {
+            plate_json_idx = static_cast<int>(i);
+        }
+    }
+
+    if (already_present) {
+        mz_zip_reader_end(&in);
+        return false;
+    }
+    if (project_idx < 0) {
+        // Not a Bambu/Orca .3mf with project_settings — nothing to inject.
+        mz_zip_reader_end(&in);
+        return false;
+    }
+
+    // Read project_settings.config as JSON.
+    json project_cfg;
+    {
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&in, project_idx, &st)) {
+            mz_zip_reader_end(&in);
+            return false;
+        }
+        std::string body(static_cast<std::size_t>(st.m_uncomp_size), '\0');
+        if (st.m_uncomp_size > 0 &&
+            !mz_zip_reader_extract_to_mem(&in, project_idx, body.data(),
+                                          body.size(), 0)) {
+            mz_zip_reader_end(&in);
+            return false;
+        }
+        try {
+            project_cfg = json::parse(body);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr,
+                "[filament-inject] dev=%s parse project_settings failed: %s\n",
+                dev_id.c_str(), e.what());
+            std::fflush(stderr);
+            mz_zip_reader_end(&in);
+            return false;
+        }
+    }
+
+    // Determine total filament count from `filament_settings_id`.
+    if (!project_cfg.contains("filament_settings_id") ||
+        !project_cfg["filament_settings_id"].is_array() ||
+        project_cfg["filament_settings_id"].empty()) {
+        mz_zip_reader_end(&in);
+        return false;
+    }
+    const auto& fs_ids = project_cfg["filament_settings_id"];
+    const std::size_t N = fs_ids.size();
+
+    // Figure out which filament indices the print actually uses. Prefer
+    // plate_*.json `filament_ids` (0-indexed); fall back to slice_info
+    // `<filament id="N" .../>` (1-indexed → subtract 1). If neither is
+    // readable, default to all filaments (worst case overshoot — but
+    // ams_mapping validation only cares that referenced indices have a
+    // matching file, so emitting extras is safe).
+    std::vector<int> active_filaments;  // 0-indexed
+    if (plate_json_idx >= 0) {
+        mz_zip_archive_file_stat st{};
+        if (mz_zip_reader_file_stat(&in, plate_json_idx, &st)) {
+            std::string body(static_cast<std::size_t>(st.m_uncomp_size), '\0');
+            if (st.m_uncomp_size == 0 ||
+                mz_zip_reader_extract_to_mem(&in, plate_json_idx, body.data(),
+                                             body.size(), 0)) {
+                try {
+                    json pj = json::parse(body);
+                    if (pj.contains("filament_ids") && pj["filament_ids"].is_array()) {
+                        std::set<int> seen;
+                        for (const auto& v : pj["filament_ids"]) {
+                            if (v.is_number_integer()) {
+                                int idx = v.get<int>();
+                                if (idx >= 0 && static_cast<std::size_t>(idx) < N &&
+                                    seen.insert(idx).second) {
+                                    active_filaments.push_back(idx);
+                                }
+                            }
+                        }
+                    }
+                } catch (...) {
+                    // Fall through to slice_info / all-filaments fallback.
+                }
+            }
+        }
+    }
+    if (active_filaments.empty() && slice_info_idx >= 0) {
+        mz_zip_archive_file_stat st{};
+        if (mz_zip_reader_file_stat(&in, slice_info_idx, &st)) {
+            std::string body(static_cast<std::size_t>(st.m_uncomp_size), '\0');
+            if (st.m_uncomp_size == 0 ||
+                mz_zip_reader_extract_to_mem(&in, slice_info_idx, body.data(),
+                                             body.size(), 0)) {
+                // slice_info.config is XML — simple substring scan for
+                // `<filament id="N"`. Parser-free; the slicer's emitter
+                // formats the attribute as `id="N"` (no leading zeros,
+                // 1-indexed). Order is the source order so we preserve
+                // it via the seen-set.
+                std::set<int> seen;
+                std::size_t p = 0;
+                while ((p = body.find("<filament id=\"", p)) != std::string::npos) {
+                    p += 14;
+                    std::size_t q = body.find('"', p);
+                    if (q == std::string::npos) break;
+                    try {
+                        int one_idx = std::stoi(body.substr(p, q - p));
+                        int idx = one_idx - 1;  // 1-indexed → 0-indexed
+                        if (idx >= 0 && static_cast<std::size_t>(idx) < N &&
+                            seen.insert(idx).second) {
+                            active_filaments.push_back(idx);
+                        }
+                    } catch (...) {}
+                    p = q + 1;
+                }
+            }
+        }
+    }
+    if (active_filaments.empty()) {
+        // No reliable active-filament list — fall back to ALL filaments
+        // so we never under-cover what the firmware validates.
+        for (std::size_t i = 0; i < N; ++i) {
+            active_filaments.push_back(static_cast<int>(i));
+        }
+    }
+
+    // Build a synthetic per-filament JSON. Strategy:
+    //   - Copy `version` and `from` scalars verbatim (with sensible
+    //     fallbacks). The slicer's save_to_json wraps the file in a
+    //     `version`/`name`/`from` header.
+    //   - Set `name` and `inherits` from filament_settings_id[idx].
+    //   - For every other key in project_settings.config that's an array
+    //     of length N (per-filament) or 2N (per-filament-per-extruder),
+    //     narrow to a 1-element or 2-element array.
+    //   - Drop scalars and arrays of any other length — they're not
+    //     filament-specific and can't be sliced.
+    auto build_one = [&](int idx) -> json {
+        json out = json::object();
+        // Header. The slicer writes these in this order; we match for
+        // diff-friendliness against captured GUI snapshots.
+        std::string version = "1.0.0.0";
+        if (project_cfg.contains("version") && project_cfg["version"].is_string()) {
+            version = project_cfg["version"].get<std::string>();
+        }
+        std::string name_str;
+        if (fs_ids[idx].is_string()) {
+            name_str = fs_ids[idx].get<std::string>();
+        }
+        out["name"]     = name_str;
+        out["from"]     = "project";
+        out["version"]  = version;
+        out["inherits"] = name_str;
+
+        for (auto it = project_cfg.begin(); it != project_cfg.end(); ++it) {
+            const std::string& k = it.key();
+            if (k == "version" || k == "from" || k == "name" || k == "inherits")
+                continue;
+            const auto& v = it.value();
+            if (!v.is_array()) continue;
+            const std::size_t L = v.size();
+            if (L == N) {
+                out[k] = json::array({v[static_cast<std::size_t>(idx)]});
+            } else if (N > 0 && L == 2 * N) {
+                std::size_t base = static_cast<std::size_t>(idx) * 2;
+                out[k] = json::array({v[base], v[base + 1]});
+            }
+            // else: not per-filament, skip.
+        }
+        return out;
+    };
+
+    // Now build the output zip: copy every existing entry verbatim,
+    // then append the synthesised filament_settings_K.config entries.
+    auto pos = threemf_path.find_last_of('/');
+    std::string dir = (pos == std::string::npos) ? "/tmp"
+                                                 : threemf_path.substr(0, pos);
+    std::string out_path = threemf_path + ".finject.tmp";
+    ::unlink(out_path.c_str());
+
+    mz_zip_archive out{};
+    if (!mz_zip_writer_init_file(&out, out_path.c_str(), 0)) {
+        std::fprintf(stderr,
+            "[filament-inject] dev=%s open output %s failed\n",
+            dev_id.c_str(), out_path.c_str());
+        std::fflush(stderr);
+        mz_zip_reader_end(&in);
+        return false;
+    }
+
+    bool ok = true;
+    for (mz_uint i = 0; i < n_files; ++i) {
+        if (!mz_zip_writer_add_from_zip_reader(&out, &in, i)) {
+            char name[512];
+            mz_zip_reader_get_filename(&in, i, name, sizeof(name));
+            std::fprintf(stderr,
+                "[filament-inject] dev=%s copy '%s' failed\n",
+                dev_id.c_str(), name);
+            std::fflush(stderr);
+            ok = false;
+            break;
+        }
+    }
+
+    int n_injected = 0;
+    if (ok) {
+        for (std::size_t k = 0; k < active_filaments.size(); ++k) {
+            int idx = active_filaments[k];
+            json j = build_one(idx);
+            // save_to_json uses `j.dump(1, '\t')` + trailing newline.
+            // We mirror that so the bytes match what the slicer would
+            // have produced.
+            std::string body = j.dump(1, '\t');
+            body.push_back('\n');
+            std::string entry = "Metadata/filament_settings_" +
+                                std::to_string(k + 1) + ".config";
+            if (!mz_zip_writer_add_mem(&out,
+                                       entry.c_str(),
+                                       body.data(),
+                                       body.size(),
+                                       MZ_DEFAULT_COMPRESSION)) {
+                std::fprintf(stderr,
+                    "[filament-inject] dev=%s add '%s' failed\n",
+                    dev_id.c_str(), entry.c_str());
+                std::fflush(stderr);
+                ok = false;
+                break;
+            }
+            ++n_injected;
+        }
+    }
+
+    bool finalize_ok = ok &&
+        mz_zip_writer_finalize_archive(&out) &&
+        mz_zip_writer_end(&out);
+    mz_zip_reader_end(&in);
+
+    if (!finalize_ok) {
+        std::fprintf(stderr,
+            "[filament-inject] dev=%s finalize failed; leaving original\n",
+            dev_id.c_str());
+        std::fflush(stderr);
+        ::unlink(out_path.c_str());
+        return false;
+    }
+
+    if (::rename(out_path.c_str(), threemf_path.c_str()) != 0) {
+        std::fprintf(stderr,
+            "[filament-inject] dev=%s rename %s -> %s failed: %s\n",
+            dev_id.c_str(), out_path.c_str(), threemf_path.c_str(),
+            std::strerror(errno));
+        std::fflush(stderr);
+        ::unlink(out_path.c_str());
+        return false;
+    }
+
+    std::fprintf(stderr,
+        "[lan-upload] dev=%s inject filament_settings count=%d "
+        "(total_filaments=%zu)\n",
+        dev_id.c_str(), n_injected, N);
+    std::fflush(stderr);
+    return true;
+}
+
 } // namespace
+
+// Test-only thin wrapper around the file-static inject helper. Lets
+// tests/harnesses drive the rewriter directly against a .3mf on disk
+// without standing up an entire UploadJob/MockPluginHandle.
+bool inject_filament_settings_for_test(const std::string& path,
+                                       const std::string& dev_id) {
+    return inject_filament_settings(path, dev_id);
+}
 
 void LanUploadSink::attach_plugin(
         std::shared_ptr<BambuNetworkingPluginHandle> handle) {
@@ -608,6 +949,16 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
     // printer reports "couldn't read file". The rewriter is idempotent and
     // a no-op when the upload is already plate_0 or isn't a .3mf at all.
     (void) rewrite_plate_to_zero(tmp_path, job.dev_id);
+
+    // Synthesise missing `Metadata/filament_settings_<K>.config` entries
+    // so the H2D firmware can validate ams_mapping. OrcaSlicer ships
+    // these files only when the user has user-overridden filament project
+    // presets; a "use Bambu PETG @BBL H2D as-is" print uploads with zero
+    // filament_settings files and the H2D rejects with HMS error
+    // 0700700000020008 ("Failed to get AMS mapping table; please select
+    // Resume to retry"). Idempotent — no-op when any
+    // `filament_settings_*.config` already exists in the archive.
+    (void) inject_filament_settings(tmp_path, job.dev_id);
 
     // Debug snapshot — copy of every spooled .3mf retained at a stable
     // path per dev_id so we can inspect what the slicer is actually
