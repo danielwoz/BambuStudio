@@ -560,21 +560,29 @@ static bool inject_filament_settings(const std::string& threemf_path,
     }
 
     // First pass — locate project_settings.config, a plate_*.json, the
-    // slice_info.config, and detect any pre-existing filament_settings_*
-    // entries.
-    int     project_idx     = -1;
-    int     plate_json_idx  = -1;
-    int     slice_info_idx  = -1;
-    bool    already_present = false;
-    mz_uint n_files         = mz_zip_reader_get_num_files(&in);
+    // slice_info.config, and identify any pre-existing filament_settings_*
+    // entries so we can REPLACE them (not skip). Slicers — including the
+    // OrcaSlicer patch on experiment/3mf-filament-settings — emit
+    // sequentially-numbered files (filament_settings_1..N for N active
+    // extruder presets) which DON'T match the printer's expectation that
+    // filament_settings_<K>.config corresponds to project filament index
+    // (K-1). The bridge is the canonical place to enforce that mapping,
+    // so we strip any existing filament_settings_*.config entries on
+    // copy and regenerate from project_settings.config + the active
+    // plate's filament_ids.
+    int                  project_idx    = -1;
+    int                  plate_json_idx = -1;
+    int                  slice_info_idx = -1;
+    std::set<mz_uint>    strip_indices; // existing filament_settings_*.config — skip on copy
+    mz_uint              n_files        = mz_zip_reader_get_num_files(&in);
     for (mz_uint i = 0; i < n_files; ++i) {
         char name[512];
         if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
         std::string nm(name);
         if (nm.size() > 17 &&
             nm.compare(0, 26, "Metadata/filament_settings") == 0) {
-            already_present = true;
-            break;
+            strip_indices.insert(i);
+            continue;
         }
         if (nm == "Metadata/project_settings.config") project_idx = static_cast<int>(i);
         else if (nm == "Metadata/slice_info.config")  slice_info_idx = static_cast<int>(i);
@@ -587,10 +595,6 @@ static bool inject_filament_settings(const std::string& threemf_path,
         }
     }
 
-    if (already_present) {
-        mz_zip_reader_end(&in);
-        return false;
-    }
     if (project_idx < 0) {
         // Not a Bambu/Orca .3mf with project_settings — nothing to inject.
         mz_zip_reader_end(&in);
@@ -772,6 +776,11 @@ static bool inject_filament_settings(const std::string& threemf_path,
 
     bool ok = true;
     for (mz_uint i = 0; i < n_files; ++i) {
+        // Skip any existing Metadata/filament_settings_*.config — we
+        // are about to regenerate them with the correct
+        // <project-filament-index+1>.config naming, so don't carry the
+        // slicer's mis-numbered originals through.
+        if (strip_indices.count(i)) continue;
         if (!mz_zip_writer_add_from_zip_reader(&out, &in, i)) {
             char name[512];
             mz_zip_reader_get_filename(&in, i, name, sizeof(name));
@@ -794,8 +803,16 @@ static bool inject_filament_settings(const std::string& threemf_path,
             // have produced.
             std::string body = j.dump(1, '\t');
             body.push_back('\n');
+            // File name uses idx+1 (project filament position, 1-indexed),
+            // NOT loop counter. slice_info.config emits `<filament id="N">`
+            // where N is the 1-indexed filament position in the project,
+            // and the printer expects `filament_settings_<N>.config` to
+            // match. Using loop counter (k+1) produced `filament_settings_1`
+            // for an active filament at project index 4, missing the
+            // expected `filament_settings_5.config` — printer returned
+            // HMS 0700700000020008 ("Failed to get AMS mapping table").
             std::string entry = "Metadata/filament_settings_" +
-                                std::to_string(k + 1) + ".config";
+                                std::to_string(idx + 1) + ".config";
             if (!mz_zip_writer_add_mem(&out,
                                        entry.c_str(),
                                        body.data(),
@@ -836,10 +853,20 @@ static bool inject_filament_settings(const std::string& threemf_path,
         return false;
     }
 
+    // Log the active-filament project indices (0-indexed) we generated
+    // files for. Helpful for diagnosing "Failed to get AMS mapping
+    // table" — confirms the printer should find a filament_settings_
+    // <idx+1>.config for every <filament id="idx+1"> in slice_info.
+    std::string idx_list;
+    for (std::size_t k = 0; k < active_filaments.size(); ++k) {
+        if (k) idx_list += ',';
+        idx_list += std::to_string(active_filaments[k]);
+    }
     std::fprintf(stderr,
         "[lan-upload] dev=%s inject filament_settings count=%d "
-        "(total_filaments=%zu)\n",
-        dev_id.c_str(), n_injected, N);
+        "stripped_existing=%zu total_filaments=%zu active_indices=[%s]\n",
+        dev_id.c_str(), n_injected, strip_indices.size(), N,
+        idx_list.c_str());
     std::fflush(stderr);
     return true;
 }
