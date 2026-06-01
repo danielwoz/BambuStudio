@@ -45,14 +45,37 @@ public:
     virtual void on_unsubscribe(const std::string& dev_id, std::string topic) = 0;
     virtual void on_disconnect (const std::string& dev_id) = 0;
 
-    // Hook the uplink uses to push a printer-side message back to the
-    // currently-connected slicer. The broker installs the publisher when a
-    // session starts and tears it down (passes an empty function) when the
-    // session ends. Implementations should store the latest publisher per
-    // dev_id and ignore calls when none is installed.
+    // Hook the uplink uses to push a printer-side message back to a
+    // connected slicer. The broker installs one publisher PER SESSION
+    // when each slicer connects, and detaches that specific session's
+    // entry on session end. Multiple sessions for the same dev_id all
+    // receive the same printer-side traffic (multi-subscriber fan-out).
+    //
+    // Implementations also maintain a small retained-message cache per
+    // dev_id (typically the last 2 inbound messages) and replay it
+    // synchronously into the new publisher inside attach_downstream so
+    // a freshly-connected slicer's UI has push_status to render without
+    // waiting for the next printer push.
     using DownstreamPublisher = std::function<void(std::string topic,
                                                    std::vector<uint8_t> payload,
                                                    uint8_t qos)>;
+
+    // Add (or replace, for the same {dev_id, session_id}) a downstream
+    // subscriber. The broker generates session_id via its own counter
+    // — uniqueness is the caller's responsibility.
+    virtual void attach_downstream(const std::string& dev_id,
+                                   uint64_t            session_id,
+                                   DownstreamPublisher publisher) = 0;
+
+    // Remove just the specified session's publisher. Other sessions
+    // attached to the same dev_id continue to receive traffic.
+    virtual void detach_downstream(const std::string& dev_id,
+                                   uint64_t            session_id) = 0;
+
+    // Deprecated 2-arg overload kept for backward compatibility with
+    // existing tests and SessionRouter call paths that haven't yet
+    // adopted session_id. Implementations synthesise a session_id
+    // internally and log a warning. Prefer the 3-arg form.
     virtual void attach_downstream(const std::string& dev_id,
                                    DownstreamPublisher publisher) = 0;
 };

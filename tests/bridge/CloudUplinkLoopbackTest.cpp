@@ -193,9 +193,95 @@ int main() {
     mock->deliver_message_for_test(dev_id, "{\"print\":{\"state\":\"IDLE\"}}");
     {
         std::lock_guard<std::mutex> lk(ds_mu);
+        // The 2-arg overload only detaches the synthesised-session-id=0
+        // entry; the IDLE delivery still updates the retained cache and
+        // would have fired downstream had any other subscriber been
+        // attached. With none attached, count stays at 2.
         check(downstream.size() == 2,
               "delivery after detach is a no-op");
     }
+
+    // ---- Multi-subscriber fan-out + retained cache + per-session detach ----
+    // Attach 3 publishers for the same dev_id with distinct session_ids.
+    // A single inbound delivery must reach all 3.
+    std::mutex mux;
+    std::vector<int> hits(3, 0);
+    auto make_pub = [&](int idx) {
+        return [&, idx](std::string, std::vector<uint8_t>, uint8_t) {
+            std::lock_guard<std::mutex> lk(mux);
+            ++hits[idx];
+        };
+    };
+    up.attach_downstream(dev_id, /*session_id=*/1001, make_pub(0));
+    up.attach_downstream(dev_id, /*session_id=*/1002, make_pub(1));
+    up.attach_downstream(dev_id, /*session_id=*/1003, make_pub(2));
+
+    // The retained-cache replay fires immediately for each attach.
+    // Last 2 messages cached: PAUSED + IDLE. So each new subscriber
+    // receives 2 messages from the cache at attach time.
+    {
+        std::lock_guard<std::mutex> lk(mux);
+        check(hits[0] == 2,
+              "retained cache replays 2 messages to subscriber 1 at attach time");
+        check(hits[1] == 2,
+              "retained cache replays 2 messages to subscriber 2 at attach time");
+        check(hits[2] == 2,
+              "retained cache replays 2 messages to subscriber 3 at attach time");
+    }
+
+    // One live delivery must fan out to all 3 (each gets +1).
+    mock->deliver_message_for_test(dev_id, "{\"print\":{\"state\":\"FANOUT\"}}");
+    {
+        std::lock_guard<std::mutex> lk(mux);
+        check(hits[0] == 3,
+              "fan-out: subscriber 1 received the live delivery");
+        check(hits[1] == 3,
+              "fan-out: subscriber 2 received the live delivery");
+        check(hits[2] == 3,
+              "fan-out: subscriber 3 received the live delivery");
+    }
+
+    // Per-session detach: remove session 1001; subsequent deliveries
+    // must reach only sessions 1002 and 1003.
+    up.detach_downstream(dev_id, /*session_id=*/1001);
+    mock->deliver_message_for_test(dev_id, "{\"print\":{\"state\":\"AFTER\"}}");
+    {
+        std::lock_guard<std::mutex> lk(mux);
+        check(hits[0] == 3,
+              "per-session detach: session 1001 received nothing more");
+        check(hits[1] == 4,
+              "per-session detach: session 1002 still receives");
+        check(hits[2] == 4,
+              "per-session detach: session 1003 still receives");
+    }
+
+    // Cache-replay-into-fresh-subscriber check: attach a fresh
+    // subscriber AFTER the recent deliveries; it should see the 2
+    // most recent retained messages (FANOUT + AFTER), immediately,
+    // without any further deliver_message_for_test call.
+    std::mutex late_mu;
+    std::vector<std::string> late_seen;
+    up.attach_downstream(dev_id, /*session_id=*/2001,
+        [&](std::string /*t*/, std::vector<uint8_t> p, uint8_t /*q*/) {
+            std::lock_guard<std::mutex> lk(late_mu);
+            late_seen.emplace_back(p.begin(), p.end());
+        });
+    {
+        std::lock_guard<std::mutex> lk(late_mu);
+        check(late_seen.size() == 2,
+              "fresh subscriber gets exactly the 2 retained messages on attach");
+        if (late_seen.size() == 2) {
+            check(late_seen[0] == "{\"print\":{\"state\":\"FANOUT\"}}",
+                  "retained cache replay order: oldest first");
+            check(late_seen[1] == "{\"print\":{\"state\":\"AFTER\"}}",
+                  "retained cache replay order: newest last");
+        }
+    }
+
+    // Clean up the multi-subscriber state.
+    up.detach_downstream(dev_id, 1002);
+    up.detach_downstream(dev_id, 1003);
+    up.detach_downstream(dev_id, 2001);
 
     // ---- unsubscribe refcount: only the LAST emits wire unsubscribe ----
     up.on_unsubscribe(dev_id, topic_report);                       // 2->1

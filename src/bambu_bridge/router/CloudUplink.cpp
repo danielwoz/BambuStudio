@@ -14,10 +14,13 @@
 
 #include "../BambuNetworkingPluginHandle.hpp"
 
+#include <algorithm>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Slic3r {
 namespace bridge {
@@ -41,11 +44,29 @@ struct CloudUplink::Impl {
         bool subscribed = false;
     };
 
+    // Per-session downstream entry. Multiple sessions can subscribe to
+    // the same dev_id; printer-side traffic fans out to all of them.
+    struct Subscriber {
+        uint64_t                            session_id;
+        server::IUplink::DownstreamPublisher publisher;
+    };
+
+    // Last few inbound messages per dev_id, replayed synchronously to a
+    // newly-attached publisher so a fresh slicer can render state
+    // without waiting for the printer's next push. Bounded to 2 — a
+    // pushall (~25 KB) plus one delta covers the realistic case.
+    struct RetainedMsg {
+        std::string          topic;
+        std::vector<uint8_t> payload;
+        uint8_t              qos;
+    };
+    static constexpr size_t kRetainedCap = 2;
+
     std::shared_ptr<BambuNetworkingPluginHandle>                handle;
     mutable std::mutex                                          mu;
     std::unordered_map<std::string, std::unique_ptr<DeviceState>> devices;
-    std::unordered_map<std::string,
-                       server::IUplink::DownstreamPublisher>     downstreams;
+    std::unordered_map<std::string, std::vector<Subscriber>>    downstreams;
+    std::unordered_map<std::string, std::vector<RetainedMsg>>   retained;
 
     DeviceState* find_locked(const std::string& dev_id) {
         auto it = devices.find(dev_id);
@@ -95,13 +116,25 @@ void CloudUplink::attach_plugin(std::shared_ptr<BambuNetworkingPluginHandle> han
                 [impl, dev_id](std::string topic,
                                std::vector<uint8_t> payload,
                                uint8_t qos) {
-                server::IUplink::DownstreamPublisher cb;
+                std::vector<server::IUplink::DownstreamPublisher> cbs;
                 {
                     std::lock_guard<std::mutex> lk(impl->mu);
                     auto it = impl->downstreams.find(dev_id);
-                    if (it != impl->downstreams.end()) cb = it->second;
+                    if (it != impl->downstreams.end()) {
+                        cbs.reserve(it->second.size());
+                        for (auto& s : it->second) cbs.push_back(s.publisher);
+                    }
+                    // Cache for replay to future subscribers.
+                    auto& ring = impl->retained[dev_id];
+                    ring.push_back({topic, payload, qos});
+                    if (ring.size() > Impl::kRetainedCap) {
+                        ring.erase(ring.begin(),
+                                   ring.begin() + (ring.size() - Impl::kRetainedCap));
+                    }
                 }
-                if (cb) cb(std::move(topic), std::move(payload), qos);
+                for (auto& cb : cbs) {
+                    if (cb) cb(topic, payload, qos);
+                }
             });
         }
     }
@@ -114,6 +147,8 @@ std::shared_ptr<BambuNetworkingPluginHandle> CloudUplink::plugin_handle() const 
 
 void CloudUplink::add_device(CloudUplinkConfig cfg) {
     const std::string dev_id = cfg.dev_id;
+    std::fprintf(stderr, "[cloud-uplink] add_device dev=%s\n", dev_id.c_str());
+    std::fflush(stderr);
     std::shared_ptr<BambuNetworkingPluginHandle> h;
     {
         std::lock_guard<std::mutex> lk(m_impl->mu);
@@ -123,22 +158,42 @@ void CloudUplink::add_device(CloudUplinkConfig cfg) {
         h = m_impl->handle;
     }
     if (h) {
-        // Register the receiver up front. The plugin's dispatcher will
-        // call us once messages start arriving — even before our first
-        // subscribe — and we want them routed properly.
         Impl* impl = m_impl.get();
         h->register_receiver(dev_id,
             [impl, dev_id](std::string topic,
                            std::vector<uint8_t> payload,
                            uint8_t qos) {
-            server::IUplink::DownstreamPublisher cb;
+            std::vector<server::IUplink::DownstreamPublisher> cbs;
+            size_t subscriber_count = 0;
             {
                 std::lock_guard<std::mutex> lk(impl->mu);
                 auto it = impl->downstreams.find(dev_id);
-                if (it != impl->downstreams.end()) cb = it->second;
+                if (it != impl->downstreams.end()) {
+                    subscriber_count = it->second.size();
+                    cbs.reserve(subscriber_count);
+                    for (auto& s : it->second) cbs.push_back(s.publisher);
+                }
+                // Cache for replay to future subscribers.
+                auto& ring = impl->retained[dev_id];
+                ring.push_back({topic, payload, qos});
+                if (ring.size() > Impl::kRetainedCap) {
+                    ring.erase(ring.begin(),
+                               ring.begin() + (ring.size() - Impl::kRetainedCap));
+                }
             }
-            if (cb) cb(std::move(topic), std::move(payload), qos);
+            std::fprintf(stderr,
+                "[cloud-uplink] receiver dev=%s topic=%s bytes=%zu qos=%u subscribers=%zu\n",
+                dev_id.c_str(), topic.c_str(), payload.size(), unsigned(qos), subscriber_count);
+            std::fflush(stderr);
+            for (auto& cb : cbs) {
+                if (cb) cb(topic, payload, qos);
+            }
         });
+        std::fprintf(stderr, "[cloud-uplink] register_receiver dev=%s installed\n", dev_id.c_str());
+        std::fflush(stderr);
+    } else {
+        std::fprintf(stderr, "[cloud-uplink] add_device dev=%s NO HANDLE — receiver not registered\n", dev_id.c_str());
+        std::fflush(stderr);
     }
 }
 
@@ -152,6 +207,7 @@ void CloudUplink::remove_device(const std::string& dev_id) {
         was_subscribed = it->second->subscribed;
         m_impl->devices.erase(it);
         m_impl->downstreams.erase(dev_id);
+        m_impl->retained.erase(dev_id);
         h = m_impl->handle;
     }
     if (h) {
@@ -235,19 +291,85 @@ void CloudUplink::on_unsubscribe(const std::string& dev_id, std::string topic) {
 }
 
 void CloudUplink::on_disconnect(const std::string& dev_id) {
-    // Slicer detached. Match LanUplink's behaviour: we do NOT tear down
-    // our cloud routing — the agent is shared and reports keep flowing
-    // for the next slicer that connects. Just drop the per-device
-    // downstream publisher.
+    // Slicer detached. With multi-subscriber fan-out, on_disconnect from
+    // the broker means "no more sessions for this dev_id" — but per-
+    // session detach has already been performed by MqttBroker's
+    // session-end cleanup. Keep this a no-op for downstreams to avoid
+    // wiping concurrent sessions racily.
+    (void)dev_id;
+}
+
+void CloudUplink::attach_downstream(const std::string& dev_id,
+                                    uint64_t            session_id,
+                                    DownstreamPublisher publisher) {
+    // Add (or replace, if same session_id reattaches) the subscriber.
+    // Then snapshot retained[dev_id] under lock; invoke the new
+    // publisher with each retained entry OUTSIDE the lock so it can
+    // enqueue into a session's send queue without deadlocking on us.
+    std::vector<Impl::RetainedMsg> replay;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->mu);
+        if (!publisher) {
+            // No-publisher attach is a detach signal in the new world.
+            auto it = m_impl->downstreams.find(dev_id);
+            if (it != m_impl->downstreams.end()) {
+                auto& vec = it->second;
+                vec.erase(std::remove_if(vec.begin(), vec.end(),
+                              [&](const Impl::Subscriber& s) {
+                                  return s.session_id == session_id;
+                              }),
+                          vec.end());
+                if (vec.empty()) m_impl->downstreams.erase(it);
+            }
+            return;
+        }
+        auto& vec = m_impl->downstreams[dev_id];
+        bool replaced = false;
+        for (auto& s : vec) {
+            if (s.session_id == session_id) {
+                s.publisher = publisher;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) vec.push_back({session_id, publisher});
+        auto rit = m_impl->retained.find(dev_id);
+        if (rit != m_impl->retained.end()) replay = rit->second;
+    }
+    for (auto& m : replay) {
+        publisher(m.topic, m.payload, m.qos);
+    }
+}
+
+void CloudUplink::detach_downstream(const std::string& dev_id,
+                                    uint64_t            session_id) {
     std::lock_guard<std::mutex> lk(m_impl->mu);
-    m_impl->downstreams.erase(dev_id);
+    auto it = m_impl->downstreams.find(dev_id);
+    if (it == m_impl->downstreams.end()) return;
+    auto& vec = it->second;
+    vec.erase(std::remove_if(vec.begin(), vec.end(),
+                  [&](const Impl::Subscriber& s) {
+                      return s.session_id == session_id;
+                  }),
+              vec.end());
+    if (vec.empty()) m_impl->downstreams.erase(it);
 }
 
 void CloudUplink::attach_downstream(const std::string& dev_id,
                                     DownstreamPublisher publisher) {
-    std::lock_guard<std::mutex> lk(m_impl->mu);
-    if (publisher) m_impl->downstreams[dev_id] = std::move(publisher);
-    else           m_impl->downstreams.erase(dev_id);
+    // Deprecated. Synthesises session_id = 0 so legacy callers keep
+    // working but only get the single "default" slot. The new world
+    // routes per-session via the 3-arg overload.
+    std::fprintf(stderr,
+        "[cloud-uplink] WARN: deprecated 2-arg attach_downstream(dev=%s) — "
+        "caller should use the (dev_id, session_id, publisher) overload\n",
+        dev_id.c_str());
+    std::fflush(stderr);
+    if (publisher) {
+        attach_downstream(dev_id, /*session_id=*/0, std::move(publisher));
+    } else {
+        detach_downstream(dev_id, /*session_id=*/0);
+    }
 }
 
 } // namespace router

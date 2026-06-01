@@ -42,6 +42,12 @@ namespace server {
 
 namespace {
 
+// Process-wide monotonic session id. Used by IUplink's per-session
+// attach_downstream / detach_downstream so each accepted slicer session
+// gets a unique fan-out slot. Starts at 1 so 0 stays reserved for the
+// deprecated 2-arg attach_downstream legacy path.
+std::atomic<uint64_t> g_next_session_id{1};
+
 // ---------------------------------------------------------------------------
 // OpenSSL global init (one-time, idempotent across translation units).
 // OpenSSL 1.1+ self-initialises but explicitly loading error strings makes
@@ -227,6 +233,11 @@ struct MqttBroker::Device {
 
         // Per-session client-id from CONNECT, for logging.
         std::string client_id;
+
+        // Broker-assigned unique session id. Used by IUplink's per-session
+        // attach_downstream / detach_downstream so multiple slicer sessions
+        // for the same dev_id each get their own fan-out slot.
+        uint64_t    session_id = 0;
 
         // Lifetime sentinel held by both this Session AND the downstream
         // publisher lambda. Flipped to true by Cleanup when this session
@@ -487,6 +498,7 @@ void MqttBroker::start_device(Device& d) {
             sess->ssl        = ssl;
             sess->fd         = cfd;
             sess->stopped.store(false);
+            sess->session_id = g_next_session_id.fetch_add(1);
 
             MqttBroker::Device::Session* raw = sess.get();
             {
@@ -576,20 +588,20 @@ void session_io_loop(MqttBroker::Device* dev,
             sess->stopped.store(true);
             // Flip the publisher's lifetime sentinel BEFORE notifying the
             // uplink. A stale publisher lambda still in the downstreams
-            // map (because we deliberately don't call attach_downstream
-            // (nullptr) here — see the Session::dead comment) will now
-            // no-op instead of touching the soon-to-be-freed ssl/fd.
+            // map will now no-op instead of touching the soon-to-be-freed
+            // ssl/fd.
             if (sess->dead) sess->dead->store(true);
             if (!notified && uplink) {
-                // Intentionally NOT clearing the downstream publisher:
-                // a concurrent new-session attach for this dev_id can land
-                // BEFORE this destructor runs (slicer set_selected_machine
-                // disconnect+reconnect is racey by design), and nulling
-                // here would overwrite the live wiring → 30 s push_status
-                // blackhole before the slicer gives up and re-clicks.
-                // The next session's attach_downstream naturally overwrites
-                // this entry; the captured `dead` flag guarantees the old
-                // lambda is a safe no-op until then.
+                // Per-session detach: only THIS session's entry leaves
+                // the downstreams vector. Concurrent sessions for the
+                // same dev_id keep receiving printer pushes. This
+                // replaces the old "leave it wired, let the next attach
+                // overwrite" hack — which was correct under single-slot
+                // semantics but is wrong under multi-subscriber fan-out.
+                if (sess->session_id != 0) {
+                    uplink->detach_downstream(dev->spec.dev_id,
+                                              sess->session_id);
+                }
                 uplink->on_disconnect(dev->spec.dev_id);
             }
         }
@@ -743,7 +755,7 @@ void session_io_loop(MqttBroker::Device* dev,
                                           /*packet_id=*/0, /*dup=*/false);
                 enqueue_send(sess, std::move(pkt));
             };
-        uplink->attach_downstream(dev->spec.dev_id, publisher);
+        uplink->attach_downstream(dev->spec.dev_id, sess->session_id, publisher);
     }
 
     // Consumed bytes for the CONNECT packet.

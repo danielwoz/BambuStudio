@@ -168,6 +168,83 @@ int main() {
         }
     }
 
+    // ---- Multi-subscriber fan-out + retained cache + per-session detach ----
+    std::mutex mux;
+    std::vector<int> hits(3, 0);
+    auto make_pub = [&](int idx) {
+        return [&, idx](std::string, std::vector<uint8_t>, uint8_t) {
+            std::lock_guard<std::mutex> lk(mux);
+            ++hits[idx];
+        };
+    };
+    up.attach_downstream(dev_id_a, /*session_id=*/1001, make_pub(0));
+    up.attach_downstream(dev_id_a, /*session_id=*/1002, make_pub(1));
+    up.attach_downstream(dev_id_a, /*session_id=*/1003, make_pub(2));
+
+    // Retained cache holds the RUNNING delivery from earlier; each
+    // attach replays it synchronously. (Only 1 cached message — the
+    // ring is bounded to 2 but only 1 has been delivered so far.)
+    {
+        std::lock_guard<std::mutex> lk(mux);
+        check(hits[0] == 1,
+              "retained cache replays 1 message to LAN subscriber 1 at attach");
+        check(hits[1] == 1,
+              "retained cache replays 1 message to LAN subscriber 2 at attach");
+        check(hits[2] == 1,
+              "retained cache replays 1 message to LAN subscriber 3 at attach");
+    }
+
+    // One live LAN delivery → all 3 subscribers see it.
+    mock->deliver_local_message_for_test(dev_id_a,
+        "{\"print\":{\"state\":\"FANOUT\"}}");
+    {
+        std::lock_guard<std::mutex> lk(mux);
+        check(hits[0] == 2, "LAN fan-out: subscriber 1 saw delivery");
+        check(hits[1] == 2, "LAN fan-out: subscriber 2 saw delivery");
+        check(hits[2] == 2, "LAN fan-out: subscriber 3 saw delivery");
+    }
+
+    // Per-session detach: drop subscriber 1; the others keep receiving.
+    up.detach_downstream(dev_id_a, /*session_id=*/1001);
+    mock->deliver_local_message_for_test(dev_id_a,
+        "{\"print\":{\"state\":\"AFTER\"}}");
+    {
+        std::lock_guard<std::mutex> lk(mux);
+        check(hits[0] == 2,
+              "LAN per-session detach: subscriber 1 received nothing more");
+        check(hits[1] == 3,
+              "LAN per-session detach: subscriber 2 still receives");
+        check(hits[2] == 3,
+              "LAN per-session detach: subscriber 3 still receives");
+    }
+
+    // Fresh subscriber after deliveries gets the last 2 messages
+    // replayed (FANOUT + AFTER).
+    std::mutex late_mu;
+    std::vector<std::string> late_seen;
+    up.attach_downstream(dev_id_a, /*session_id=*/2001,
+        [&](std::string /*t*/, std::vector<uint8_t> p, uint8_t /*q*/) {
+            std::lock_guard<std::mutex> lk(late_mu);
+            late_seen.emplace_back(p.begin(), p.end());
+        });
+    {
+        std::lock_guard<std::mutex> lk(late_mu);
+        check(late_seen.size() == 2,
+              "LAN fresh subscriber gets 2 retained messages on attach");
+        if (late_seen.size() == 2) {
+            check(late_seen[0] == "{\"print\":{\"state\":\"FANOUT\"}}",
+                  "LAN retained-cache replay order: oldest first");
+            check(late_seen[1] == "{\"print\":{\"state\":\"AFTER\"}}",
+                  "LAN retained-cache replay order: newest last");
+        }
+    }
+
+    // Detach the fan-out subscribers so the subsequent assertions about
+    // is_connected / disconnect aren't perturbed.
+    up.detach_downstream(dev_id_a, 1002);
+    up.detach_downstream(dev_id_a, 1003);
+    up.detach_downstream(dev_id_a, 2001);
+
     // ---- Second device: only the most recently-added is "current" ----
     LanUplinkConfig cfg_b;
     cfg_b.dev_id      = dev_id_b;

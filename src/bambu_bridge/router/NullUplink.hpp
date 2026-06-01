@@ -15,6 +15,7 @@
 
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace Slic3r {
 namespace bridge {
@@ -32,13 +33,22 @@ public:
     void on_disconnect (const std::string& dev_id) override;
 
     void attach_downstream(const std::string& dev_id,
+                           uint64_t            session_id,
+                           DownstreamPublisher publisher) override;
+    void detach_downstream(const std::string& dev_id,
+                           uint64_t            session_id) override;
+    void attach_downstream(const std::string& dev_id,
                            DownstreamPublisher publisher) override;
 
 private:
+    struct Subscriber {
+        uint64_t            session_id;
+        DownstreamPublisher publisher;
+    };
     // Stored only so callers can later send back via the publisher if
     // they want; NullUplink itself never pushes anything downstream.
     std::mutex                                                   m_mu;
-    std::unordered_map<std::string, DownstreamPublisher>         m_pub;
+    std::unordered_map<std::string, std::vector<Subscriber>>     m_pub;
 };
 
 } // namespace router

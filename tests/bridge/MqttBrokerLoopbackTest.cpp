@@ -93,10 +93,20 @@ struct RecordingUplink : public IUplink {
         disconnects.push_back(dev);
     }
     void attach_downstream(const std::string& dev,
+                           uint64_t /*session_id*/,
                            DownstreamPublisher p) override {
         std::lock_guard<std::mutex> lk(mu);
         if (p) pubs[dev] = std::move(p);
         else   pubs.erase(dev);
+    }
+    void detach_downstream(const std::string& dev,
+                           uint64_t /*session_id*/) override {
+        std::lock_guard<std::mutex> lk(mu);
+        pubs.erase(dev);
+    }
+    void attach_downstream(const std::string& dev,
+                           DownstreamPublisher p) override {
+        attach_downstream(dev, /*session_id=*/0, std::move(p));
     }
 };
 

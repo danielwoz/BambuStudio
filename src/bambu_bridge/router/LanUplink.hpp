@@ -127,6 +127,14 @@ public:
     void on_unsubscribe(const std::string& dev_id, std::string topic) override;
     void on_disconnect (const std::string& dev_id) override;
     void attach_downstream(const std::string& dev_id,
+                           uint64_t            session_id,
+                           DownstreamPublisher publisher) override;
+    void detach_downstream(const std::string& dev_id,
+                           uint64_t            session_id) override;
+    // Deprecated single-publisher overload. Logs a warning. Synthesises
+    // session_id = 0. Kept so existing tests and the legacy
+    // SessionRouter call path keep compiling.
+    void attach_downstream(const std::string& dev_id,
                            DownstreamPublisher publisher) override;
 
 private:

@@ -11,6 +11,7 @@
 #include "../EncMsgEnvelope.hpp"
 #include "RawMqttPublisher.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -306,6 +307,22 @@ struct LanUplink::Impl {
         std::unordered_map<std::string, int> topic_refs;
     };
 
+    // Per-session downstream entry. Multiple sessions per dev_id all
+    // receive the same printer-side traffic (multi-subscriber fan-out).
+    struct Subscriber {
+        uint64_t                            session_id;
+        server::IUplink::DownstreamPublisher publisher;
+    };
+
+    // Last few inbound messages per dev_id, replayed synchronously to a
+    // newly-attached publisher. Bounded to 2.
+    struct RetainedMsg {
+        std::string          topic;
+        std::vector<uint8_t> payload;
+        uint8_t              qos;
+    };
+    static constexpr size_t kRetainedCap = 2;
+
     std::shared_ptr<BambuNetworkingPluginHandle>                  handle;
     // Ship 7 — optional native enc_msg envelope wrapper. When set,
     // on_publish wraps print.* payloads before cert+key publish; otherwise
@@ -313,8 +330,8 @@ struct LanUplink::Impl {
     std::shared_ptr<EncMsgEnvelope>                               enc_msg;
     mutable std::mutex                                            mu;
     std::unordered_map<std::string, std::unique_ptr<DeviceState>> devices;
-    std::unordered_map<std::string,
-                       server::IUplink::DownstreamPublisher>      downstreams;
+    std::unordered_map<std::string, std::vector<Subscriber>>      downstreams;
+    std::unordered_map<std::string, std::vector<RetainedMsg>>     retained;
 
     // The plugin only supports ONE active LAN connection at a time. Track
     // which dev_id currently owns it; is_connected(dev_id) returns true
@@ -375,13 +392,24 @@ void LanUplink::attach_plugin(std::shared_ptr<BambuNetworkingPluginHandle> handl
                 [impl, dev_id](std::string topic,
                                std::vector<uint8_t> payload,
                                uint8_t qos) {
-                server::IUplink::DownstreamPublisher cb;
+                std::vector<server::IUplink::DownstreamPublisher> cbs;
                 {
                     std::lock_guard<std::mutex> lk(impl->mu);
                     auto it = impl->downstreams.find(dev_id);
-                    if (it != impl->downstreams.end()) cb = it->second;
+                    if (it != impl->downstreams.end()) {
+                        cbs.reserve(it->second.size());
+                        for (auto& s : it->second) cbs.push_back(s.publisher);
+                    }
+                    auto& ring = impl->retained[dev_id];
+                    ring.push_back({topic, payload, qos});
+                    if (ring.size() > Impl::kRetainedCap) {
+                        ring.erase(ring.begin(),
+                                   ring.begin() + (ring.size() - Impl::kRetainedCap));
+                    }
                 }
-                if (cb) cb(std::move(topic), std::move(payload), qos);
+                for (auto& cb : cbs) {
+                    if (cb) cb(topic, payload, qos);
+                }
             });
         }
     }
@@ -430,13 +458,31 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
         [impl, dev_id](std::string topic,
                        std::vector<uint8_t> payload,
                        uint8_t qos) {
-        server::IUplink::DownstreamPublisher cb;
+        std::vector<server::IUplink::DownstreamPublisher> cbs;
+        size_t subscriber_count = 0;
         {
             std::lock_guard<std::mutex> lk(impl->mu);
             auto it = impl->downstreams.find(dev_id);
-            if (it != impl->downstreams.end()) cb = it->second;
+            if (it != impl->downstreams.end()) {
+                subscriber_count = it->second.size();
+                cbs.reserve(subscriber_count);
+                for (auto& s : it->second) cbs.push_back(s.publisher);
+            }
+            auto& ring = impl->retained[dev_id];
+            ring.push_back({topic, payload, qos});
+            if (ring.size() > Impl::kRetainedCap) {
+                ring.erase(ring.begin(),
+                           ring.begin() + (ring.size() - Impl::kRetainedCap));
+            }
         }
-        if (cb) cb(std::move(topic), std::move(payload), qos);
+        std::fprintf(stderr,
+            "[lan-uplink] receiver dev=%s topic=%s bytes=%zu qos=%u subscribers=%zu\n",
+            dev_id.c_str(), topic.c_str(), payload.size(), unsigned(qos),
+            subscriber_count);
+        std::fflush(stderr);
+        for (auto& cb : cbs) {
+            if (cb) cb(topic, payload, qos);
+        }
     });
 
     // Establish the LAN connection. The plugin only holds one LAN
@@ -470,6 +516,7 @@ void LanUplink::remove_device(const std::string& dev_id) {
         if (it == m_impl->devices.end()) return;
         m_impl->devices.erase(it);
         m_impl->downstreams.erase(dev_id);
+        m_impl->retained.erase(dev_id);
         if (m_impl->current_connected_dev_id == dev_id) {
             m_impl->current_connected_dev_id.clear();
             was_current = true;
@@ -773,17 +820,76 @@ void LanUplink::on_unsubscribe(const std::string& dev_id, std::string topic) {
 void LanUplink::on_disconnect(const std::string& dev_id) {
     // Slicer detached. Match CloudUplink behaviour: we do NOT tear down
     // the plugin's LAN session — the bridge keeps it hot so reports keep
-    // flowing for the next slicer that connects. Just drop the
-    // per-device downstream publisher.
+    // flowing for the next slicer that connects. Per-session detach
+    // happens via detach_downstream(); on_disconnect from the broker
+    // would race with a concurrent reconnect, so it's a no-op for the
+    // downstreams map.
+    (void)dev_id;
+}
+
+void LanUplink::attach_downstream(const std::string& dev_id,
+                                  uint64_t            session_id,
+                                  DownstreamPublisher publisher) {
+    std::vector<Impl::RetainedMsg> replay;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->mu);
+        if (!publisher) {
+            auto it = m_impl->downstreams.find(dev_id);
+            if (it != m_impl->downstreams.end()) {
+                auto& vec = it->second;
+                vec.erase(std::remove_if(vec.begin(), vec.end(),
+                              [&](const Impl::Subscriber& s) {
+                                  return s.session_id == session_id;
+                              }),
+                          vec.end());
+                if (vec.empty()) m_impl->downstreams.erase(it);
+            }
+            return;
+        }
+        auto& vec = m_impl->downstreams[dev_id];
+        bool replaced = false;
+        for (auto& s : vec) {
+            if (s.session_id == session_id) {
+                s.publisher = publisher;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) vec.push_back({session_id, publisher});
+        auto rit = m_impl->retained.find(dev_id);
+        if (rit != m_impl->retained.end()) replay = rit->second;
+    }
+    for (auto& m : replay) {
+        publisher(m.topic, m.payload, m.qos);
+    }
+}
+
+void LanUplink::detach_downstream(const std::string& dev_id,
+                                  uint64_t            session_id) {
     std::lock_guard<std::mutex> lk(m_impl->mu);
-    m_impl->downstreams.erase(dev_id);
+    auto it = m_impl->downstreams.find(dev_id);
+    if (it == m_impl->downstreams.end()) return;
+    auto& vec = it->second;
+    vec.erase(std::remove_if(vec.begin(), vec.end(),
+                  [&](const Impl::Subscriber& s) {
+                      return s.session_id == session_id;
+                  }),
+              vec.end());
+    if (vec.empty()) m_impl->downstreams.erase(it);
 }
 
 void LanUplink::attach_downstream(const std::string& dev_id,
                                   DownstreamPublisher publisher) {
-    std::lock_guard<std::mutex> lk(m_impl->mu);
-    if (publisher) m_impl->downstreams[dev_id] = std::move(publisher);
-    else           m_impl->downstreams.erase(dev_id);
+    std::fprintf(stderr,
+        "[lan-uplink] WARN: deprecated 2-arg attach_downstream(dev=%s) — "
+        "caller should use the (dev_id, session_id, publisher) overload\n",
+        dev_id.c_str());
+    std::fflush(stderr);
+    if (publisher) {
+        attach_downstream(dev_id, /*session_id=*/0, std::move(publisher));
+    } else {
+        detach_downstream(dev_id, /*session_id=*/0);
+    }
 }
 
 } // namespace router

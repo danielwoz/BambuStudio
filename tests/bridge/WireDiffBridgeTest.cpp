@@ -248,6 +248,9 @@ struct DroppingUplink : public IUplink {
                     std::vector<uint8_t>, uint8_t) override {}
     void on_unsubscribe(const std::string&, std::string) override {}
     void on_disconnect(const std::string&) override {}
+    void attach_downstream(const std::string&, uint64_t,
+                           DownstreamPublisher) override {}
+    void detach_downstream(const std::string&, uint64_t) override {}
     void attach_downstream(const std::string&, DownstreamPublisher) override {}
 };
 

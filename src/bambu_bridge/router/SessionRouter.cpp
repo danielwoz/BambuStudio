@@ -182,6 +182,7 @@ void SessionRouter::on_disconnect(const std::string& dev_id) {
 }
 
 void SessionRouter::attach_downstream(const std::string& dev_id,
+                                      uint64_t            session_id,
                                       DownstreamPublisher publisher) {
     // Critical: register with BOTH sub-uplinks. Either side may receive
     // a printer-state report independently — for example, a print started
@@ -195,8 +196,31 @@ void SessionRouter::attach_downstream(const std::string& dev_id,
         lan   = m_lan;
         cloud = m_cloud;
     }
-    if (lan)   lan  ->attach_downstream(dev_id, publisher);
-    if (cloud) cloud->attach_downstream(dev_id, publisher);
+    if (lan)   lan  ->attach_downstream(dev_id, session_id, publisher);
+    if (cloud) cloud->attach_downstream(dev_id, session_id, publisher);
+}
+
+void SessionRouter::detach_downstream(const std::string& dev_id,
+                                      uint64_t            session_id) {
+    std::shared_ptr<LanUplink>   lan;
+    std::shared_ptr<CloudUplink> cloud;
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        lan   = m_lan;
+        cloud = m_cloud;
+    }
+    if (lan)   lan  ->detach_downstream(dev_id, session_id);
+    if (cloud) cloud->detach_downstream(dev_id, session_id);
+}
+
+void SessionRouter::attach_downstream(const std::string& dev_id,
+                                      DownstreamPublisher publisher) {
+    std::fprintf(stderr,
+        "[session-router] WARN: deprecated 2-arg attach_downstream(dev=%s)\n",
+        dev_id.c_str());
+    std::fflush(stderr);
+    if (publisher) attach_downstream(dev_id, /*session_id=*/0, std::move(publisher));
+    else           detach_downstream(dev_id, /*session_id=*/0);
 }
 
 } // namespace router
