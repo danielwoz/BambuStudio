@@ -638,77 +638,24 @@ static bool inject_filament_settings(const std::string& threemf_path,
     const auto& fs_ids = project_cfg["filament_settings_id"];
     const std::size_t N = fs_ids.size();
 
-    // Figure out which filament indices the print actually uses. Prefer
-    // plate_*.json `filament_ids` (0-indexed); fall back to slice_info
-    // `<filament id="N" .../>` (1-indexed → subtract 1). If neither is
-    // readable, default to all filaments (worst case overshoot — but
-    // ams_mapping validation only cares that referenced indices have a
-    // matching file, so emitting extras is safe).
-    std::vector<int> active_filaments;  // 0-indexed
-    if (plate_json_idx >= 0) {
-        mz_zip_archive_file_stat st{};
-        if (mz_zip_reader_file_stat(&in, plate_json_idx, &st)) {
-            std::string body(static_cast<std::size_t>(st.m_uncomp_size), '\0');
-            if (st.m_uncomp_size == 0 ||
-                mz_zip_reader_extract_to_mem(&in, plate_json_idx, body.data(),
-                                             body.size(), 0)) {
-                try {
-                    json pj = json::parse(body);
-                    if (pj.contains("filament_ids") && pj["filament_ids"].is_array()) {
-                        std::set<int> seen;
-                        for (const auto& v : pj["filament_ids"]) {
-                            if (v.is_number_integer()) {
-                                int idx = v.get<int>();
-                                if (idx >= 0 && static_cast<std::size_t>(idx) < N &&
-                                    seen.insert(idx).second) {
-                                    active_filaments.push_back(idx);
-                                }
-                            }
-                        }
-                    }
-                } catch (...) {
-                    // Fall through to slice_info / all-filaments fallback.
-                }
-            }
-        }
-    }
-    if (active_filaments.empty() && slice_info_idx >= 0) {
-        mz_zip_archive_file_stat st{};
-        if (mz_zip_reader_file_stat(&in, slice_info_idx, &st)) {
-            std::string body(static_cast<std::size_t>(st.m_uncomp_size), '\0');
-            if (st.m_uncomp_size == 0 ||
-                mz_zip_reader_extract_to_mem(&in, slice_info_idx, body.data(),
-                                             body.size(), 0)) {
-                // slice_info.config is XML — simple substring scan for
-                // `<filament id="N"`. Parser-free; the slicer's emitter
-                // formats the attribute as `id="N"` (no leading zeros,
-                // 1-indexed). Order is the source order so we preserve
-                // it via the seen-set.
-                std::set<int> seen;
-                std::size_t p = 0;
-                while ((p = body.find("<filament id=\"", p)) != std::string::npos) {
-                    p += 14;
-                    std::size_t q = body.find('"', p);
-                    if (q == std::string::npos) break;
-                    try {
-                        int one_idx = std::stoi(body.substr(p, q - p));
-                        int idx = one_idx - 1;  // 1-indexed → 0-indexed
-                        if (idx >= 0 && static_cast<std::size_t>(idx) < N &&
-                            seen.insert(idx).second) {
-                            active_filaments.push_back(idx);
-                        }
-                    } catch (...) {}
-                    p = q + 1;
-                }
-            }
-        }
-    }
-    if (active_filaments.empty()) {
-        // No reliable active-filament list — fall back to ALL filaments
-        // so we never under-cover what the firmware validates.
-        for (std::size_t i = 0; i < N; ++i) {
-            active_filaments.push_back(static_cast<int>(i));
-        }
+    // Emit ONE filament_settings_<i+1>.config for EVERY filament slot
+    // configured in the project (i = 0..N-1), not just the slots the
+    // current plate uses. The H2D firmware validates against ALL
+    // configured filaments — when only the actively-used one is shipped
+    // it reports HMS 0700700000020008 ("Failed to get AMS mapping
+    // table") for whichever slot it iterated to first that lacked a
+    // backing file. The trace's 2-filament project shipped 2 files
+    // (docs/plugin-trace/H2D-cloud.yaml § threemf_payload), our 11-slot
+    // project should ship 11. plate_*.json's filament_ids / slice_info's
+    // <filament id=...> only tell us which slot's color/temp the gcode
+    // uses; the firmware needs the whole roster for AMS validation.
+    std::vector<int> active_filaments;  // 0-indexed; "active" is a
+                                        // legacy name — now means "all
+                                        // configured project slots".
+    (void) plate_json_idx;
+    (void) slice_info_idx;
+    for (std::size_t i = 0; i < N; ++i) {
+        active_filaments.push_back(static_cast<int>(i));
     }
 
     // Build a synthetic per-filament JSON. Strategy:
