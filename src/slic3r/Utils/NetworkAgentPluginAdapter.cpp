@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -330,13 +331,81 @@ int NetworkAgentPluginAdapter::send_message_to_printer(
         int(m_agent->is_server_connected()),
         json_payload.c_str());
     std::fflush(stderr);
-    // No raw mTLS fallback: the GUI does not have one, so neither does
-    // the bridge in "be identical to the GUI" mode. If the plugin's
-    // primary cloud+LAN send_message returned an error, surface it —
-    // do not synthesise a publish through a path the GUI never uses.
-    // See experiment/identical-to-gui branch rationale + removed
-    // mTLS resolver / RawMqttPublisher one-shot path that used to live
-    // here.
+    if (rc_lan == 0) return 0;
+
+    // ──────────── cert_report retry / "device-tab click on error" ────────────
+    //
+    // Both paths failed (rc_cloud=-2 and rc_lan=-4). The most common cause
+    // is the plugin's enc_msg gate: device_pub_key_map[dev_id] is empty
+    // because the printer's cert_report MQTT reply lost the race against
+    // the single install_device_cert call the natural GUI lambda fires
+    // (set_on_printer_connected_fn in GUI_App.cpp:2160). The plugin then
+    // rejects every print.* publish with rc=-4 forever until the gate is
+    // re-opened.
+    //
+    // Mimic what a user does in the GUI when a control command fails:
+    // click the Device tab again, which re-fires the connected-callback
+    // chain (push_all + get_version + get_access_code + install_device_cert).
+    // We compress that to just install_device_cert here (the only call
+    // that actually re-triggers cert_report on the wire). Sleep briefly
+    // for the reply to land, then retry the original send once.
+    //
+    // Coalesced per (dev_id) so a burst of failing publishes triggers
+    // ONE retry cycle, not N. The map entry's expiry blocks re-retry for
+    // 8 s so we don't hammer install_device_cert if the gate is durably
+    // broken (e.g. printer powered off).
+    {
+        using namespace std::chrono;
+        const auto now = steady_clock::now();
+        bool should_retry = false;
+        {
+            std::lock_guard<std::mutex> lk(m_cert_retry_mu);
+            auto it = m_cert_retry_after.find(dev_id);
+            if (it == m_cert_retry_after.end() || it->second <= now) {
+                m_cert_retry_after[dev_id] = now + seconds(8);
+                should_retry = true;
+            }
+        }
+        if (should_retry) {
+            std::fprintf(stderr,
+                "[adapter] cert_report retry dev=%s — re-firing "
+                "install_device_cert(lan_only=false) then re-sending\n",
+                dev_id.c_str());
+            std::fflush(stderr);
+            // Determine LAN-only mode: same heuristic the GUI lambda uses.
+            // We don't have MachineObject in scope here, so pass false
+            // (cloud mode) — matches the bridge's primary case. If a
+            // user has a true LAN-only printer the bridge wasn't built
+            // for, that's a separate failure mode.
+            m_agent->install_device_cert(dev_id, /*lan_only=*/false);
+            // Wait for the printer's cert_report to land + plugin to
+            // process. Empirical from EXP-{A..E}: 5 s reliable, 2 s
+            // flaky. We choose 3 s as a balance for filament-drying
+            // latency expectations.
+            std::this_thread::sleep_for(seconds(3));
+            int rc_cloud2 = m_agent->send_message(dev_id, json_payload, qos, 0);
+            if (rc_cloud2 == 0) {
+                std::fprintf(stderr,
+                    "[adapter] cert_report retry dev=%s SUCCESS via cloud\n",
+                    dev_id.c_str());
+                std::fflush(stderr);
+                return 0;
+            }
+            int rc_lan2 = m_agent->send_message_to_printer(dev_id, json_payload, qos, 0);
+            std::fprintf(stderr,
+                "[adapter] cert_report retry dev=%s rc_cloud=%d rc_lan=%d "
+                "(retry exhausted)\n",
+                dev_id.c_str(), rc_cloud2, rc_lan2);
+            std::fflush(stderr);
+            if (rc_lan2 == 0) return 0;
+            return rc_lan2;
+        }
+        std::fprintf(stderr,
+            "[adapter] cert_report retry dev=%s suppressed "
+            "(within 8 s of prior retry)\n",
+            dev_id.c_str());
+        std::fflush(stderr);
+    }
     return rc_lan;
 }
 

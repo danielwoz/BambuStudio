@@ -12,6 +12,7 @@
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "slic3r/Utils/FileTransferObject.hpp"
 #include "slic3r/Utils/bambu_virtual_client/VirtualLanPrinterStore.hpp"
+#include "slic3r/Utils/bambu_virtual_client/VirtualSsdpDiscovery.hpp"
 #include <boost/asio.hpp>
 #include <cstring>
 
@@ -375,21 +376,20 @@ void MediaPlayCtrl::Play()
         // Standard PLAIN RTSP served by the bridge's own C++ RtspServer
         // (server/RtspServer.cpp), NOT the proprietary bambu:/// scheme —
         // virtual printers use standard streaming the slicer's native
-        // GStreamer rtspsrc plays directly (no libBambuSource). Per-device
-        // port = rtsp_base + (mqtt_port - mqtt_base).
-        constexpr uint16_t kBridgeMqttPort = 8883;
+        // GStreamer rtspsrc plays directly (no libBambuSource).
+        //
+        // Port resolution: same shared resolver MQTT/FTPS/vtun use:
+        // live SSDP cache → persisted store → unicast probe of the
+        // bridge. Was store-only previously, which silently defaulted
+        // to the H2D's 38322 whenever the store hadn't captured this
+        // dev's mqtt_port yet — exactly the BBS-side regression that
+        // broke H2S/A1 video while H2D worked. Matches OrcaSlicer's
+        // build_virtual_live_url shape in
+        // OrcaSlicer-bridge/src/slic3r/GUI/Printer/MediaUrlBuilder.cpp.
         constexpr uint16_t kBridgeRtspPort = 38322;
-        uint16_t rtsp_port = kBridgeRtspPort;
-        {
-            Slic3r::VirtualLanPrinterStore store;
-            for (const auto& e : store.load()) {
-                if (e.dev_id == m_machine && e.mqtt_port != 0) {
-                    rtsp_port = static_cast<uint16_t>(
-                        int(kBridgeRtspPort) + (int(e.mqtt_port) - int(kBridgeMqttPort)));
-                    break;
-                }
-            }
-        }
+        const uint16_t rtsp_port =
+            Slic3r::VirtualSsdpDiscovery::port_for(
+                m_machine, kBridgeRtspPort, m_lan_ip);
         // Transport (rtsp vs rtsps) is detected by probing the bridge — no
         // slicer-side flag; the bridge's BAMBU_BRIDGE_RTSP_TLS is the single
         // source of truth.

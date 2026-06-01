@@ -2247,6 +2247,8 @@ void GUI_App::init_networking_callbacks()
         );
 
         auto message_arrive_fn = [this](std::string dev_id, std::string msg) {
+            std::fprintf(stderr, "[gui-callback] set_on_message_fn FIRED dev=%s bytes=%zu\n", dev_id.c_str(), msg.size());
+            std::fflush(stderr);
             if (is_closing()) {
                 return;
             }

@@ -29,9 +29,11 @@
 #include "PrintDispatcher.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 namespace Slic3r {
 
@@ -134,6 +136,15 @@ private:
     mutable std::mutex          m_resolver_mu;
     DispatcherInputsResolver    m_inputs_resolver; // optional; nullptr-safe
     MtlsResolver                m_mtls_resolver;   // optional; nullptr-safe
+
+    // Per-dev_id cert_report retry coalescing. When send_message_to_printer
+    // sees rc_cloud=-2 + rc_lan=-4 (the enc_msg-gate-closed signature),
+    // we re-fire install_device_cert + retry the original send. The
+    // expiry map suppresses re-retry within 8 s of a prior attempt so
+    // a burst of failing publishes triggers ONE retry cycle, not N.
+    mutable std::mutex                                                       m_cert_retry_mu;
+    std::unordered_map<std::string,
+                       std::chrono::steady_clock::time_point>                m_cert_retry_after;
 };
 
 } // namespace Slic3r
