@@ -680,14 +680,60 @@ static bool inject_filament_settings(const std::string& threemf_path,
         if (fs_ids[idx].is_string()) {
             name_str = fs_ids[idx].get<std::string>();
         }
-        out["name"]     = name_str;
-        out["from"]     = "project";
-        out["version"]  = version;
-        out["inherits"] = name_str;
+        // Required scalar metadata the printer needs to recognise this
+        // file as an instantiable filament profile. Without `type` and
+        // `instantiation` the firmware classifies the file as an
+        // unusable partial preset and AMS-mapping validation fails with
+        // HMS 0700700000020008. See
+        // resources/profiles/BBL/filament/Bambu PETG Basic @BBL H2D
+        // 0.4 nozzle.json for the canonical schema.
+        out["type"]          = "filament";
+        out["name"]          = name_str;
+        out["from"]          = "system";
+        out["instantiation"] = true;
+        out["inherits"]      = "";  // top-level system preset, no parent
+        out["version"]       = version;
+
+        // setting_id — Bambu's canonical filament identifier
+        // (e.g. "GFSG00_09" for PETG Basic). project_settings.config
+        // stores these per-filament as `filament_settings_id` already
+        // (the human-readable name), but the printer-side `setting_id`
+        // is the SKU/internal id. project_settings does carry
+        // `filament_self_index` per slot which is the closest analogue
+        // we have access to. Fall back to "GFB99_00" (a generic-PLA-ish
+        // ID) when there's no better signal — empty would be worse.
+        if (project_cfg.contains("filament_settings_id") &&
+            project_cfg["filament_settings_id"].is_array() &&
+            project_cfg["filament_settings_id"].size() > static_cast<std::size_t>(idx)) {
+            // Derive from filament_id array if present (per-filament SKUs).
+            if (project_cfg.contains("filament_id") &&
+                project_cfg["filament_id"].is_array() &&
+                project_cfg["filament_id"].size() > static_cast<std::size_t>(idx)) {
+                out["setting_id"] = project_cfg["filament_id"][static_cast<std::size_t>(idx)];
+            } else {
+                out["setting_id"] = "";
+            }
+        }
+
+        // compatible_printers — required so the printer accepts this
+        // filament for the current machine. Try project's printer_model
+        // / printer_settings_id; fall back to a sensible H2D default.
+        std::string printer_name = "Bambu Lab H2D 0.4 nozzle";
+        if (project_cfg.contains("printer_settings_id") &&
+            project_cfg["printer_settings_id"].is_string()) {
+            printer_name = project_cfg["printer_settings_id"].get<std::string>();
+        } else if (project_cfg.contains("printer_model") &&
+                   project_cfg["printer_model"].is_string()) {
+            // Model is e.g. "Bambu Lab H2D"; tack on a default nozzle.
+            printer_name = project_cfg["printer_model"].get<std::string>() + " 0.4 nozzle";
+        }
+        out["compatible_printers"] = json::array({printer_name});
 
         for (auto it = project_cfg.begin(); it != project_cfg.end(); ++it) {
             const std::string& k = it.key();
-            if (k == "version" || k == "from" || k == "name" || k == "inherits")
+            if (k == "version" || k == "from" || k == "name" || k == "inherits" ||
+                k == "type" || k == "instantiation" || k == "setting_id" ||
+                k == "compatible_printers")
                 continue;
             const auto& v = it.value();
             if (!v.is_array()) continue;
