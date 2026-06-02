@@ -309,7 +309,12 @@ void MediaFilePanel::UpdateByObj(MachineObject* obj)
         }
     }
 
-    Enable(obj && obj->is_info_ready() && obj->m_push_count > 0);
+    // Mirror MediaPlayCtrl: virtual (FFFF-prefix) printers never see an
+    // info.command=get_version reply via the bridge, so module_vers stays
+    // empty and is_info_ready returns false forever. Skip the version
+    // check for virtual dev_ids while still requiring a real pushall.
+    const bool is_virtual = obj && Slic3r::NetworkAgent::is_virtual_dev_id(obj->get_dev_id());
+    Enable(obj && obj->is_info_ready(/*check_version=*/!is_virtual) && obj->m_push_count > 0);
     if (machine == m_machine && !sdcard_state_changed) {
         if ((m_waiting_enable && IsEnabled()) || (m_waiting_support && (m_local_proto || m_remote_proto))) {
             auto fs = m_image_grid->GetFileSystem();

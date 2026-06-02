@@ -109,6 +109,15 @@ void log_ssl_err(const char* where) {
     unsigned long e = ERR_peek_last_error();
     char buf[256] = {0};
     if (e) ERR_error_string_n(e, buf, sizeof(buf));
+    // 2026-06-02: this used to silently swallow the error string —
+    // SSL_accept failures during RTSPS handshake from Orca's GStreamer
+    // rtspsrc produced no log output, leaving the camera at a black
+    // screen with no diagnostic trail. Emit the where + OpenSSL string
+    // to stderr so the bridge's per-device log captures it.
+    std::fprintf(stderr,
+        "[rtsp-server] ssl error at %s: %s\n",
+        where ? where : "?", e ? buf : "(no openssl error queued)");
+    std::fflush(stderr);
     ERR_clear_error();
 }
 
@@ -946,12 +955,29 @@ void session_io_loop(RtspServer::Device* dev,
         ~Cleanup() { sess->stopped.store(true); }
     } cleanup{sess};
 
+    // 2026-06-02: silent hang under TLS handshake from GStreamer rtspsrc
+    // — instrument every step so we can localise where SSL_accept stops
+    // returning. Cleared up once cursors=1 lands; remove these prints
+    // after the camera path is empirically stable.
+    std::fprintf(stderr,
+        "[rtsp-server] session_io_loop start fd=%d ssl=%p tls=%d\n",
+        sess->fd, (void*)sess->ssl, int(sess->ssl != nullptr));
+    std::fflush(stderr);
+
     if (sess->ssl) {  // TLS (RTSPS); plain RTSP skips the handshake
-        if (SSL_accept(sess->ssl) != 1) {
+        const int acc = SSL_accept(sess->ssl);
+        std::fprintf(stderr,
+            "[rtsp-server] SSL_accept fd=%d returned %d (err=%d)\n",
+            sess->fd, acc, acc <= 0 ? SSL_get_error(sess->ssl, acc) : 0);
+        std::fflush(stderr);
+        if (acc != 1) {
             log_ssl_err("SSL_accept(rtsp)");
             return;
         }
     }
+    std::fprintf(stderr,
+        "[rtsp-server] handshake ok fd=%d — entering control loop\n", sess->fd);
+    std::fflush(stderr);
 
     // Per-session control state.
     std::vector<uint8_t> recv;
@@ -1014,6 +1040,18 @@ void session_io_loop(RtspServer::Device* dev,
     const ICameraSource::Codec stream_codec =
         src ? src->info().codec : ICameraSource::Codec::H264_AnnexB;
 
+    // Per-session SPS+PPS cache (Layer 2 of the BBS-video-freeze fix,
+    // 2026-06-02). BambuLib's RTSP client requires SPS+PPS inline before
+    // every H.264 IDR — real Bambu cameras provide this; many camera
+    // sources only emit them once at stream start. Without inline
+    // SPS+PPS the decoder gives up ~2s in, the TCP read pauses, and
+    // (combined with the now-fixed missing SO_SNDTIMEO) the bridge used
+    // to wedge in a blocking sendmsg forever. Cache updates run inside
+    // `stream_one_frame` so the cache always reflects the most recent
+    // parameter set seen on the wire.
+    std::vector<uint8_t> sps_cache;
+    std::vector<uint8_t> pps_cache;
+
     // Helper: send one access-unit's worth of RTP packets for a Frame
     // pulled from the source. Returns false on TLS write failure.
     auto stream_one_frame = [&](const VideoFrame& f) -> bool {
@@ -1040,12 +1078,50 @@ void session_io_loop(RtspServer::Device* dev,
         std::vector<std::pair<size_t,size_t>> ranges;
         split_annexb_nals(f.nal_data, ranges);
         if (ranges.empty()) return true;
-        for (size_t i = 0; i < ranges.size(); ++i) {
-            const uint8_t* p = f.nal_data.data() + ranges[i].first;
-            const size_t   n = ranges[i].second;
-            const bool last  = (i + 1 == ranges.size());
-            if (!packetise_nal(sess->ssl, sess->fd, rtp_channel, rtp_seq, ts, rtp_ssrc,
-                               p, n, last,
+
+        // First pass — classify NALs, refresh the SPS/PPS cache, and
+        // note whether this access unit already carries them inline. NAL
+        // header is the first byte of the body; nal_type is the low 5
+        // bits (RFC 6184 §1.3).
+        bool has_sps = false, has_pps = false, has_idr = false;
+        for (auto& r : ranges) {
+            if (r.second == 0) continue;
+            const uint8_t* p = f.nal_data.data() + r.first;
+            const uint8_t nal_type = p[0] & 0x1F;
+            if (nal_type == 7) {      // SPS
+                sps_cache.assign(p, p + r.second);
+                has_sps = true;
+            } else if (nal_type == 8) { // PPS
+                pps_cache.assign(p, p + r.second);
+                has_pps = true;
+            } else if (nal_type == 5) { // IDR
+                has_idr = true;
+            }
+        }
+
+        // Second pass — build emission plan. If this access unit is an
+        // IDR without inline SPS+PPS, prepend the cached parameter sets
+        // so BambuLib's decoder can initialise on every keyframe. RTP
+        // marker bit (set on the last NAL via the `last` flag) belongs
+        // to the access unit, so the marker still lands on the actual
+        // last NAL of the original frame — not on our injected ones.
+        struct EmitEntry { const uint8_t* p; size_t n; };
+        std::vector<EmitEntry> plan;
+        plan.reserve(ranges.size() + 2);
+        if (has_idr && !has_sps && !sps_cache.empty())
+            plan.push_back({sps_cache.data(), sps_cache.size()});
+        if (has_idr && !has_pps && !pps_cache.empty())
+            plan.push_back({pps_cache.data(), pps_cache.size()});
+        for (auto& r : ranges) {
+            if (r.second == 0) continue;
+            plan.push_back({f.nal_data.data() + r.first, r.second});
+        }
+
+        for (size_t i = 0; i < plan.size(); ++i) {
+            const bool last = (i + 1 == plan.size());
+            if (!packetise_nal(sess->ssl, sess->fd, rtp_channel, rtp_seq, ts,
+                               rtp_ssrc,
+                               plan[i].p, plan[i].n, last,
                                static_cast<size_t>(cfg.rtp_max_payload))) {
                 return false;
             }
@@ -1246,6 +1322,20 @@ void RtspServer::start_device(Device& d) {
             if (cfg.io_timeout_seconds > 0) {
                 timeval rt{}; rt.tv_sec = cfg.io_timeout_seconds;
                 ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof(rt));
+            }
+            // 2026-06-02: BBS' wxMediaCtrl3 (libBambuSource RTSP client)
+            // stops draining the TCP socket ~2s in when its decoder
+            // can't make progress (likely missing in-band SPS+PPS before
+            // each IDR — Layer 2 fix elsewhere in this file). Without
+            // SO_SNDTIMEO the bridge's `::send` in `ssl_write_all` blocks
+            // forever in sk_stream_wait_memory: the io_loop never
+            // returns, no TEARDOWN runs, sessions zombie up with TCP
+            // Send-Q queued in megabytes. Hard cap so the write fails
+            // with EAGAIN, ssl_write_all returns false, session_io_loop
+            // returns, Cleanup flips stopped, and accept_thread reaps.
+            {
+                timeval st{}; st.tv_sec  = 10;
+                ::setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &st, sizeof(st));
             }
 
             // Reap finished sessions; enforce max_sessions_per_device.

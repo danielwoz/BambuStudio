@@ -27,7 +27,9 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>     // getenv
 #include <cstring>
+#include <ctime>       // clock_gettime, gmtime_r
 #include <set>
 #include <string>
 #include <unistd.h>
@@ -316,563 +318,207 @@ static std::string make_settings_only_zip(const std::string& threemf_path,
     return out_path;
 }
 
-// Normalise plate index in an Orca/Bambu .3mf so the printer firmware can
-// open it. Bambu's firmware (and BambuStudio's cloud project_file path,
-// per H2D-cloud.yaml) always references `Metadata/plate_0.gcode`. Orca's
-// PartPlate exporter writes the active plate as `Metadata/plate_<N>.gcode`
-// where N is the UI plate index (1-based) — so a single-plate slice ends
-// up at `plate_1.gcode` and the printer reports "couldn't read file".
+// ---------------------------------------------------------------------------
+// Normalise plate naming in an Orca-produced .3mf so the H2D firmware can
+// find the gcode the slicer's `print.gcode_file` MQTT command points at.
 //
-// The fix: rewrite the .3mf in place. Find any `Metadata/plate_<N>.<ext>`
-// entries (gcode, gcode.md5, png, _small.png, _no_light.png, .json, top_,
-// pick_) and rename to `plate_0.<ext>`. Patch `Metadata/model_settings.config`
-// so its `gcode_file`/`thumbnail_file`/etc. references match. Idempotent —
-// re-running on a .3mf that's already plate_0 is a no-op.
+// Empirical (2026-06-02, "Nozzle temperature test" AND regular BENCHY from
+// OrcaSlicer-bridge → bridge → H2D):
+//   - Orca writes Metadata/plate_0.gcode, plate_0.png, plate_0.gcode.md5,
+//     plate_no_light_0.png, top_0.png, pick_0.png, plate_0.json
+//   - model_settings.config has plater_id="0" and gcode_file=
+//     "Metadata/plate_0.gcode" (plus thumbnail_file etc. all _0)
+//   - BUT slice_info.config says index="1" and the slicer's MQTT
+//     print.gcode_file `param` is also plate_1-shaped
+// Result: printer looks for plate_1.gcode, finds only plate_0.gcode,
+// rejects with "didn't understand the file."
 //
-// Returns true if the file was rewritten (in place), false otherwise.
-// On any failure the original file is left untouched.
-static bool rewrite_plate_to_zero(const std::string& threemf_path,
-                                  const std::string& dev_id) {
+// Root cause is in Orca's bbs_3mf.cpp exporter (plate_data->plate_index is
+// -1 at most write sites, 0 at the slice_info site); not yet root-caused
+// upstream. This transform translates Orca's plate_0 archive to the BBS
+// plate_1 shape the firmware expects. BBS-direct prints already have
+// plate_1.gcode and are no-op'd.
+//
+// Inverse of the historical `rewrite_plate_to_zero` (which renamed
+// plate_<N>.* → plate_0.* in the wrong direction; removed when the BBS
+// flow proved plate_1 is what the firmware actually wants).
+//
+// Rewrites `in_path` in place via atomic rename of a sibling tempfile.
+static bool normalise_orca_plate_to_one(const std::string& in_path,
+                                        const std::string& dev_id) {
     mz_zip_archive in{};
-    if (!mz_zip_reader_init_file(&in, threemf_path.c_str(), 0)) {
+    if (!mz_zip_reader_init_file(&in, in_path.c_str(), 0)) {
         std::fprintf(stderr,
-            "[plate-rewrite] dev=%s open input %s failed\n",
-            dev_id.c_str(), threemf_path.c_str());
+            "[lan-upload] dev=%s normalise-plate: open %s failed\n",
+            dev_id.c_str(), in_path.c_str());
         std::fflush(stderr);
         return false;
     }
 
-    // Detect the source plate index by scanning for a `Metadata/plate_<N>.gcode`
-    // entry. If we find plate_0 already, nothing to do. If we find plate_<N>
-    // for N > 0, that's our source index.
-    int        src_idx = -1;
-    mz_uint    n_files = mz_zip_reader_get_num_files(&in);
-    for (mz_uint i = 0; i < n_files; ++i) {
+    // Detect Orca shape: plate_0.gcode present AND plate_1.gcode absent.
+    // Either condition unmet = BBS-style or non-print spool; no-op.
+    const mz_uint n_in = mz_zip_reader_get_num_files(&in);
+    bool has_plate_0 = false, has_plate_1 = false;
+    for (mz_uint i = 0; i < n_in; ++i) {
         char name[512];
         if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
         std::string nm(name);
-        if (nm.size() <= 15) continue;
-        if (nm.compare(0, 15, "Metadata/plate_") != 0) continue;
-        // Must end in ".gcode" so we don't pick up `.gcode.md5` as the lead
-        // (we accept the lead by gcode alone and rename its siblings by N).
-        if (nm.size() < 6 || nm.compare(nm.size() - 6, 6, ".gcode") != 0) continue;
-        std::size_t dot = nm.find('.', 15);
-        if (dot == std::string::npos) continue;
-        try {
-            src_idx = std::stoi(nm.substr(15, dot - 15));
-            break;
-        } catch (...) {}
+        if (nm == "Metadata/plate_0.gcode") has_plate_0 = true;
+        else if (nm == "Metadata/plate_1.gcode") has_plate_1 = true;
     }
-
-    if (src_idx <= 0) {
-        // Already plate_0 (idx==0) or no plate_*.gcode entry at all (16-byte
-        // probe / non-3mf upload). Either way: no rewrite.
+    if (!has_plate_0 || has_plate_1) {
         mz_zip_reader_end(&in);
-        return false;
+        std::fprintf(stderr,
+            "[lan-upload] dev=%s normalise-plate: no-op "
+            "(has_plate_0=%d has_plate_1=%d)\n",
+            dev_id.c_str(), int(has_plate_0), int(has_plate_1));
+        std::fflush(stderr);
+        return true;
     }
 
-    const std::string src_tag = "plate_" + std::to_string(src_idx);
-    const std::string dst_tag = "plate_0";
-
-    auto pos = threemf_path.find_last_of('/');
-    std::string dir = (pos == std::string::npos) ? "/tmp"
-                                                 : threemf_path.substr(0, pos);
-    std::string out_path = threemf_path + ".rewrite.tmp";
+    // Build the rewritten archive at a sibling path; rename atomically
+    // on success.
+    const std::string out_path = in_path + ".normalised";
     ::unlink(out_path.c_str());
-
     mz_zip_archive out{};
     if (!mz_zip_writer_init_file(&out, out_path.c_str(), 0)) {
         std::fprintf(stderr,
-            "[plate-rewrite] dev=%s open output %s failed\n",
+            "[lan-upload] dev=%s normalise-plate: create %s failed\n",
             dev_id.c_str(), out_path.c_str());
         std::fflush(stderr);
         mz_zip_reader_end(&in);
         return false;
     }
 
-    auto rename_entry = [&](const std::string& nm) {
-        // Replace `plate_<N>` with `plate_0` everywhere in the entry name.
-        // Two known shapes:
-        //   Metadata/plate_<N>.<ext>          (gcode, gcode.md5, png, json)
-        //   Metadata/plate_no_light_<N>.png   (special case)
-        //   Metadata/top_<N>.png
-        //   Metadata/pick_<N>.png
-        //   Metadata/plate_<N>_small.png
-        std::string out = nm;
-        auto subst = [&](const std::string& needle, const std::string& with) {
-            std::size_t p = 0;
-            while ((p = out.find(needle, p)) != std::string::npos) {
-                out.replace(p, needle.size(), with);
-                p += with.size();
-            }
-        };
-        subst(src_tag, dst_tag);
-        // Sibling-thumbnail naming variants (must use the same src_idx):
-        const std::string n = std::to_string(src_idx);
-        subst("plate_no_light_" + n, "plate_no_light_0");
-        subst("top_" + n,             "top_0");
-        subst("pick_" + n,            "pick_0");
-        return out;
+    // Path remap. Only entries that match a known plate_0-shaped prefix
+    // are renamed; everything else copies through unchanged. Tested
+    // patterns from a 2026-06-02 H2D Orca capture:
+    //   Metadata/plate_0.gcode, plate_0.gcode.md5, plate_0.png,
+    //   plate_0_small.png, plate_0.json,
+    //   Metadata/plate_no_light_0.png,
+    //   Metadata/top_0.png, Metadata/pick_0.png
+    auto remap_path = [](const std::string& nm) -> std::string {
+        // Order matters: plate_no_light_0 prefix is longer than plate_0
+        // — match the longer one first so we don't accidentally rewrite
+        // "plate_no_light_0" to "plate_1_no_light_0".
+        if (nm.rfind("Metadata/plate_no_light_0", 0) == 0)
+            return "Metadata/plate_no_light_1" + nm.substr(25);
+        if (nm.rfind("Metadata/plate_0", 0) == 0)
+            return "Metadata/plate_1" + nm.substr(16);
+        if (nm.rfind("Metadata/top_0", 0) == 0)
+            return "Metadata/top_1" + nm.substr(14);
+        if (nm.rfind("Metadata/pick_0", 0) == 0)
+            return "Metadata/pick_1" + nm.substr(15);
+        return nm;
+    };
+
+    auto str_replace_all = [](std::string s, const std::string& from,
+                              const std::string& to) -> std::string {
+        for (std::size_t p = 0; (p = s.find(from, p)) != std::string::npos;
+             p += to.size())
+            s.replace(p, from.size(), to);
+        return s;
     };
 
     int n_renamed = 0, n_copied = 0;
+    bool patched_model_settings = false;
     bool ok = true;
-    for (mz_uint i = 0; i < n_files; ++i) {
+
+    for (mz_uint i = 0; i < n_in && ok; ++i) {
         char name[512];
         if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
-        std::string nm(name);
-        std::string new_nm = rename_entry(nm);
+        const std::string in_name(name);
+        const std::string out_name = remap_path(in_name);
 
-        // model_settings.config carries gcode_file / thumbnail / pick / top
-        // string refs that themselves need updating. Read, rewrite, write
-        // explicitly. Every other entry just gets a rename via
-        // `mz_zip_writer_add_mem` (we can't use add_from_zip_reader because
-        // that preserves the source name).
-        std::size_t sz = 0;
-        std::vector<unsigned char> buf;
-        {
-            mz_zip_archive_file_stat st{};
-            if (!mz_zip_reader_file_stat(&in, i, &st)) { ok = false; break; }
-            buf.resize(static_cast<std::size_t>(st.m_uncomp_size));
-            if (st.m_uncomp_size > 0
-                && !mz_zip_reader_extract_to_mem(&in, i, buf.data(),
-                                                  buf.size(), 0)) {
-                ok = false;
-                break;
-            }
-        }
-
-        if (new_nm == "Metadata/model_settings.config") {
-            // Patch every `plate_<N>` occurrence (handles the metadata refs
-            // to gcode_file, thumbnail_file, pick_file, top_file etc.) and
-            // `plater_id" value="<N>"`. Simple string replace — the XML
-            // wrapping is unchanged so this is safe without a full parser.
-            std::string xml(buf.begin(), buf.end());
-            auto subst_all = [&](const std::string& needle,
-                                 const std::string& with) {
-                std::size_t p = 0;
-                while ((p = xml.find(needle, p)) != std::string::npos) {
-                    xml.replace(p, needle.size(), with);
-                    p += with.size();
-                }
-            };
-            const std::string n = std::to_string(src_idx);
-            subst_all(src_tag,                       dst_tag);
-            subst_all("plate_no_light_" + n,         "plate_no_light_0");
-            subst_all("top_" + n,                    "top_0");
-            subst_all("pick_" + n,                   "pick_0");
-            subst_all("plater_id\" value=\"" + n + "\"",
-                      "plater_id\" value=\"0\"");
-            buf.assign(xml.begin(), xml.end());
-        }
-
-        sz = buf.size();
-        if (!mz_zip_writer_add_mem(&out,
-                                   new_nm.c_str(),
-                                   sz == 0 ? nullptr : buf.data(),
-                                   sz,
-                                   MZ_DEFAULT_COMPRESSION)) {
-            std::fprintf(stderr,
-                "[plate-rewrite] dev=%s add '%s' -> '%s' failed\n",
-                dev_id.c_str(), nm.c_str(), new_nm.c_str());
-            std::fflush(stderr);
-            ok = false;
-            break;
-        }
-        if (new_nm != nm) ++n_renamed;
-        ++n_copied;
-    }
-
-    bool finalize_ok = ok &&
-        mz_zip_writer_finalize_archive(&out) &&
-        mz_zip_writer_end(&out);
-    mz_zip_reader_end(&in);
-
-    if (!finalize_ok) {
-        std::fprintf(stderr,
-            "[plate-rewrite] dev=%s finalize failed; leaving original\n",
-            dev_id.c_str());
-        std::fflush(stderr);
-        ::unlink(out_path.c_str());
-        return false;
-    }
-
-    if (::rename(out_path.c_str(), threemf_path.c_str()) != 0) {
-        std::fprintf(stderr,
-            "[plate-rewrite] dev=%s rename %s -> %s failed: %s\n",
-            dev_id.c_str(), out_path.c_str(), threemf_path.c_str(),
-            std::strerror(errno));
-        std::fflush(stderr);
-        ::unlink(out_path.c_str());
-        return false;
-    }
-
-    std::fprintf(stderr,
-        "[plate-rewrite] dev=%s normalised plate_%d -> plate_0 "
-        "(entries copied=%d renamed=%d)\n",
-        dev_id.c_str(), src_idx, n_copied, n_renamed);
-    std::fflush(stderr);
-    return true;
-}
-
-// Inject `Metadata/filament_settings_<K>.config` entries into the .3mf
-// when the slicer didn't ship them.
-//
-// Why: H2D firmware rejects prints with HMS error `0700700000020008`
-// ("Failed to get AMS mapping table; please select Resume to retry") when
-// the .3mf's project_settings has filament references the firmware can't
-// resolve to a per-slot filament profile inside the archive. BambuStudio
-// emits one `filament_settings_<K>.config` per active filament (see
-// `_add_project_embedded_presets_to_archive` in bbs_3mf.cpp:7730 and the
-// captured plugin trace in docs/plugin-trace/H2D-cloud.yaml section
-// `threemf_payload.contents`). OrcaSlicer only emits these files when
-// the user has user-overridden filament project presets — a "use Bambu
-// Lab PETG preset as-is" print ships zero filament_settings files and
-// the H2D bails on AMS-mapping validation.
-//
-// What we inject: for every filament index referenced by the print's
-// plate, synthesise a minimal `filament_settings_<K>.config` (K is the
-// 1-indexed position among ACTIVE filaments — first active = 1). The
-// content is the same JSON shape `ConfigBase::save_to_json` would emit
-// for a single embedded project preset: per-filament-array fields from
-// `Metadata/project_settings.config` narrowed to that filament's slot
-// (arrays of length N become 1-element; arrays of length 2N become
-// 2-element — one per extruder). Plus the identifying header fields
-// `name`/`inherits`/`from`/`version` so the firmware can validate the
-// AMS-mapping entry against a real filament profile.
-//
-// Returns true if the archive was rewritten; false on any failure or
-// when injection wasn't needed (already had filament_settings_*).
-//
-// Idempotent: re-running on a .3mf that already contains any
-// `Metadata/filament_settings_*.config` is a no-op.
-static bool inject_filament_settings(const std::string& threemf_path,
-                                     const std::string& dev_id) {
-    using nlohmann::json;
-
-    mz_zip_archive in{};
-    if (!mz_zip_reader_init_file(&in, threemf_path.c_str(), 0)) {
-        std::fprintf(stderr,
-            "[filament-inject] dev=%s open input %s failed\n",
-            dev_id.c_str(), threemf_path.c_str());
-        std::fflush(stderr);
-        return false;
-    }
-
-    // First pass — locate project_settings.config, a plate_*.json, the
-    // slice_info.config, and identify any pre-existing filament_settings_*
-    // entries so we can REPLACE them (not skip). Slicers — including the
-    // OrcaSlicer patch on experiment/3mf-filament-settings — emit
-    // sequentially-numbered files (filament_settings_1..N for N active
-    // extruder presets) which DON'T match the printer's expectation that
-    // filament_settings_<K>.config corresponds to project filament index
-    // (K-1). The bridge is the canonical place to enforce that mapping,
-    // so we strip any existing filament_settings_*.config entries on
-    // copy and regenerate from project_settings.config + the active
-    // plate's filament_ids.
-    int                  project_idx    = -1;
-    int                  plate_json_idx = -1;
-    int                  slice_info_idx = -1;
-    std::set<mz_uint>    strip_indices; // existing filament_settings_*.config — skip on copy
-    mz_uint              n_files        = mz_zip_reader_get_num_files(&in);
-    for (mz_uint i = 0; i < n_files; ++i) {
-        char name[512];
-        if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
-        std::string nm(name);
-        if (nm.size() > 17 &&
-            nm.compare(0, 26, "Metadata/filament_settings") == 0) {
-            strip_indices.insert(i);
-            continue;
-        }
-        if (nm == "Metadata/project_settings.config") project_idx = static_cast<int>(i);
-        else if (nm == "Metadata/slice_info.config")  slice_info_idx = static_cast<int>(i);
-        else if (plate_json_idx < 0 &&
-                 nm.size() > 14 &&
-                 nm.compare(0, 15, "Metadata/plate_") == 0 &&
-                 nm.size() > 5 &&
-                 nm.compare(nm.size() - 5, 5, ".json") == 0) {
-            plate_json_idx = static_cast<int>(i);
-        }
-    }
-
-    if (project_idx < 0) {
-        // Not a Bambu/Orca .3mf with project_settings — nothing to inject.
-        mz_zip_reader_end(&in);
-        return false;
-    }
-
-    // Read project_settings.config as JSON.
-    json project_cfg;
-    {
-        mz_zip_archive_file_stat st{};
-        if (!mz_zip_reader_file_stat(&in, project_idx, &st)) {
-            mz_zip_reader_end(&in);
-            return false;
-        }
-        std::string body(static_cast<std::size_t>(st.m_uncomp_size), '\0');
-        if (st.m_uncomp_size > 0 &&
-            !mz_zip_reader_extract_to_mem(&in, project_idx, body.data(),
-                                          body.size(), 0)) {
-            mz_zip_reader_end(&in);
-            return false;
-        }
-        try {
-            project_cfg = json::parse(body);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr,
-                "[filament-inject] dev=%s parse project_settings failed: %s\n",
-                dev_id.c_str(), e.what());
-            std::fflush(stderr);
-            mz_zip_reader_end(&in);
-            return false;
-        }
-    }
-
-    // Determine total filament count from `filament_settings_id`.
-    if (!project_cfg.contains("filament_settings_id") ||
-        !project_cfg["filament_settings_id"].is_array() ||
-        project_cfg["filament_settings_id"].empty()) {
-        mz_zip_reader_end(&in);
-        return false;
-    }
-    const auto& fs_ids = project_cfg["filament_settings_id"];
-    const std::size_t N = fs_ids.size();
-
-    // Emit ONE filament_settings_<i+1>.config for EVERY filament slot
-    // configured in the project (i = 0..N-1), not just the slots the
-    // current plate uses. The H2D firmware validates against ALL
-    // configured filaments — when only the actively-used one is shipped
-    // it reports HMS 0700700000020008 ("Failed to get AMS mapping
-    // table") for whichever slot it iterated to first that lacked a
-    // backing file. The trace's 2-filament project shipped 2 files
-    // (docs/plugin-trace/H2D-cloud.yaml § threemf_payload), our 11-slot
-    // project should ship 11. plate_*.json's filament_ids / slice_info's
-    // <filament id=...> only tell us which slot's color/temp the gcode
-    // uses; the firmware needs the whole roster for AMS validation.
-    std::vector<int> active_filaments;  // 0-indexed; "active" is a
-                                        // legacy name — now means "all
-                                        // configured project slots".
-    (void) plate_json_idx;
-    (void) slice_info_idx;
-    for (std::size_t i = 0; i < N; ++i) {
-        active_filaments.push_back(static_cast<int>(i));
-    }
-
-    // Build a synthetic per-filament JSON. Strategy:
-    //   - Copy `version` and `from` scalars verbatim (with sensible
-    //     fallbacks). The slicer's save_to_json wraps the file in a
-    //     `version`/`name`/`from` header.
-    //   - Set `name` and `inherits` from filament_settings_id[idx].
-    //   - For every other key in project_settings.config that's an array
-    //     of length N (per-filament) or 2N (per-filament-per-extruder),
-    //     narrow to a 1-element or 2-element array.
-    //   - Drop scalars and arrays of any other length — they're not
-    //     filament-specific and can't be sliced.
-    auto build_one = [&](int idx) -> json {
-        json out = json::object();
-        // Header. The slicer writes these in this order; we match for
-        // diff-friendliness against captured GUI snapshots.
-        std::string version = "1.0.0.0";
-        if (project_cfg.contains("version") && project_cfg["version"].is_string()) {
-            version = project_cfg["version"].get<std::string>();
-        }
-        std::string name_str;
-        if (fs_ids[idx].is_string()) {
-            name_str = fs_ids[idx].get<std::string>();
-        }
-        // Required scalar metadata the printer needs to recognise this
-        // file as an instantiable filament profile. Without `type` and
-        // `instantiation` the firmware classifies the file as an
-        // unusable partial preset and AMS-mapping validation fails with
-        // HMS 0700700000020008. See
-        // resources/profiles/BBL/filament/Bambu PETG Basic @BBL H2D
-        // 0.4 nozzle.json for the canonical schema.
-        out["type"]          = "filament";
-        out["name"]          = name_str;
-        out["from"]          = "system";
-        out["instantiation"] = true;
-        out["inherits"]      = "";  // top-level system preset, no parent
-        out["version"]       = version;
-
-        // setting_id — Bambu's canonical filament identifier
-        // (e.g. "GFSG00_09" for PETG Basic). project_settings.config
-        // stores these per-filament as `filament_settings_id` already
-        // (the human-readable name), but the printer-side `setting_id`
-        // is the SKU/internal id. project_settings does carry
-        // `filament_self_index` per slot which is the closest analogue
-        // we have access to. Fall back to "GFB99_00" (a generic-PLA-ish
-        // ID) when there's no better signal — empty would be worse.
-        if (project_cfg.contains("filament_settings_id") &&
-            project_cfg["filament_settings_id"].is_array() &&
-            project_cfg["filament_settings_id"].size() > static_cast<std::size_t>(idx)) {
-            // Derive from filament_id array if present (per-filament SKUs).
-            if (project_cfg.contains("filament_id") &&
-                project_cfg["filament_id"].is_array() &&
-                project_cfg["filament_id"].size() > static_cast<std::size_t>(idx)) {
-                out["setting_id"] = project_cfg["filament_id"][static_cast<std::size_t>(idx)];
-            } else {
-                out["setting_id"] = "";
-            }
-        }
-
-        // compatible_printers — required so the printer accepts this
-        // filament for the current machine. Try project's printer_model
-        // / printer_settings_id; fall back to a sensible H2D default.
-        std::string printer_name = "Bambu Lab H2D 0.4 nozzle";
-        if (project_cfg.contains("printer_settings_id") &&
-            project_cfg["printer_settings_id"].is_string()) {
-            printer_name = project_cfg["printer_settings_id"].get<std::string>();
-        } else if (project_cfg.contains("printer_model") &&
-                   project_cfg["printer_model"].is_string()) {
-            // Model is e.g. "Bambu Lab H2D"; tack on a default nozzle.
-            printer_name = project_cfg["printer_model"].get<std::string>() + " 0.4 nozzle";
-        }
-        out["compatible_printers"] = json::array({printer_name});
-
-        for (auto it = project_cfg.begin(); it != project_cfg.end(); ++it) {
-            const std::string& k = it.key();
-            if (k == "version" || k == "from" || k == "name" || k == "inherits" ||
-                k == "type" || k == "instantiation" || k == "setting_id" ||
-                k == "compatible_printers")
-                continue;
-            const auto& v = it.value();
-            if (!v.is_array()) continue;
-            const std::size_t L = v.size();
-            if (L == N) {
-                out[k] = json::array({v[static_cast<std::size_t>(idx)]});
-            } else if (N > 0 && L == 2 * N) {
-                std::size_t base = static_cast<std::size_t>(idx) * 2;
-                out[k] = json::array({v[base], v[base + 1]});
-            }
-            // else: not per-filament, skip.
-        }
-        return out;
-    };
-
-    // Now build the output zip: copy every existing entry verbatim,
-    // then append the synthesised filament_settings_K.config entries.
-    auto pos = threemf_path.find_last_of('/');
-    std::string dir = (pos == std::string::npos) ? "/tmp"
-                                                 : threemf_path.substr(0, pos);
-    std::string out_path = threemf_path + ".finject.tmp";
-    ::unlink(out_path.c_str());
-
-    mz_zip_archive out{};
-    if (!mz_zip_writer_init_file(&out, out_path.c_str(), 0)) {
-        std::fprintf(stderr,
-            "[filament-inject] dev=%s open output %s failed\n",
-            dev_id.c_str(), out_path.c_str());
-        std::fflush(stderr);
-        mz_zip_reader_end(&in);
-        return false;
-    }
-
-    bool ok = true;
-    for (mz_uint i = 0; i < n_files; ++i) {
-        // Skip any existing Metadata/filament_settings_*.config — we
-        // are about to regenerate them with the correct
-        // <project-filament-index+1>.config naming, so don't carry the
-        // slicer's mis-numbered originals through.
-        if (strip_indices.count(i)) continue;
-        if (!mz_zip_writer_add_from_zip_reader(&out, &in, i)) {
-            char name[512];
-            mz_zip_reader_get_filename(&in, i, name, sizeof(name));
-            std::fprintf(stderr,
-                "[filament-inject] dev=%s copy '%s' failed\n",
-                dev_id.c_str(), name);
-            std::fflush(stderr);
-            ok = false;
-            break;
-        }
-    }
-
-    int n_injected = 0;
-    if (ok) {
-        for (std::size_t k = 0; k < active_filaments.size(); ++k) {
-            int idx = active_filaments[k];
-            json j = build_one(idx);
-            // save_to_json uses `j.dump(1, '\t')` + trailing newline.
-            // We mirror that so the bytes match what the slicer would
-            // have produced.
-            std::string body = j.dump(1, '\t');
-            body.push_back('\n');
-            // File name uses idx+1 (project filament position, 1-indexed),
-            // NOT loop counter. slice_info.config emits `<filament id="N">`
-            // where N is the 1-indexed filament position in the project,
-            // and the printer expects `filament_settings_<N>.config` to
-            // match. Using loop counter (k+1) produced `filament_settings_1`
-            // for an active filament at project index 4, missing the
-            // expected `filament_settings_5.config` — printer returned
-            // HMS 0700700000020008 ("Failed to get AMS mapping table").
-            std::string entry = "Metadata/filament_settings_" +
-                                std::to_string(idx + 1) + ".config";
-            if (!mz_zip_writer_add_mem(&out,
-                                       entry.c_str(),
-                                       body.data(),
-                                       body.size(),
+        if (in_name == "Metadata/model_settings.config") {
+            // Extract → patch path references and plater_id → re-add.
+            // The same plate_0/plate_no_light_0/top_0/pick_0 prefixes
+            // appear inside as the value= of gcode_file / thumbnail_file
+            // / thumbnail_no_light_file / top_file / pick_file /
+            // pattern_bbox_file. Substring replace is safe because
+            // those strings never legitimately appear elsewhere in this
+            // file — XML attribute values are the only embedded paths.
+            std::size_t sz = 0;
+            void* data = mz_zip_reader_extract_to_heap(&in, i, &sz, 0);
+            if (!data) { ok = false; break; }
+            std::string body(static_cast<const char*>(data), sz);
+            mz_free(data);
+            body = str_replace_all(body, "Metadata/plate_no_light_0",
+                                          "Metadata/plate_no_light_1");
+            body = str_replace_all(body, "Metadata/plate_0",
+                                          "Metadata/plate_1");
+            body = str_replace_all(body, "Metadata/top_0",
+                                          "Metadata/top_1");
+            body = str_replace_all(body, "Metadata/pick_0",
+                                          "Metadata/pick_1");
+            // plater_id field is written as `plate_data->plate_index + 1`
+            // in bbs_3mf.cpp:7917. Same -1 source → "0" here; bump to 1
+            // so model_settings stays internally consistent with the
+            // renamed plate files.
+            body = str_replace_all(body, "key=\"plater_id\" value=\"0\"",
+                                          "key=\"plater_id\" value=\"1\"");
+            if (!mz_zip_writer_add_mem(&out, in_name.c_str(),
+                                       body.data(), body.size(),
                                        MZ_DEFAULT_COMPRESSION)) {
-                std::fprintf(stderr,
-                    "[filament-inject] dev=%s add '%s' failed\n",
-                    dev_id.c_str(), entry.c_str());
-                std::fflush(stderr);
-                ok = false;
-                break;
+                ok = false; break;
             }
-            ++n_injected;
+            patched_model_settings = true;
+            ++n_copied;
+        } else if (out_name != in_name) {
+            // Renamed entry: extract → re-add under new name.
+            std::size_t sz = 0;
+            void* data = mz_zip_reader_extract_to_heap(&in, i, &sz, 0);
+            if (!data) { ok = false; break; }
+            if (!mz_zip_writer_add_mem(&out, out_name.c_str(),
+                                       data, sz, MZ_DEFAULT_COMPRESSION)) {
+                mz_free(data);
+                ok = false; break;
+            }
+            mz_free(data);
+            ++n_renamed;
+        } else {
+            // Unchanged: bulk-copy preserving compression.
+            if (!mz_zip_writer_add_from_zip_reader(&out, &in, i)) {
+                ok = false; break;
+            }
+            ++n_copied;
         }
     }
 
-    bool finalize_ok = ok &&
-        mz_zip_writer_finalize_archive(&out) &&
-        mz_zip_writer_end(&out);
+    if (ok && !mz_zip_writer_finalize_archive(&out)) ok = false;
+    if (!mz_zip_writer_end(&out))                    ok = false;
     mz_zip_reader_end(&in);
 
-    if (!finalize_ok) {
+    if (!ok) {
+        ::unlink(out_path.c_str());
         std::fprintf(stderr,
-            "[filament-inject] dev=%s finalize failed; leaving original\n",
+            "[lan-upload] dev=%s normalise-plate: rewrite failed\n",
             dev_id.c_str());
         std::fflush(stderr);
-        ::unlink(out_path.c_str());
         return false;
     }
-
-    if (::rename(out_path.c_str(), threemf_path.c_str()) != 0) {
+    if (::rename(out_path.c_str(), in_path.c_str()) != 0) {
         std::fprintf(stderr,
-            "[filament-inject] dev=%s rename %s -> %s failed: %s\n",
-            dev_id.c_str(), out_path.c_str(), threemf_path.c_str(),
+            "[lan-upload] dev=%s normalise-plate: rename %s -> %s "
+            "failed: %s\n",
+            dev_id.c_str(), out_path.c_str(), in_path.c_str(),
             std::strerror(errno));
         std::fflush(stderr);
         ::unlink(out_path.c_str());
         return false;
     }
-
-    // Log the active-filament project indices (0-indexed) we generated
-    // files for. Helpful for diagnosing "Failed to get AMS mapping
-    // table" — confirms the printer should find a filament_settings_
-    // <idx+1>.config for every <filament id="idx+1"> in slice_info.
-    std::string idx_list;
-    for (std::size_t k = 0; k < active_filaments.size(); ++k) {
-        if (k) idx_list += ',';
-        idx_list += std::to_string(active_filaments[k]);
-    }
     std::fprintf(stderr,
-        "[lan-upload] dev=%s inject filament_settings count=%d "
-        "stripped_existing=%zu total_filaments=%zu active_indices=[%s]\n",
-        dev_id.c_str(), n_injected, strip_indices.size(), N,
-        idx_list.c_str());
+        "[lan-upload] dev=%s normalise-plate: rewrote %s "
+        "(renamed=%d copied=%d patched_model_settings=%d)\n",
+        dev_id.c_str(), in_path.c_str(),
+        n_renamed, n_copied, int(patched_model_settings));
     std::fflush(stderr);
     return true;
 }
+
 
 } // namespace
 
-// Test-only thin wrapper around the file-static inject helper. Lets
-// tests/harnesses drive the rewriter directly against a .3mf on disk
-// without standing up an entire UploadJob/MockPluginHandle.
-bool inject_filament_settings_for_test(const std::string& path,
-                                       const std::string& dev_id) {
-    return inject_filament_settings(path, dev_id);
-}
 
 void LanUploadSink::attach_plugin(
         std::shared_ptr<BambuNetworkingPluginHandle> handle) {
@@ -961,24 +607,26 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
         return res;
     }
 
-    // Normalise OrcaSlicer's `Metadata/plate_<N>.gcode` → `plate_0.gcode`
-    // BEFORE forwarding to the printer. Bambu firmware (and the cloud-relay
-    // project_file path observed in docs/plugin-trace/H2D-cloud.yaml) opens
-    // the .3mf and looks for `Metadata/plate_0.gcode`; Orca's plater_id is
-    // 1-based so a single-plate slice ends up at plate_1.gcode and the
-    // printer reports "couldn't read file". The rewriter is idempotent and
-    // a no-op when the upload is already plate_0 or isn't a .3mf at all.
-    (void) rewrite_plate_to_zero(tmp_path, job.dev_id);
+    // Normalise Orca-shaped plate_0.* archives to plate_1.* (no-op for
+    // BBS-style spools that are already plate_1). Runs BEFORE the debug
+    // snapshot, the settings-only zip, and the spool hard-link so all
+    // downstream artefacts see the corrected paths. See the helper above.
+    normalise_orca_plate_to_one(tmp_path, job.dev_id);
 
-    // Synthesise missing `Metadata/filament_settings_<K>.config` entries
-    // so the H2D firmware can validate ams_mapping. OrcaSlicer ships
-    // these files only when the user has user-overridden filament project
-    // presets; a "use Bambu PETG @BBL H2D as-is" print uploads with zero
-    // filament_settings files and the H2D rejects with HMS error
-    // 0700700000020008 ("Failed to get AMS mapping table; please select
-    // Resume to retry"). Idempotent — no-op when any
-    // `filament_settings_*.config` already exists in the archive.
-    (void) inject_filament_settings(tmp_path, job.dev_id);
+    // (Historically the bridge ran two .3mf transforms here:
+    //  `rewrite_plate_to_zero` renamed Metadata/plate_<N>.* → plate_0.*,
+    //  and `inject_filament_settings` synthesised 11 generic
+    //  filament_settings_<N>.config files. Empirical comparison against
+    //  a BBS-direct print proved both were the CAUSE of HMS
+    //  0700700000020008 rejection, not the cure: the plate rename
+    //  shifted file names but not Metadata/slice_info.config's
+    //  index=1 so the printer couldn't find the renamed file, and the
+    //  injected filament_settings content mismatched the actually-
+    //  loaded filament. Removed; see memory `project_orca_3mf_filament
+    //  _settings`. The slicer-side mirror is also removed — plates
+    //  start at 1 end-to-end. The new `normalise_orca_plate_to_one`
+    //  call above is the inverse: bring Orca-style plate_0 archives up
+    //  to plate_1 so the firmware finds the gcode it's told to print.)
 
     // Debug snapshot — copy of every spooled .3mf retained at a stable
     // path per dev_id so we can inspect what the slicer is actually
@@ -1046,6 +694,7 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
     lp.use_ssl_for_ftp  = true;
     lp.use_ssl_for_mqtt = true;
 
+
     // GUI parity for X1C/P1S: prefer the BambuTunnel-on-port-6000
     // route (eMMC target) over legacy FTPS-on-990 (SD card) when the
     // printer's BambuTunnel server is reachable. Plugin honours the
@@ -1086,27 +735,464 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
         lp.try_emmc_print = reachable;
     }
 
-    int rc = handle->start_local_print_with_record(lp);
+    // Spool ONLY. The bridge is a pass-through: the file goes into a
+    // per-dev_id staging directory keyed by the STOR remote name. When
+    // the slicer's matching `print.command=gcode_file` MQTT command
+    // arrives (a moment later — see virtual_lan_print_ in NetworkAgent.cpp)
+    // it carries the full AMS mapping / plate / cali context. At that
+    // point MqttBroker calls back into LanUploadSink::dispatch_print_command
+    // which looks up the spool here and invokes the plugin's
+    // start_local_print_with_record on the real dev_id (or start_print
+    // for A1-class printers via the adapter's built-in fallback).
+    //
+    // This decoupling is what lets the bridge map the slicer's intent
+    // (a slicer-side gcode_file MQTT) onto the appropriate real-printer
+    // command (LAN-FTPS+MQTT for H2D/H2S/X1/P1, or cloud-relay for A1
+    // and forced-cloud H2 firmware) — without the bridge having to
+    // re-derive the AMS context the slicer already had.
+    //
+    // Stable per-dev spool location: `/tmp/bridge-spool/<dev_id>/<filename>`.
+    // Same dev_id + filename on the next print just overwrites — fine,
+    // there's only one job in flight per dev_id at a time. The per-job
+    // tempfile from spool_upload_to_tempfile is hard-linked here and
+    // then cleanup_upload_tempfile rmdir's the tempfile's containing
+    // dir — the spool path survives because of the link.
+    std::string spool_dir = "/tmp/bridge-spool/" + job.dev_id;
+    ::mkdir("/tmp/bridge-spool", 0700);
+    ::mkdir(spool_dir.c_str(), 0700);
+    std::string spool_basename =
+        job.filename.empty() ? std::string("lan_print.3mf") : job.filename;
+    // Strip any leading '/' (job.filename is whatever the slicer sent in
+    // its STOR remote name; harmless to defend against accidental paths).
+    while (!spool_basename.empty() && spool_basename.front() == '/')
+        spool_basename.erase(0, 1);
+    std::string spool_path = spool_dir + "/" + spool_basename;
+    ::unlink(spool_path.c_str());
+    if (::link(tmp_path.c_str(), spool_path.c_str()) != 0) {
+        // Cross-fs / EXDEV fallback: stream-copy.
+        FILE* in_f  = std::fopen(tmp_path.c_str(),  "rb");
+        FILE* out_f = std::fopen(spool_path.c_str(), "wb");
+        if (in_f && out_f) {
+            char buf[64 * 1024];
+            std::size_t n;
+            while ((n = std::fread(buf, 1, sizeof(buf), in_f)) > 0)
+                std::fwrite(buf, 1, n, out_f);
+        }
+        if (in_f)  std::fclose(in_f);
+        if (out_f) std::fclose(out_f);
+    }
+    // Persist the settings-only sidecar alongside the spool. Both
+    // legs of the plugin's start_local_print_with_record need it
+    // (LAN-FTPS path uploads the config to OSS for record; cloud-
+    // relay path uses it as the project_file config). Without it the
+    // plugin returns -2030 (config-to-OSS failed) on the LAN leg
+    // and -3070 on the cloud-fallback leg.
+    //
+    // settings_path (made earlier by make_settings_only_zip on the
+    // per-job tempfile) currently sits in /tmp/bridge-upload-XXX/
+    // which is about to be cleanup_upload_tempfile-rmdir'd. Hard-
+    // link it next to the main spool so it survives.
+    std::string spool_config_path;
+    if (!settings_path.empty()) {
+        auto dot = spool_basename.find_last_of('.');
+        std::string stem = (dot == std::string::npos)
+                           ? spool_basename : spool_basename.substr(0, dot);
+        spool_config_path = spool_dir + "/" + stem + "_config.3mf";
+        ::unlink(spool_config_path.c_str());
+        if (::link(settings_path.c_str(), spool_config_path.c_str()) != 0) {
+            // EXDEV fallback: stream-copy.
+            FILE* in_f  = std::fopen(settings_path.c_str(),  "rb");
+            FILE* out_f = std::fopen(spool_config_path.c_str(), "wb");
+            if (in_f && out_f) {
+                char buf[64 * 1024];
+                std::size_t n;
+                while ((n = std::fread(buf, 1, sizeof(buf), in_f)) > 0)
+                    std::fwrite(buf, 1, n, out_f);
+            }
+            if (in_f)  std::fclose(in_f);
+            if (out_f) std::fclose(out_f);
+            // Verify the copy actually produced a file before
+            // claiming we have a config sidecar.
+            struct stat st{};
+            if (::stat(spool_config_path.c_str(), &st) != 0 || st.st_size == 0) {
+                spool_config_path.clear();
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        m_spool_paths[job.dev_id][spool_basename] =
+            SpoolEntry{spool_path, spool_config_path};
+    }
+    std::fprintf(stderr,
+        "[lan-upload] dev=%s spooled %s (%lld bytes) at %s "
+        "config=%s — waiting for matching gcode_file MQTT to dispatch\n",
+        job.dev_id.c_str(),
+        spool_basename.c_str(),
+        (long long)([&]{ struct stat st{}; ::stat(spool_path.c_str(), &st); return st.st_size; })(),
+        spool_path.c_str(),
+        spool_config_path.empty() ? "<none>" : spool_config_path.c_str());
+    std::fflush(stderr);
 
-    // `start_local_print_with_record` is documented synchronous in
-    // upstream — the slicer's FTPS 226 reply waits on this completion,
-    // so it's safe to unlink the spool tempfile now. cleanup_upload_
-    // tempfile also rmdir's the per-job dir the spool created. We also
-    // unlink the settings-only .3mf sibling (lives in the same dir) so
-    // the rmdir actually succeeds.
+    // Now clean up the per-job tempdir — the hard link above keeps the
+    // bytes alive at spool_path.
     if (!settings_path.empty() && settings_path != tmp_path)
         ::unlink(settings_path.c_str());
     cleanup_upload_tempfile(tmp_path);
 
-    res.ok = (rc == 0);
-    if (res.ok) {
-        res.remote_url = "bambu-lan:///model/" + job.filename;
-    } else {
-        res.error_message =
-            std::string("LanUploadSink: plugin upload rc=") +
-            std::to_string(rc) + " — " + err_for_rc(rc);
-    }
+    res.ok = true;
+    res.remote_url = "bambu-lan:///spool/" + spool_basename;
     return res;
+}
+
+// Per-virtual-dev progress file. The slicer's virtual_lan_print_ polls
+// this and calls its update_fn for each event so the user's BBS print
+// dialog stays open while the bridge's plugin call uploads to the real
+// printer and waits for the print to actually start (~10-20 s after
+// BBS finishes its FTPS upload to the bridge).
+static void write_bridge_progress(const std::string& virtual_dev_id,
+                                  int stage, int code,
+                                  const std::string& info,
+                                  const std::string& phase) {
+    if (virtual_dev_id.empty()) return;
+    ::mkdir("/tmp/bridge-progress", 0700);
+    std::string path = "/tmp/bridge-progress/" + virtual_dev_id + ".json";
+    std::string tmp_path = path + ".tmp";
+    FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    if (!f) return;
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    // Compact JSON; slicer parses with nlohmann.
+    std::fprintf(f,
+        "{\"ts_ms\":%lld,\"stage\":%d,\"code\":%d,"
+        "\"info\":\"%s\",\"phase\":\"%s\"}\n",
+        (long long) now_ms, stage, code,
+        info.c_str(),  // info is plugin-formatted, safe ASCII
+        phase.c_str());
+    std::fclose(f);
+    // Atomic publish — rename so the slicer never reads a half-written file.
+    ::rename(tmp_path.c_str(), path.c_str());
+}
+
+int LanUploadSink::dispatch_print_command(const std::string& dev_id,
+                                          const std::string& virtual_dev_id,
+                                          const std::string& mqtt_payload_json) {
+    // Pull the spooled file path + the slicer's full LocalPrintParams
+    // context out of the MQTT JSON. The slicer publishes this on
+    // `device/<sn>/request` with the shape virtual_lan_print_ in
+    // NetworkAgent.cpp constructs.
+    nlohmann::json root;
+    try { root = nlohmann::json::parse(mqtt_payload_json); }
+    catch (...) {
+        std::fprintf(stderr,
+            "[lan-upload] dispatch dev=%s parse error\n", dev_id.c_str());
+        std::fflush(stderr);
+        return -1;
+    }
+    auto pit = root.find("print");
+    if (pit == root.end() || !pit->is_object()) return -1;
+    const auto& p = *pit;
+    auto cmd_it = p.find("command");
+    if (cmd_it == p.end() || !cmd_it->is_string()
+        || cmd_it->get<std::string>() != "gcode_file")
+        return -1;
+
+    auto get_str = [&](const char* k) -> std::string {
+        auto it = p.find(k);
+        if (it == p.end() || it->is_null()) return {};
+        if (it->is_string()) return it->get<std::string>();
+        return it->dump();
+    };
+    auto get_int = [&](const char* k, int fallback = 0) -> int {
+        auto it = p.find(k);
+        if (it == p.end()) return fallback;
+        if (it->is_number_integer()) return it->get<int>();
+        if (it->is_string()) {
+            try { return std::stoi(it->get<std::string>()); }
+            catch (...) {}
+        }
+        return fallback;
+    };
+    auto get_bool = [&](const char* k, bool fallback = false) -> bool {
+        auto it = p.find(k);
+        if (it == p.end() || it->is_null()) return fallback;
+        if (it->is_boolean()) return it->get<bool>();
+        return fallback;
+    };
+
+    // `print.param` carries the file reference from the slicer (matches
+    // virtual_lan_print_'s remote_path = folder + fname).
+    std::string param = get_str("param");
+    std::string filename = param;
+    // Strip the folder prefix the slicer composed.
+    auto slash = filename.find_last_of('/');
+    if (slash != std::string::npos) filename = filename.substr(slash + 1);
+
+    // Look up spool (main + config sidecar).
+    std::string spool_path;
+    std::string spool_config_path;
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        auto it = m_spool_paths.find(dev_id);
+        if (it != m_spool_paths.end()) {
+            auto f = it->second.find(filename);
+            if (f != it->second.end()) {
+                spool_path        = f->second.main_path;
+                spool_config_path = f->second.config_path;
+            }
+        }
+    }
+    if (spool_path.empty()) {
+        std::fprintf(stderr,
+            "[lan-upload] dispatch dev=%s file=%s NOT spooled — "
+            "ignoring (probe / out-of-order publish)\n",
+            dev_id.c_str(), filename.c_str());
+        std::fflush(stderr);
+        return -2;
+    }
+
+    // Resolve the per-device routing config so we can fill dev_ip etc.
+    LanUploadSinkDevice dev{};
+    std::shared_ptr<BambuNetworkingPluginHandle> handle;
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        auto dit = m_devices.find(dev_id);
+        if (dit != m_devices.end()) dev = dit->second;
+        handle = m_handle;
+    }
+    if (!handle) {
+        std::fprintf(stderr,
+            "[lan-upload] dispatch dev=%s no plugin handle attached\n",
+            dev_id.c_str());
+        std::fflush(stderr);
+        return -3;
+    }
+
+    // Build LocalPrintParams from the MQTT JSON. The shapes virtual_lan_print_
+    // emits map one-to-one to LocalPrintParams field names — except for
+    // (use_ams|task_use_ams), where the slicer sets BOTH and we accept
+    // either as the source.
+    BambuNetworkingPluginHandle::LocalPrintParams lp;
+    lp.dev_id           = dev_id;
+    lp.dev_ip           = dev.printer_ip;
+    lp.access_code      = dev.access_code;
+    lp.local_file_path  = spool_path;
+    lp.config_filename  = spool_config_path; // settings-only sidecar;
+                                             // empty if make_settings_only_zip
+                                             // failed for this upload
+    lp.project_name     = get_str("project_name");
+    if (lp.project_name.empty()) lp.project_name = filename;
+    lp.task_name        = get_str("task_name");
+    lp.connection_type  = "cloud";   // mirrors successful BBL GUI trace
+    lp.use_ssl_for_ftp  = true;
+    lp.use_ssl_for_mqtt = true;
+    lp.plate_index      = get_int("plate_idx", 0);
+    lp.ams_mapping      = get_str("ams_mapping");
+    lp.ams_mapping2     = get_str("ams_mapping2");
+    lp.ams_mapping_info = get_str("ams_mapping_info");
+    lp.nozzles_info     = get_str("nozzles_info");
+    lp.nozzle_mapping   = get_str("nozzle_mapping");
+    lp.task_bed_type    = get_str("task_bed_type");
+    lp.task_use_ams     = get_bool("task_use_ams", get_bool("use_ams", false));
+    lp.task_bed_leveling    = get_bool("bed_leveling");
+    lp.task_flow_cali       = get_bool("flow_cali");
+    lp.task_vibration_cali  = get_bool("vibration_cali");
+    lp.task_layer_inspect   = get_bool("layer_inspect");
+    lp.task_record_timelapse= get_bool("timelapse");
+    lp.auto_bed_leveling    = get_int("auto_bed_leveling", 0);
+    lp.auto_flow_cali       = get_int("auto_flow_cali", 0);
+    lp.auto_offset_cali     = get_int("auto_offset_cali", 0);
+    lp.origin_model_id      = get_str("model_id");
+
+    std::fprintf(stderr,
+        "[lan-upload] dispatch dev=%s vdev=%s file=%s project=%s "
+        "ams_mapping_len=%zu task_use_ams=%d plate_idx=%d\n",
+        dev_id.c_str(), virtual_dev_id.c_str(), filename.c_str(),
+        lp.project_name.c_str(), lp.ams_mapping.size(),
+        int(lp.task_use_ams), lp.plate_index);
+    std::fflush(stderr);
+
+    // ------------------------------------------------------------------
+    // Full-trace + 3mf capture (BAMBU_BRIDGE_CAPTURE).
+    //
+    // The dispatch site has both the spool path (.3mf + _config.3mf
+    // already persisted by handle_upload_finish) and the complete
+    // mapping payloads parsed out of the slicer's gcode_file MQTT.
+    // We snapshot all of them into one per-print directory so the
+    // .3mf can't be overwritten by the next print and the mapping
+    // JSON is preserved next to the model that produced it.
+    //
+    //   /tmp/bridge-capture/<dev_id>/<UTC-ts>_plate<N>/
+    //     ├── <basename>.3mf
+    //     ├── <basename>_config.3mf      (if present)
+    //     └── meta.json                  (ams_mapping*, nozzles_info,
+    //                                     project_name, plate_idx, …)
+    //
+    // Default-on; set BAMBU_BRIDGE_CAPTURE=0 to disable.
+    // ------------------------------------------------------------------
+    {
+        const char* cap_env = std::getenv("BAMBU_BRIDGE_CAPTURE");
+        const bool  cap_on  = !cap_env || std::strcmp(cap_env, "0") != 0;
+        if (cap_on) {
+            // Timestamped, plate-tagged directory name.
+            timespec ts{};
+            ::clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm tm{};
+            ::gmtime_r(&ts.tv_sec, &tm);
+            char ts_buf[64];
+            std::snprintf(ts_buf, sizeof(ts_buf),
+                "%04d%02d%02dT%02d%02d%02d.%03ldZ",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                tm.tm_hour, tm.tm_min, tm.tm_sec,
+                long(ts.tv_nsec / 1000000));
+            std::string cap_root = "/tmp/bridge-capture";
+            std::string cap_dev  = cap_root + "/" + dev_id;
+            char plate_buf[32];
+            std::snprintf(plate_buf, sizeof(plate_buf), "_plate%d", lp.plate_index);
+            std::string cap_dir  = cap_dev + "/" + ts_buf + plate_buf;
+            ::mkdir(cap_root.c_str(), 0700);
+            ::mkdir(cap_dev.c_str(),  0700);
+            int mkdir_rc = ::mkdir(cap_dir.c_str(),  0700);
+
+            // Best-effort hard-link copies; on EXDEV fall back to stream-copy.
+            auto link_or_copy = [](const std::string& src,
+                                    const std::string& dst) -> bool {
+                if (src.empty()) return false;
+                ::unlink(dst.c_str());
+                if (::link(src.c_str(), dst.c_str()) == 0) return true;
+                FILE* in_f  = std::fopen(src.c_str(),  "rb");
+                FILE* out_f = std::fopen(dst.c_str(), "wb");
+                if (!in_f || !out_f) {
+                    if (in_f)  std::fclose(in_f);
+                    if (out_f) std::fclose(out_f);
+                    return false;
+                }
+                char buf[64 * 1024];
+                std::size_t n;
+                while ((n = std::fread(buf, 1, sizeof(buf), in_f)) > 0)
+                    std::fwrite(buf, 1, n, out_f);
+                std::fclose(in_f);
+                std::fclose(out_f);
+                return true;
+            };
+
+            // Use a sane basename for the capture copy (the spool name
+            // can be a pid-counter dotfile from the slicer's tempfile).
+            std::string cap_basename = lp.project_name;
+            if (cap_basename.empty()) cap_basename = filename;
+            if (cap_basename.empty()) cap_basename = "lan_print";
+            // Strip any path and trailing .3mf so we can append.
+            if (auto p = cap_basename.find_last_of('/'); p != std::string::npos)
+                cap_basename = cap_basename.substr(p + 1);
+            if (cap_basename.size() >= 4 &&
+                cap_basename.compare(cap_basename.size() - 4, 4, ".3mf") == 0)
+                cap_basename.resize(cap_basename.size() - 4);
+
+            const std::string cap_3mf    = cap_dir + "/" + cap_basename + ".3mf";
+            const std::string cap_cfg    = cap_dir + "/" + cap_basename + "_config.3mf";
+            const std::string cap_meta   = cap_dir + "/meta.json";
+            const bool got_3mf = link_or_copy(spool_path,        cap_3mf);
+            const bool got_cfg = link_or_copy(spool_config_path, cap_cfg);
+
+            // meta.json — full mapping payloads + the surrounding scalars.
+            // The mapping fields arrive as already-serialised JSON strings;
+            // we emit them as raw JSON values (no nested quoting) so they're
+            // trivially parseable by `jq`. Anything malformed gets wrapped
+            // in a string literal as a fallback.
+            auto json_value_or_string = [](const std::string& s) -> std::string {
+                if (s.empty()) return "null";
+                // Cheap heuristic — if it parses as JSON, emit raw; else
+                // emit as a quoted string. We don't need to be strict.
+                try {
+                    auto j = nlohmann::json::parse(s);
+                    return j.dump();
+                } catch (...) {
+                    return nlohmann::json(s).dump();
+                }
+            };
+            auto esc = [](const std::string& s) -> std::string {
+                return nlohmann::json(s).dump();
+            };
+            std::string meta;
+            meta.reserve(8192);
+            meta += "{\n";
+            meta += "  \"timestamp_utc\": "    + esc(ts_buf) + ",\n";
+            meta += "  \"dev_id\": "           + esc(dev_id) + ",\n";
+            meta += "  \"virtual_dev_id\": "   + esc(virtual_dev_id) + ",\n";
+            meta += "  \"project_name\": "     + esc(lp.project_name) + ",\n";
+            meta += "  \"task_name\": "        + esc(lp.task_name) + ",\n";
+            meta += "  \"slicer_filename\": "  + esc(filename) + ",\n";
+            meta += "  \"plate_index\": "      + std::to_string(lp.plate_index) + ",\n";
+            meta += "  \"task_use_ams\": "     + std::string(lp.task_use_ams ? "true" : "false") + ",\n";
+            meta += "  \"task_bed_type\": "    + esc(lp.task_bed_type) + ",\n";
+            meta += "  \"ams_mapping\": "      + json_value_or_string(lp.ams_mapping) + ",\n";
+            meta += "  \"ams_mapping2\": "     + json_value_or_string(lp.ams_mapping2) + ",\n";
+            meta += "  \"ams_mapping_info\": " + json_value_or_string(lp.ams_mapping_info) + ",\n";
+            meta += "  \"nozzles_info\": "     + json_value_or_string(lp.nozzles_info) + ",\n";
+            meta += "  \"nozzle_mapping\": "   + json_value_or_string(lp.nozzle_mapping) + ",\n";
+            meta += "  \"captured_3mf\": "     + std::string(got_3mf ? "true" : "false") + ",\n";
+            meta += "  \"captured_config\": "  + std::string(got_cfg ? "true" : "false") + "\n";
+            meta += "}\n";
+            if (FILE* mf = std::fopen(cap_meta.c_str(), "w")) {
+                std::fwrite(meta.data(), 1, meta.size(), mf);
+                std::fclose(mf);
+            }
+
+            // Echo the per-field bodies to stderr too — same info, no need
+            // to crack open meta.json to see what a print sent.
+            std::fprintf(stderr,
+                "[lan-upload] CAPTURE dir=%s mkdir_rc=%d 3mf=%d cfg=%d\n",
+                cap_dir.c_str(), mkdir_rc, int(got_3mf), int(got_cfg));
+            std::fprintf(stderr,
+                "[lan-upload]   ams_mapping=%s\n", lp.ams_mapping.c_str());
+            std::fprintf(stderr,
+                "[lan-upload]   ams_mapping2=%s\n", lp.ams_mapping2.c_str());
+            std::fprintf(stderr,
+                "[lan-upload]   ams_mapping_info=%s\n", lp.ams_mapping_info.c_str());
+            std::fprintf(stderr,
+                "[lan-upload]   nozzles_info=%s\n", lp.nozzles_info.c_str());
+            std::fprintf(stderr,
+                "[lan-upload]   nozzle_mapping=%s\n", lp.nozzle_mapping.c_str());
+            std::fflush(stderr);
+        }
+    }
+
+    // Publish the "dispatch starting" marker BEFORE the plugin call so
+    // the slicer's progress poll sees us advance immediately (otherwise
+    // there's a perceptible blank gap between BBS finishing the FTPS
+    // upload and seeing real plugin progress).
+    write_bridge_progress(virtual_dev_id, 0, 0, "", "dispatching");
+
+    // The plugin's update_fn fires from the proprietary plugin's worker
+    // thread; we forward each event to the bridge-progress file so the
+    // slicer can mirror real progress in its print dialog. The adapter
+    // already passes a `make_update_fn` closure for its own stderr
+    // logging — but that closure is hardcoded inside the adapter. We
+    // install OURS by invoking the plugin call indirectly through the
+    // upload-route the dispatch chain already uses: the handle's
+    // start_local_print_with_record. Unfortunately that interface
+    // doesn't take an update_fn — it routes through the adapter's
+    // PrintDispatcher which builds its own closure. To get progress
+    // events out we'd need to crack the adapter open further. For now,
+    // emit a single "dispatching" marker before the call and a final
+    // marker (acked / done / failed) after; the slicer at least sees
+    // "uploading" → "starting" → "done" rather than nothing. The
+    // intermediate stage=4 percent stream can be added by routing the
+    // plugin call through a sibling code path that exposes update_fn —
+    // tracked as a separate refactor.
+    int rc = handle->start_local_print_with_record(lp);
+    std::fprintf(stderr,
+        "[lan-upload] dispatch dev=%s rc=%d\n", dev_id.c_str(), rc);
+    std::fflush(stderr);
+
+    // Publish the terminal marker. `phase=done` (rc==0) tells the
+    // slicer's poll loop to stop waiting and return success;
+    // `phase=failed` returns the error to the slicer's PrintJob UI
+    // instead of silently completing.
+    write_bridge_progress(virtual_dev_id, 0, rc,
+        rc == 0 ? std::string("ok") : std::string("rc=") + std::to_string(rc),
+        rc == 0 ? "done" : "failed");
+    return rc;
 }
 
 } // namespace router

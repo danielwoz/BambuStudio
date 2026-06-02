@@ -88,8 +88,8 @@ add_library(bambu_bridge STATIC
     server/RtspServer.cpp
     server/RtspServer.hpp
     server/RtspJpegPacketiser.hpp
-    server/TranscodingCameraSource.cpp
-    server/TranscodingCameraSource.hpp
+    server/PassthroughCameraSource.cpp
+    server/PassthroughCameraSource.hpp
     server/VirtualTunnelServer.cpp
     server/VirtualTunnelServer.hpp
     router/NullUplink.cpp
@@ -163,19 +163,11 @@ set_target_properties(bambu_bridge PROPERTIES
 if (UNIX AND NOT APPLE)
     # libdl for dlopen/dlsym on Linux.
     target_link_libraries(bambu_bridge PUBLIC dl)
-
-    # libav (ffmpeg) for the MJPEG->H.264 transcoder (TranscodingCameraSource).
-    # Linked the same way libslic3r_gui does (pkg-config IMPORTED_TARGET) so the
-    # bridge and the GUI resolve to ONE ffmpeg version in the final binary. The
-    # bridge server (RtspServer/transcoder) is Linux-only, so this is gated to
-    # UNIX-non-APPLE.
-    # avcodec/swscale: MJPEG decode + colour convert. x264: H.264 ENCODE
-    # directly (the bundled ffmpeg is LGPL and ships no H.264 encoder).
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(BRIDGE_LIBAV REQUIRED IMPORTED_TARGET
-        libavcodec libswscale libavutil x264)
-    target_link_libraries(bambu_bridge PUBLIC PkgConfig::BRIDGE_LIBAV)
 endif ()
+# Note: previously linked libavcodec / libswscale / libavutil / x264 for the
+# MJPEG → H.264 transcoder. The bridge now passes camera frames through
+# unchanged (RtspServer's RTP packetiser already handles RFC 6184 H.264 and
+# RFC 2435 MJPEG natively); the ffmpeg/x264 deps went away with that.
 
 # pthread is needed for std::mutex on most Linux toolchains.
 find_package(Threads QUIET)

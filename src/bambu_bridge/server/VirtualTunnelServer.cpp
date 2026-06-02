@@ -36,6 +36,42 @@ namespace server {
 
 namespace {
 
+// Base64 decoder. Mirror of the encoder in
+// `slic3r/GUI/Printer/BridgeStorageBackend.cpp`. BridgeStorageBackend
+// smuggles binary `data` from PFS SUB_FILE replies (thumbnail bytes,
+// zipped 3mf metadata) inside the reply JSON as `_bridge_data_b64`; we
+// decode it back to bytes here and splice them into the JSON\n\n+bytes
+// frame the slicer-side PFS' HandleResponse expects. Non-alphabet
+// characters are skipped silently; `=` terminates.
+std::string bridge_b64_decode(const std::string& in) {
+    static const signed char T_init = -1; (void)T_init;
+    static signed char T[256];
+    static bool initialised = false;
+    if (!initialised) {
+        for (int i = 0; i < 256; ++i) T[i] = -1;
+        const char alpha[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) T[(unsigned char)alpha[i]] = static_cast<signed char>(i);
+        initialised = true;
+    }
+    std::string out;
+    out.reserve((in.size() / 4) * 3);
+    std::uint32_t buf = 0;
+    int           bits = 0;
+    for (unsigned char c : in) {
+        if (c == '=') break;
+        const signed char v = T[c];
+        if (v < 0) continue;
+        buf = (buf << 6) | std::uint32_t(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += char((buf >> bits) & 0xff);
+        }
+    }
+    return out;
+}
+
 // ABI mirror of `Bambu_Sample` from BambuTunnel.h. The BambuSourceHandle
 // public API erases this as `void*` so we don't drag the proprietary
 // header into every TU; the layout MUST match BambuTunnel.h byte-for-byte.
@@ -415,13 +451,38 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
             } catch (const std::exception& ex) {
                 reply = nlohmann::json::object();
             }
+            // If BridgeStorageBackend smuggled binary `data` from the
+            // upstream PFS SUB_FILE response, strip the sidecar field
+            // and splice the bytes into the wire frame after `\n\n`.
+            // The slicer-side PFS' HandleResponse (PrinterFileSystem.cpp
+            // ~line 1629) finds the `\n\n` delimiter and treats every
+            // byte past it as the `data` portion of the sample, exactly
+            // matching libBambuSource's on-wire shape. Without this the
+            // slicer parses thumbnail bytes / 3mf metadata zip bytes as
+            // zero, so the Storage tab loses timelapse previews and
+            // model weight + print-time.
+            std::string binary_data;
+            if (reply.contains("_bridge_data_b64")) {
+                try {
+                    binary_data = bridge_b64_decode(
+                        reply["_bridge_data_b64"].get<std::string>());
+                } catch (const std::exception&) {
+                    binary_data.clear();
+                }
+                reply.erase("_bridge_data_b64");
+            }
             nlohmann::json envelope = {
                 {"result",   rc},
                 {"sequence", sequence},
                 {"reply",    std::move(reply)},
             };
             const std::string body = envelope.dump();
-            const uint32_t    nb   = static_cast<uint32_t>(body.size());
+            const char sep[2] = {'\n', '\n'};
+            const std::size_t total =
+                body.size()
+              + (binary_data.empty() ? std::size_t{0}
+                                     : sizeof(sep) + binary_data.size());
+            const uint32_t nb = static_cast<uint32_t>(total);
             uint8_t hdr[4] = {
                 static_cast<uint8_t>((nb >> 24) & 0xff),
                 static_cast<uint8_t>((nb >> 16) & 0xff),
@@ -437,6 +498,19 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
                                reinterpret_cast<const uint8_t*>(body.data()),
                                body.size())) {
                 return;
+            }
+            if (!binary_data.empty()) {
+                if (!ssl_write_all(ssl_capture,
+                                   reinterpret_cast<const uint8_t*>(sep),
+                                   sizeof(sep))) {
+                    return;
+                }
+                if (!ssl_write_all(ssl_capture,
+                                   reinterpret_cast<const uint8_t*>(
+                                       binary_data.data()),
+                                   binary_data.size())) {
+                    return;
+                }
             }
         };
 

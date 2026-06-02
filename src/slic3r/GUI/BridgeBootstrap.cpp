@@ -42,7 +42,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
+#include <dirent.h>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -1121,6 +1123,303 @@ void install_gui_worker(GUI_App* app)
             app->m_bridge_app->set_virtual_printers(std::move(snap));
         }, app->m_bridge_push_timer->GetId());
         app->m_bridge_push_timer->Start(5000);
+
+        // Periodic cloud-session refresh — bridge children only.
+        //
+        // Long-running observation: after 4–6 hours the H2D/H2S bridge
+        // child wedges. The MQTT broker thread stops reading from the
+        // slicer's TCP socket (388-byte SUBSCRIBE packet left unread),
+        // the per-child log goes silent except for camera-retry noise,
+        // thread count climbs to ~175 from cumulative leaks, and the
+        // child no longer registers new slicer subscriptions even
+        // though it still accepts the TCP connect. Root cause is the
+        // proprietary plugin's cloud cert / subscription going stale —
+        // the stock GUI refreshes that implicitly every time the user
+        // clicks Home → Prepare → Device, but the headless bridge child
+        // never re-clicks. After a stale window the plugin's reactor
+        // and the bridge's broker thread end up deadlocked on some
+        // shared lock and the child never recovers.
+        //
+        // The fix: re-run the same PROBE sequence the one-shot startup
+        // cascade ran, every 60 s. get_user_print_info refreshes the
+        // HTTP session cookie; parse_user_print_info refreshes the
+        // DeviceManager map; load_last_machine re-asserts the bridge's
+        // pinned dev_id; add_subscribe re-tells the cloud broker we
+        // care about events for this dev_id. Each is a thin plugin
+        // call that the stock GUI fires whenever the user navigates,
+        // so re-issuing them periodically is exactly the "click Home
+        // then Device" the user asked for, just dispatched from a
+        // timer instead of a wxEvent.
+        //
+        // Gated on BAMBU_BRIDGE_TARGET_DEV — a regular slicer doesn't
+        // need this; the user clicking around the UI naturally
+        // refreshes the session.
+        if (const char* td = std::getenv("BAMBU_BRIDGE_TARGET_DEV");
+            td && *td) {
+            // Capture the target dev_id (per child it's a single
+            // printer; the launcher passes one comma-separated entry).
+            std::string target_dev = td;
+            if (auto c = target_dev.find(','); c != std::string::npos)
+                target_dev.resize(c);
+
+            // ---- Fast-path graceful shutdown -----------------------------
+            //
+            // Why this exists. The launcher's `stop` issues a plain
+            // SIGTERM then waits 3 s before SIGKILL. The natural
+            // BambuStudio shutdown path (SIGTERM → wxApp event loop →
+            // OnExit → BridgeBootstrap::shutdown_hooks → BridgeApp::
+            // shutdown → ~LanUplink → disconnect_printer) takes longer
+            // than that window because wxApp tears down GUI widgets,
+            // joins many threads, and the bridge has hot retry loops
+            // (camera-fanout, cloud reconnect) that don't yield
+            // promptly. So we routinely got SIGKILL'd before the LAN
+            // MQTT slot was released, leaving the printer holding the
+            // zombie session for 2–5 minutes — exactly the "bridge
+            // doesn't come back after a restart" symptom.
+            //
+            // Solution: signal handler that just sets an atomic flag.
+            // A dedicated polling thread observes the flag and runs
+            // the critical disconnect inline (NOT through wxApp's
+            // event loop), then `_Exit(0)`s without touching wxApp.
+            //
+            // disconnect_printer takes ~50 ms in normal cases; we add
+            // 500 ms TCP-FIN flush time, so total is < 1 s — well
+            // within the launcher's 3 s window. If the plugin's
+            // disconnect_printer ever hangs, the launcher's SIGKILL
+            // still fires; the previous-generation behaviour. No
+            // worse than before.
+            static std::atomic<bool> g_bridge_shutdown_requested{false};
+            // Register signal handler ONCE per process. Bridge child
+            // is a single process; idempotent if we ever get re-init'd.
+            static std::atomic<bool> g_handler_installed{false};
+            if (!g_handler_installed.exchange(true)) {
+                auto handler = +[](int) {
+                    // Async-signal-safe: just flip the atomic. The
+                    // polling thread does the heavy lifting.
+                    g_bridge_shutdown_requested.store(true);
+                };
+                ::signal(SIGTERM, handler);
+                ::signal(SIGINT,  handler);
+                ::signal(SIGHUP,  handler);
+                std::fprintf(stderr,
+                    "[bridge-shutdown] handler installed for SIGTERM/SIGINT/SIGHUP\n");
+                std::fflush(stderr);
+            }
+            std::thread([app, target_dev]{
+                while (!g_bridge_shutdown_requested.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                std::fprintf(stderr,
+                    "[bridge-shutdown] dev=%s signal caught, "
+                    "disconnecting before exit\n",
+                    target_dev.c_str());
+                std::fflush(stderr);
+
+                // 1. Release the printer's LAN MQTT slot. THIS is the
+                //    critical step the launcher's 3 s window often
+                //    fails to fit through under the wxApp path.
+                if (app && app->m_agent) {
+                    int rc = app->m_agent->disconnect_printer();
+                    std::fprintf(stderr,
+                        "[bridge-shutdown] disconnect_printer rc=%d\n", rc);
+                    std::fflush(stderr);
+                }
+
+                // 2. Let the TCP FIN packets flush to the printer's
+                //    broker AND to the bridge's connected slicers.
+                //    500 ms is enough — empirically the printer
+                //    releases the slot ~200 ms after the FIN.
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                std::fprintf(stderr,
+                    "[bridge-shutdown] dev=%s exiting (_Exit 0)\n",
+                    target_dev.c_str());
+                std::fflush(stderr);
+                // _Exit bypasses static dtors + wxApp's slow shutdown.
+                // Anything not flushed by now wasn't going to be.
+                std::_Exit(0);
+            }).detach();
+
+            // Start-of-life timestamp for the "stale > 5 min" self-
+            // restart gate.
+            static const auto s_bridge_start =
+                std::chrono::steady_clock::now();
+            // Last-seen-pushall timestamp, updated by a snoop on
+            // DeviceManager's per-machine m_push_count. Atomic so the
+            // worker thread + timer thread can read/write without a
+            // lock.
+            static std::atomic<long long> s_last_push_count{0};
+            static std::atomic<std::chrono::steady_clock::time_point>
+                s_last_push_at{std::chrono::steady_clock::now()};
+
+            // *** Originally a wxTimer; empirically the bridge child's
+            // invisible-GUI wx event loop doesn't pump wxEVT_TIMER
+            // reliably (a 5 s push_timer fired ~once/min, our 60 s
+            // refresh never fired). Replaced with a plain std::thread
+            // so the watchdog and the self-restart gate actually run.
+            std::thread([app, target_dev]() {
+                using clock = std::chrono::steady_clock;
+                std::fprintf(stderr,
+                    "[bridge-refresh] worker thread started dev=%s\n",
+                    target_dev.c_str());
+                std::fflush(stderr);
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::seconds(60));
+                    // Run the tick body. Mirrors the wxTimer lambda
+                    // we replaced.
+                    [&] {
+                using clock = std::chrono::steady_clock;
+                const auto now    = clock::now();
+                const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+                                       now - s_bridge_start).count();
+
+                // ----- A. Health probes --------------------------------------
+                const int thread_count = [] {
+                    DIR* d = ::opendir("/proc/self/task");
+                    if (!d) return -1;
+                    int n = 0;
+                    while (auto* e = ::readdir(d)) {
+                        if (e->d_name[0] != '.') ++n;
+                    }
+                    ::closedir(d);
+                    return n;
+                }();
+
+                // Sample push_count for the bridge's target printer
+                // (updated by DeviceManager when /report msg=0 arrives).
+                long long current_push = 0;
+                if (app->m_device_manager) {
+                    if (auto* mo = app->m_device_manager->get_my_machine(target_dev)) {
+                        current_push = mo->m_push_count;
+                    }
+                }
+                if (current_push > s_last_push_count.load()) {
+                    s_last_push_count.store(current_push);
+                    s_last_push_at.store(now);
+                }
+                const auto stale_secs =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        now - s_last_push_at.load()).count();
+
+                const bool user_login    = app->m_agent
+                                           && app->m_agent->is_user_login();
+                const bool srv_connected = app->m_agent
+                                           && app->m_agent->is_server_connected();
+
+                std::fprintf(stderr,
+                    "[bridge-refresh] tick dev=%s uptime=%llds threads=%d "
+                    "push_count=%lld stale=%llds user_login=%d server_connected=%d\n",
+                    target_dev.c_str(), (long long) uptime,
+                    thread_count, current_push,
+                    (long long) stale_secs,
+                    int(user_login), int(srv_connected));
+                std::fflush(stderr);
+
+                // ----- B. Self-restart on hard-stuck conditions -------------
+                // Threshold-based: thread leak past 250 OR no pushall for
+                // 180 s AND we've been up at least 90 s. Earlier ship
+                // had 300 s, but empirically the printer's LAN MQTT slot
+                // gets grabbed by Handy mid-print and the plugin's
+                // recovery is best-effort at best — we'd rather restart
+                // a notch sooner than ride out an indefinite stall in a
+                // camera-retry hot loop.
+                if (uptime > 90 && (thread_count > 250 || stale_secs > 180)) {
+                    std::fprintf(stderr,
+                        "[bridge-refresh] SELF-RESTART dev=%s reason=%s "
+                        "uptime=%llds threads=%d stale=%llds — "
+                        "bridge-multiproc launcher will respawn\n",
+                        target_dev.c_str(),
+                        (thread_count > 250 ? "thread-leak" : "no-pushall"),
+                        (long long) uptime, thread_count, (long long) stale_secs);
+                    std::fflush(stderr);
+                    // exit(0) so the supervisor respawns us cleanly.
+                    std::_Exit(0);
+                }
+
+                // ----- C. Active reconnect when MQTT looks dead -------------
+                // If we're past 60 s without a pushall AND we've been up
+                // longer than that (so we don't fire during the initial
+                // login lull), kick the plugin: re-issue add_subscribe for
+                // our dev_id. That's the canonical primitive the GUI's
+                // device-tab click triggers; nothing else in the plugin
+                // re-asserts subscription state once it's been lost (e.g.
+                // by a Handy app grabbing the printer's single LAN MQTT
+                // slot or a TUTK-camera teardown). Cheap to over-call —
+                // add_subscribe is idempotent on the plugin side.
+                //
+                // CRITICAL: run on a detached worker thread, not on the
+                // watchdog thread. add_subscribe goes through the
+                // proprietary plugin's MQTT reactor and EMPIRICALLY
+                // blocks when the cloud session is wedged — last ship
+                // ran KICK inline and the watchdog thread hung at
+                // uptime=360s, never reaching the self-restart gate.
+                // The worker thread can hang forever; the watchdog
+                // keeps ticking and eventually self-restarts.
+                if (uptime > 90 && stale_secs > 60
+                    && app->m_agent && user_login) {
+                    NetworkAgent* agent = app->m_agent;
+                    std::string dev_id = target_dev;
+                    long long stale_at_dispatch = (long long) stale_secs;
+                    std::thread([agent, dev_id, stale_at_dispatch]{
+                        std::vector<std::string> subs{ dev_id };
+                        std::fprintf(stderr,
+                            "[bridge-refresh] KICK add_subscribe(%s) "
+                            "DISPATCHING (no pushall for %llds)\n",
+                            dev_id.c_str(), stale_at_dispatch);
+                        std::fflush(stderr);
+                        int sub_rc = agent->add_subscribe(subs);
+                        std::fprintf(stderr,
+                            "[bridge-refresh] KICK add_subscribe(%s) rc=%d\n",
+                            dev_id.c_str(), sub_rc);
+                        std::fflush(stderr);
+                    }).detach();
+                }
+
+                // ----- D. Normal session refresh ----------------------------
+                if (!user_login || !srv_connected) return;
+                std::thread([app]{
+                    unsigned int http = 0;
+                    std::string  body;
+                    int rc = app->m_agent->get_user_print_info(&http, &body);
+                    std::fprintf(stderr,
+                        "[bridge-refresh] get_user_print_info rc=%d http=%u "
+                        "body_len=%zu\n", rc, http, body.size());
+                    std::fflush(stderr);
+                    if (rc != 0 || body.empty()) return;
+
+                    std::string body_copy = body;
+                    app->CallAfter([app, body_copy = std::move(body_copy)]() mutable {
+                        if (!app->m_device_manager) return;
+                        try {
+                            app->m_device_manager->parse_user_print_info(body_copy);
+                            app->m_device_manager->load_last_machine();
+                            auto* sel = app->m_device_manager->get_selected_machine();
+                            if (sel && app->m_agent) {
+                                std::vector<std::string> subs{ sel->get_dev_id() };
+                                int sub_rc = app->m_agent->add_subscribe(subs);
+                                std::fprintf(stderr,
+                                    "[bridge-refresh] add_subscribe(%s) rc=%d\n",
+                                    sel->get_dev_id().c_str(), sub_rc);
+                                std::fflush(stderr);
+                            }
+                        } catch (const std::exception& ex) {
+                            std::fprintf(stderr,
+                                "[bridge-refresh] parse_user_print_info threw: %s\n",
+                                ex.what());
+                            std::fflush(stderr);
+                        }
+                    });
+                }).detach();
+                    }();
+                }
+            }).detach();
+            std::fprintf(stderr,
+                "[bridge-refresh] periodic cloud-session refresh + "
+                "watchdog + self-restart armed (every 60s, std::thread) "
+                "[targets: thread>250 || pushall-stale>300s self-restart, "
+                "pushall-stale>60s kick add_subscribe]\n");
+            std::fflush(stderr);
+        }
 
         BOOST_LOG_TRIVIAL(info)
             << "Bambu Bridge started in GUI worker thread "

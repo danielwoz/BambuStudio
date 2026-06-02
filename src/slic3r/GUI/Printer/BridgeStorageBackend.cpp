@@ -16,13 +16,41 @@
 #include <boost/smart_ptr/make_shared.hpp>
 #include <boost/smart_ptr/weak_ptr.hpp>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <utility>
 
 namespace Slic3r {
 namespace bridge {
 
 namespace {
+
+// Base64 encode. Bytes → ASCII so the binary `data` payload from an
+// upstream PFS SUB_FILE response (thumbnail bytes, zipped 3mf metadata)
+// can ride inside the JSON reply across the VirtualTunnelServer wire to
+// the slicer-side PFS, which decodes back to bytes before splicing them
+// into the canonical JSON\n\n+bytes sample buffer it expects. Mirror
+// helper lives in `bambu_bridge/server/VirtualTunnelServer.cpp`.
+std::string bridge_b64_encode(const unsigned char* data, std::size_t len) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (std::size_t i = 0; i < len; i += 3) {
+        std::uint32_t triple =
+            (std::uint32_t(data[i]) << 16)
+          | (i + 1 < len ? std::uint32_t(data[i + 1]) << 8 : 0u)
+          | (i + 2 < len ? std::uint32_t(data[i + 2])      : 0u);
+        out += alphabet[(triple >> 18) & 0x3f];
+        out += alphabet[(triple >> 12) & 0x3f];
+        out += i + 1 < len ? alphabet[(triple >> 6) & 0x3f] : '=';
+        out += i + 2 < len ? alphabet[triple        & 0x3f] : '=';
+    }
+    return out;
+}
 
 // Helper: run `fn` on the wx main thread. If the wx app is already in
 // the wx main thread we run it synchronously; otherwise queue via
@@ -101,12 +129,36 @@ void BridgeStorageBackend::send_request(const std::string& real_dev_id,
         }
         // PFS' SendRequest callback signature is
         //   int(int result, json const& resp, unsigned char const* data)
-        // We collapse data into the reply (callers don't currently need
-        // the raw buffer side-channel — every Storage opcode replies
-        // via JSON).
+        // SUB_FILE responses come back as JSON + a raw byte slice — the
+        // bytes carry thumbnail image data (timelapse previews,
+        // model_metadata thumbnails) or the zipped 3mf metadata the
+        // slicer parses for weight / print-time. We can't drop them;
+        // smuggle them in a base64 sidecar field on the JSON reply, and
+        // VirtualTunnelServer's session_loop strips + re-attaches the
+        // bytes to the JSON\n\n+bytes frame the slicer-side PFS expects.
+        // LIST_INFO / FILE_DEL / TASK_CANCEL have no data — encoding a
+        // zero-length payload yields an empty `data` slice on the other
+        // side, which the slicer handles fine.
+        //
+        // Always-on (no env gate). An earlier 2026-06-02 default-off
+        // gate existed because the first attempt crashed Orca inside
+        // load_gcode_3mf_from_stream / _extract_project_config_from_archive
+        // — that crash is now instrumented with BOOST_LOG_TRIVIAL markers
+        // and a try/catch null-guard in PrinterFileSystem::ParseThumbnail
+        // so a recurrence leaves a precise trail in
+        // ~/.config/OrcaSlicer/log/ instead of a silent process death.
         auto pfs_cb = [cb](int result, nlohmann::json const& resp,
-                           unsigned char const* /*data*/) -> int {
-            if (cb) cb(result, resp);
+                           unsigned char const* data) -> int {
+            if (!cb) return result;
+            const std::uint32_t size = resp.value("size", std::uint32_t{0});
+            if (data && size > 0) {
+                nlohmann::json resp_with_data = resp;
+                resp_with_data["_bridge_data_b64"] =
+                    bridge_b64_encode(data, size);
+                cb(result, std::move(resp_with_data));
+            } else {
+                cb(result, resp);
+            }
             return result;
         };
         // friend-access into PrinterFileSystem::SendRequest(...).

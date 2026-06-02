@@ -10,6 +10,8 @@
 
 #include "PrintDispatcher.hpp"
 
+#include "NetworkAgent.hpp"
+
 #include <boost/format.hpp>
 #include <cstdio>
 #include <memory>
@@ -27,6 +29,17 @@ bool PrintDispatcher::lan_verify_job(
     // and the print is a normal (slicer-driven) print.
     if (params.connection_type != "lan" || params.print_type != "from_normal")
         return true; // nothing to verify; treat as pass
+
+    // FFFF/virtual dev_ids — the bridge's FTPS server accepts any access
+    // code, and the bridge IP is fixed (not user-typed), so the stock
+    // access-code probe has no safety value here. Skip it. Without this
+    // gate every FFFF print pushes a wasted 16-byte upload to the bridge,
+    // a phantom `gcode_file` MQTT publish with project_name="verify_job"
+    // that the bridge's MqttBroker interceptor has to specially recognise
+    // and ignore, and (on the real-printer path) a "verify_job" entry
+    // on the printer's SD card that the GUI never deletes.
+    if (Slic3r::NetworkAgent::is_virtual_dev_id(params.dev_id))
+        return true;
 
     // The eMMC tunnel handshake (PrintJob.cpp:227-233 in the original)
     // is performed by the CALLER and passed in via inputs.emmc_handshake_ok.

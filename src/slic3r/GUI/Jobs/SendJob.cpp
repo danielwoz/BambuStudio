@@ -5,6 +5,7 @@
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/GUI.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/Utils/NetworkAgent.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -131,21 +132,32 @@ void SendJob::process()
 
     // check access code and ip address
     params.dev_id = m_dev_id;
-    params.project_name = "verify_job";
-    params.filename = job_data._temp_path.string();
-    params.connection_type = this->connection_type;
 
-    result = m_agent->start_send_gcode_to_sdcard(params, nullptr, nullptr, nullptr);
-    if (result != 0) {
-        BOOST_LOG_TRIVIAL(error) << "access code is invalid";
-        m_enter_ip_address_fun_fail(result);
-        m_job_finished = true;
-        return;
-    }
-    else if(m_is_check_mode && !m_check_and_continue){
-        m_enter_ip_address_fun_success();
-        m_job_finished = true;
-        return;
+    // FFFF/virtual dev_ids — skip the stock access-code probe. The
+    // bridge's FTPS server accepts any access code and is on a fixed
+    // IP we already know. The probe would just stamp "verify_job"
+    // onto the bridge's spool registry, push a phantom MQTT publish
+    // through the bridge's broker, and (in check-mode) bounce the
+    // user out before the real upload — none of which has a purpose
+    // for the bridge path. Drop straight through to the real upload
+    // below.
+    if (!Slic3r::NetworkAgent::is_virtual_dev_id(m_dev_id)) {
+        params.project_name = "verify_job";
+        params.filename = job_data._temp_path.string();
+        params.connection_type = this->connection_type;
+
+        result = m_agent->start_send_gcode_to_sdcard(params, nullptr, nullptr, nullptr);
+        if (result != 0) {
+            BOOST_LOG_TRIVIAL(error) << "access code is invalid";
+            m_enter_ip_address_fun_fail(result);
+            m_job_finished = true;
+            return;
+        }
+        else if(m_is_check_mode && !m_check_and_continue){
+            m_enter_ip_address_fun_success();
+            m_job_finished = true;
+            return;
+        }
     }
 
 

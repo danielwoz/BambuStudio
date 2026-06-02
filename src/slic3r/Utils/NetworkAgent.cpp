@@ -9,10 +9,11 @@
 #endif
 
 #include <atomic>
+#include <fstream>
 #include <set>
+#include <sstream>
 #include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
-#include <miniz.h>
 #include <nlohmann/json.hpp>
 #include "libslic3r/Utils.hpp"
 #include "slic3r/Utils/BBLUtil.hpp"
@@ -60,6 +61,292 @@ using Slic3r::plugin_trace::log_event;
 using Slic3r::plugin_trace::truncate;
 using Slic3r::plugin_trace::snapshot_path;
 using Slic3r::plugin_trace::dump_stack;
+
+// Always-on snapshot of the .3mf BBS hands to the plugin (or to our own
+// virtual_lan_print_), keyed by dev_id. Mirrors the bridge's own
+// `/tmp/bridge-last-upload-<dev_id>.3mf` capture so the two files are
+// directly comparable:
+//
+//   /tmp/bbs-sent-<dev_id>.3mf            ← slicer-side original
+//   /tmp/bbs-sent-<dev_id>.json           ← print-command fields incl.
+//                                           ams_mapping, nozzle_mapping,
+//                                           ftp_*, task_*, connection_type
+//   /tmp/bridge-last-upload-<dev_id>.3mf  ← bridge post-rewrite (only
+//                                            written when bridge is up)
+//
+// For an FFFF print all three files exist; for a direct-to-printer print
+// (bridge down) only the bbs-sent ones exist. Hard-link is free on the
+// same filesystem; falls back to copy on EXDEV. Same paths are
+// overwritten on each print so the latest is always inspectable.
+inline void snapshot_bbs_sent(const std::string& dev_id,
+                              const std::string& src_path) {
+    if (dev_id.empty() || src_path.empty()) return;
+    struct stat st{};
+    if (::stat(src_path.c_str(), &st) != 0) return;
+    std::string dbg = "/tmp/bbs-sent-" + dev_id + ".3mf";
+    ::unlink(dbg.c_str());
+    if (::link(src_path.c_str(), dbg.c_str()) != 0) {
+        FILE* in  = std::fopen(src_path.c_str(), "rb");
+        FILE* out = std::fopen(dbg.c_str(),      "wb");
+        if (in && out) {
+            char buf[64 * 1024];
+            std::size_t n;
+            while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0)
+                std::fwrite(buf, 1, n, out);
+        }
+        if (in)  std::fclose(in);
+        if (out) std::fclose(out);
+    }
+    std::fprintf(stderr,
+        "[bbs-sent] snapshot dev=%s bytes=%lld src=%s -> %s\n",
+        dev_id.c_str(), (long long) st.st_size, src_path.c_str(), dbg.c_str());
+    std::fflush(stderr);
+}
+
+// Dump the PrintParams fields that drive the printer's accept/reject
+// decision — most importantly `ams_mapping` (and its v2 / info variants),
+// `nozzle_mapping`, the task_* flags, FTP target, and the connection
+// type. JSON is a wrapper around the raw string fields so a `diff`
+// between a cloud print and a LAN print is mechanical: keys are
+// stable, only values change.
+//
+// This is the slicer-side equivalent of capturing the print-command
+// MQTT payload — the on-wire JSON is built by the proprietary plugin
+// from these same fields, so a diff at this layer is sufficient
+// without packet-capturing the MQTT publish.
+inline std::string j_escape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+        case '"':  o += "\\\""; break;
+        case '\\': o += "\\\\"; break;
+        case '\n': o += "\\n";  break;
+        case '\r': o += "\\r";  break;
+        case '\t': o += "\\t";  break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                o += buf;
+            } else {
+                o += c;
+            }
+        }
+    }
+    return o;
+}
+
+inline void snapshot_print_cmd(const char* call_site,
+                               const BBL::PrintParams& p) {
+    if (p.dev_id.empty()) return;
+
+    // Write the JSON body into any FILE*. Factored into a lambda so we
+    // can emit a fresh copy directly into the per-print capture dir —
+    // hard-linking the "latest" file into the dir doesn't work because
+    // the next print re-opens that path with fopen("wb") which truncates
+    // the inode in place, clobbering every hard-linked snapshot too.
+    auto write_json = [&](FILE* f) {
+        auto wkv = [&](const char* k, const std::string& v, bool last = false) {
+            std::fprintf(f, "  \"%s\": \"%s\"%s\n", k, j_escape(v).c_str(),
+                last ? "" : ",");
+        };
+        auto wki = [&](const char* k, long long v, bool last = false) {
+            std::fprintf(f, "  \"%s\": %lld%s\n", k, v, last ? "" : ",");
+        };
+        auto wkb = [&](const char* k, bool v, bool last = false) {
+            std::fprintf(f, "  \"%s\": %s%s\n", k, v ? "true" : "false",
+                last ? "" : ",");
+        };
+        std::fprintf(f, "{\n");
+        wkv("_call_site",        call_site);
+        wkv("dev_id",            p.dev_id);
+        wkv("dev_ip",            p.dev_ip);
+        wkv("dev_name",          p.dev_name);
+        wkv("username",          p.username);
+        wkv("connection_type",   p.connection_type);
+        wkv("filename",          p.filename);
+        wkv("config_filename",   p.config_filename);
+        wkv("project_name",      p.project_name);
+        wkv("task_name",         p.task_name);
+        wkv("preset_name",       p.preset_name);
+        wki("plate_index",       p.plate_index);
+        wkb("use_ssl_for_ftp",   p.use_ssl_for_ftp);
+        wkb("use_ssl_for_mqtt",  p.use_ssl_for_mqtt);
+        wkv("ftp_folder",        p.ftp_folder);
+        wkv("ftp_file",          p.ftp_file);
+        wkv("ftp_file_md5",      p.ftp_file_md5);
+        wkv("nozzle_mapping",    p.nozzle_mapping);
+        wkv("ams_mapping",       p.ams_mapping);
+        wkv("ams_mapping2",      p.ams_mapping2);
+        wkv("ams_mapping_info",  p.ams_mapping_info);
+        wkv("nozzles_info",      p.nozzles_info);
+        wkv("comments",          p.comments);
+        wki("origin_profile_id", p.origin_profile_id);
+        wki("stl_design_id",     p.stl_design_id);
+        wkv("origin_model_id",   p.origin_model_id);
+        wkv("print_type",        p.print_type);
+        wkv("dst_file",          p.dst_file);
+        wkb("task_bed_leveling",        p.task_bed_leveling);
+        wkb("task_flow_cali",           p.task_flow_cali);
+        wkb("task_vibration_cali",      p.task_vibration_cali);
+        wkb("task_layer_inspect",       p.task_layer_inspect);
+        wkb("task_record_timelapse",    p.task_record_timelapse);
+        wkb("task_timelapse_use_internal", p.task_timelapse_use_internal);
+        wkb("task_use_ams",             p.task_use_ams);
+        wkv("task_bed_type",            p.task_bed_type);
+        wkv("extra_options",            p.extra_options);
+        wki("auto_bed_leveling",        p.auto_bed_leveling);
+        wki("auto_flow_cali",           p.auto_flow_cali);
+        wki("auto_offset_cali",         p.auto_offset_cali);
+        wki("extruder_cali_manual_mode", p.extruder_cali_manual_mode);
+        wkb("task_ext_change_assist",   p.task_ext_change_assist);
+        wkb("try_emmc_print",           p.try_emmc_print, /*last=*/true);
+        std::fprintf(f, "}\n");
+    };
+
+    // Legacy "latest" snapshot at a stable path. Overwritten each print —
+    // that's intentional; this is the convenience file for `cat` / `jq`.
+    std::string out_path = "/tmp/bbs-sent-" + p.dev_id + ".json";
+    // Unlink first so we always get a fresh inode — this is what keeps
+    // any earlier hard-link in a per-print capture dir from being
+    // clobbered when we re-open the latest path for write.
+    ::unlink(out_path.c_str());
+    if (FILE* f = std::fopen(out_path.c_str(), "wb")) {
+        write_json(f);
+        std::fclose(f);
+    }
+    std::fprintf(stderr,
+        "[bbs-sent] print-cmd dev=%s call=%s ams_mapping=\"%.200s\" "
+        "connection_type=%s -> %s\n",
+        p.dev_id.c_str(), call_site,
+        p.ams_mapping.c_str(),
+        p.connection_type.c_str(), out_path.c_str());
+    std::fflush(stderr);
+
+    // ------------------------------------------------------------------
+    // Per-print timestamped archive (BAMBU_BRIDGE_GUI_CAPTURE, default-on).
+    //
+    // The legacy /tmp/bbs-sent-<dev>.json / .3mf above is "latest snapshot"
+    // — it's overwritten on every print. For a ground-truth study we want
+    // each print preserved so the GUI→real-printer dual-extruder payload
+    // can be diff'd against the bridge's own /tmp/bridge-capture/ entry
+    // for the same model.
+    //
+    //   /tmp/slicer-capture/<dev_id>/<UTC-ts>_plate<N>/
+    //     ├── <basename>.3mf
+    //     ├── <basename>_config.3mf       (if config_filename set)
+    //     ├── meta.json                   (== /tmp/bbs-sent-<dev>.json
+    //                                       at the moment of capture)
+    //     └── stderr.txt                  (mapping bodies, one per line)
+    //
+    // Set BAMBU_BRIDGE_GUI_CAPTURE=0 to disable.
+    // ------------------------------------------------------------------
+    {
+        const char* cap_env = std::getenv("BAMBU_BRIDGE_GUI_CAPTURE");
+        const bool  cap_on  = !cap_env || std::strcmp(cap_env, "0") != 0;
+        if (!cap_on) return;
+
+        timespec ts{};
+        ::clock_gettime(CLOCK_REALTIME, &ts);
+        struct tm tm{};
+        ::gmtime_r(&ts.tv_sec, &tm);
+        char ts_buf[64];
+        std::snprintf(ts_buf, sizeof(ts_buf),
+            "%04d%02d%02dT%02d%02d%02d.%03ldZ",
+            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+            tm.tm_hour, tm.tm_min, tm.tm_sec,
+            long(ts.tv_nsec / 1000000));
+
+        const std::string cap_root = "/tmp/slicer-capture";
+        const std::string cap_dev  = cap_root + "/" + p.dev_id;
+        char plate_buf[32];
+        std::snprintf(plate_buf, sizeof(plate_buf), "_plate%d", p.plate_index);
+        const std::string cap_dir = cap_dev + "/" + ts_buf + plate_buf
+                                  + "_" + call_site;
+        ::mkdir(cap_root.c_str(), 0700);
+        ::mkdir(cap_dev.c_str(),  0700);
+        ::mkdir(cap_dir.c_str(),  0700);
+
+        auto link_or_copy = [](const std::string& src,
+                                const std::string& dst) -> bool {
+            if (src.empty()) return false;
+            struct stat st{};
+            if (::stat(src.c_str(), &st) != 0) return false;
+            ::unlink(dst.c_str());
+            if (::link(src.c_str(), dst.c_str()) == 0) return true;
+            FILE* in_f  = std::fopen(src.c_str(),  "rb");
+            FILE* out_f = std::fopen(dst.c_str(), "wb");
+            if (!in_f || !out_f) {
+                if (in_f)  std::fclose(in_f);
+                if (out_f) std::fclose(out_f);
+                return false;
+            }
+            char buf[64 * 1024];
+            std::size_t n;
+            while ((n = std::fread(buf, 1, sizeof(buf), in_f)) > 0)
+                std::fwrite(buf, 1, n, out_f);
+            std::fclose(in_f);
+            std::fclose(out_f);
+            return true;
+        };
+
+        // Pick a friendly basename. p.project_name is the model name in
+        // the slicer; fall back to filename's basename, then a literal.
+        std::string cap_basename = p.project_name;
+        if (cap_basename.empty() && !p.filename.empty()) {
+            cap_basename = p.filename;
+            if (auto pos = cap_basename.find_last_of('/'); pos != std::string::npos)
+                cap_basename = cap_basename.substr(pos + 1);
+        }
+        if (cap_basename.empty()) cap_basename = "print";
+        if (cap_basename.size() >= 4 &&
+            cap_basename.compare(cap_basename.size() - 4, 4, ".3mf") == 0)
+            cap_basename.resize(cap_basename.size() - 4);
+
+        const bool got_3mf = link_or_copy(p.filename,
+                                cap_dir + "/" + cap_basename + ".3mf");
+        const bool got_cfg = link_or_copy(p.config_filename,
+                                cap_dir + "/" + cap_basename + "_config.3mf");
+
+        // meta.json — write a fresh copy directly. We can NOT hard-link
+        // from /tmp/bbs-sent-<dev>.json: the next print re-opens that
+        // path with fopen("wb"), which truncates the underlying inode
+        // and corrupts every prior capture sharing it. write_json gives
+        // us a distinct inode per capture dir.
+        if (FILE* mf = std::fopen((cap_dir + "/meta.json").c_str(), "wb")) {
+            write_json(mf);
+            std::fclose(mf);
+        }
+
+        // Per-line mapping bodies for easy grep/jq.
+        if (FILE* lf = std::fopen((cap_dir + "/stderr.txt").c_str(), "w")) {
+            std::fprintf(lf, "call_site=%s\n",        call_site);
+            std::fprintf(lf, "dev_id=%s\n",           p.dev_id.c_str());
+            std::fprintf(lf, "dev_ip=%s\n",           p.dev_ip.c_str());
+            std::fprintf(lf, "connection_type=%s\n",  p.connection_type.c_str());
+            std::fprintf(lf, "project_name=%s\n",     p.project_name.c_str());
+            std::fprintf(lf, "plate_index=%d\n",      p.plate_index);
+            std::fprintf(lf, "task_use_ams=%d\n",     int(p.task_use_ams));
+            std::fprintf(lf, "task_bed_type=%s\n",    p.task_bed_type.c_str());
+            std::fprintf(lf, "ams_mapping=%s\n",      p.ams_mapping.c_str());
+            std::fprintf(lf, "ams_mapping2=%s\n",     p.ams_mapping2.c_str());
+            std::fprintf(lf, "ams_mapping_info=%s\n", p.ams_mapping_info.c_str());
+            std::fprintf(lf, "nozzles_info=%s\n",     p.nozzles_info.c_str());
+            std::fprintf(lf, "nozzle_mapping=%s\n",   p.nozzle_mapping.c_str());
+            std::fprintf(lf, "captured_3mf=%d captured_config=%d\n",
+                int(got_3mf), int(got_cfg));
+            std::fclose(lf);
+        }
+
+        std::fprintf(stderr,
+            "[bbs-sent] CAPTURE dir=%s 3mf=%d cfg=%d "
+            "ams_mapping_info_len=%zu\n",
+            cap_dir.c_str(), int(got_3mf), int(got_cfg),
+            p.ams_mapping_info.size());
+        std::fflush(stderr);
+    }
+}
 
 // Dumps every field on PrintParams that PrintJob / SendJob is known to
 // fill, in a fixed order so cross-scenario diffs are mechanical. Also
@@ -1361,7 +1648,47 @@ int NetworkAgent::set_user_selected_machine(std::string dev_id)
 // canonical gcode_file MQTT payload shape these helpers reproduce.
 // ============================================================================
 
-static int virtual_print_normalise_plate_to_zero(const std::string& threemf_path);
+
+// Mirror of BambuStudio OSS
+// `bambu_net_oss/core/LocalPrintOrchestrator.cpp::compose_remote_path`.
+// Used as the SHARED source of truth for both:
+//   - the FTPS STOR remote name (what bytes go where on the printer's
+//     SD card / the bridge's spool)
+//   - the `print.param` field of the slicer's `gcode_file` MQTT command
+//     (which is how the printer finds the file on disk to start the
+//     print).
+// These two MUST be identical character-for-character — the bridge's
+// MqttBroker print interceptor keys its spool lookup on
+// `print.param`'s basename. Any divergence and the interceptor falls
+// back to verbatim-forwarding a command the printer can't resolve.
+//
+// We mirror the OSS chain exactly:
+//   ftp_folder (default "/")
+//   + ( dst_file
+//       | ftp_file
+//       | basename(filename)
+//       | "lan_print.3mf" )
+// The slicer's `project_name` is intentionally NOT included here — it
+// rides separately on the MQTT command as `print.project_name`, and
+// that's what the printer uses for its UI "currently printing" label.
+// The filesystem path stays under the slicer's own naming convention
+// (the dotted temp `.NNNNNN.0.3mf` BambuStudio writes), matching what
+// stock direct prints do.
+static std::string compose_remote_path(const BBL::PrintParams& p) {
+    std::string folder = p.ftp_folder.empty() ? std::string("/") : p.ftp_folder;
+    if (folder.empty() || folder.back() != '/') folder += '/';
+
+    std::string fname = p.dst_file;
+    if (fname.empty()) fname = p.ftp_file;
+    if (fname.empty()) {
+        try {
+            fname = boost::filesystem::path(p.filename).filename().string();
+        } catch (...) {}
+    }
+    if (fname.empty()) fname = "lan_print.3mf";
+    if (!fname.empty() && fname.front() == '/') fname.erase(0, 1);
+    return folder + fname;
+}
 
 int virtual_ftps_upload_(const PrintParams& params,
                          OnUpdateStatusFn  update_fn,
@@ -1385,26 +1712,18 @@ int virtual_ftps_upload_(const PrintParams& params,
     up.user        = params.username.empty() ? std::string("bblp") : params.username;
     up.pass        = params.password;
     up.local_path  = params.filename;
-    // Compose remote name with the exact fallback chain BambuStudio's OSS
-    // LocalPrintOrchestrator::compose_remote_path uses:
-    //   dst_file (set only by from_sdcard_view)
-    //     -> ftp_file (rarely set in this codebase)
-    //     -> basename of the local filename
-    //     -> "lan_print.3mf" (hardcoded last resort)
-    // Without this chain, normal calibration / object prints arrive with
-    // an empty STOR name → bridge stores under a generic path → the
-    // subsequent gcode_file MQTT command can't reference a real file →
-    // print never starts. This is the symptom observed 2026-06-01 14:31.
+    // Compose the FTPS STOR remote name via the shared helper. MUST
+    // exactly match the `remote_path` virtual_lan_print_ embeds in the
+    // slicer's MQTT `print.param` — see compose_remote_path's
+    // doc-comment for the why.
     {
-        std::string fname = params.dst_file;
-        if (fname.empty()) fname = params.ftp_file;
-        if (fname.empty()) {
-            try {
-                fname = boost::filesystem::path(params.filename).filename().string();
-            } catch (...) {}
-        }
-        if (fname.empty()) fname = "lan_print.3mf";
-        up.remote_name = std::move(fname);
+        std::string composed = compose_remote_path(params);
+        // up.remote_name expects a basename (the FTPS protocol takes
+        // the folder via CWD and the file via STOR <fname>); strip
+        // the leading folder prefix.
+        auto slash = composed.find_last_of('/');
+        up.remote_name = (slash == std::string::npos)
+                         ? composed : composed.substr(slash + 1);
     }
     Slic3r::virtual_ftps::ProgressFn  prog = nullptr;
     Slic3r::virtual_ftps::CancelledFn canc = nullptr;
@@ -1419,12 +1738,21 @@ int virtual_ftps_upload_(const PrintParams& params,
 int virtual_lan_print_(const PrintParams& params,
                        OnUpdateStatusFn  update_fn,
                        WasCancelledFn    cancel_fn) {
-    // Renumber Metadata/plate_<N>.* → plate_0.* before the FTPS upload so
-    // the printer can open the file. Operates on params.filename in place;
-    // a non-zero return is logged but doesn't block the upload (the bridge-
-    // side rewriter is the fallback).
-    (void) virtual_print_normalise_plate_to_zero(params.filename);
+    // (Plates start at 1: slicer writes plate_1.gcode, slice_info.config
+    // index=1, bridge passes through, printer opens plate_1.gcode. An
+    // earlier `virtual_print_normalise_plate_to_zero` renamed
+    // plate_<N>.* → plate_0.* but did NOT update slice_info.config,
+    // creating a mismatch the printer rejected. Removed in both slicer
+    // and bridge; see memory `project_orca_3mf_filament_settings`.)
 
+    // Mirror the real-printer LAN flow: FTPS upload first, then publish
+    // the `print.command=gcode_file` MQTT command. The MQTT command is
+    // what tells the printer "open this file off your SD card and start
+    // printing"; the bridge forwards it verbatim (FFFF→0948 payload
+    // rewrite) and the real printer does the rest. The bridge does NOT
+    // call any print-starting plugin function — it's a pass-through for
+    // both the file (via its FTPS server → onward to the real printer)
+    // and the command.
     int rc = virtual_ftps_upload_(params, update_fn, cancel_fn);
     if (rc != 0) {
         BOOST_LOG_TRIVIAL(warning) << "virtual_lan_print: FTPS upload failed rc=" << rc;
@@ -1434,18 +1762,10 @@ int virtual_lan_print_(const PrintParams& params,
     // the path here is identical to the one virtual_ftps_upload_ just sent
     // as STOR remote_name. Both ends must agree or the printer can't find
     // the file the bridge stored.
-    std::string folder = params.ftp_folder.empty() ? std::string("/") : params.ftp_folder;
-    if (folder.empty() || folder.back() != '/') folder += '/';
-    std::string fname = params.dst_file;
-    if (fname.empty()) fname = params.ftp_file;
-    if (fname.empty()) {
-        try {
-            fname = boost::filesystem::path(params.filename).filename().string();
-        } catch (...) {}
-    }
-    if (fname.empty()) fname = "lan_print.3mf";
-    if (!fname.empty() && fname.front() == '/') fname.erase(0, 1);
-    const std::string remote_path = folder + fname;
+    // Use the same shared helper as the FTPS leg — see compose_remote_path
+    // for why it MUST be bit-identical on both legs (bridge MqttBroker
+    // print interceptor keys its spool lookup on this).
+    const std::string remote_path = compose_remote_path(params);
     static std::atomic<uint64_t> s_seq{1};
     const std::string seq = std::to_string(s_seq.fetch_add(1));
 
@@ -1513,122 +1833,117 @@ int virtual_lan_print_(const PrintParams& params,
         BOOST_LOG_TRIVIAL(warning) << "virtual_lan_print: MQTT send rc=" << pubrc;
         return -1;
     }
-    return 0;
-}
 
-static int virtual_print_normalise_plate_to_zero(const std::string& threemf_path) {
-    if (threemf_path.empty()) return 0;
-    mz_zip_archive in{};
-    if (!mz_zip_reader_init_file(&in, threemf_path.c_str(), 0)) {
-        // Not a .3mf / not readable — silently let downstream FTPS proceed
-        // with whatever the slicer prepared; the bridge-side rewriter is
-        // the fallback for non-Orca slicers anyway.
-        return 0;
-    }
-    int src_idx = -1;
-    mz_uint n_files = mz_zip_reader_get_num_files(&in);
-    for (mz_uint i = 0; i < n_files; ++i) {
-        char name[512];
-        if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
-        std::string nm(name);
-        if (nm.size() <= 15) continue;
-        if (nm.compare(0, 15, "Metadata/plate_") != 0) continue;
-        if (nm.size() < 6 || nm.compare(nm.size() - 6, 6, ".gcode") != 0) continue;
-        std::size_t dot = nm.find('.', 15);
-        if (dot == std::string::npos) continue;
-        try { src_idx = std::stoi(nm.substr(15, dot - 15)); break; } catch (...) {}
-    }
-    if (src_idx <= 0) {                       // already plate_0 or no gcode
-        mz_zip_reader_end(&in);
+    // SendJob (BambuStudio) and PrintJob (OrcaSlicer) BOTH fire a
+    // leading `start_send_gcode_to_sdcard` with `project_name="verify_job"`
+    // and a 16-byte probe body purely to test that the printer's FTPS
+    // endpoint accepts the access code. NetworkAgent dispatches that
+    // probe through this very same virtual_lan_print_ for FFFF dev_ids.
+    // The bridge absorbs the probe at the FTPS layer (LanUploadSink
+    // detects the 16-byte body and never spools it), so there's no
+    // matching dispatch and no progress file will ever appear — if we
+    // entered the wait loop we'd block the slicer for the full 120 s
+    // timeout before it can even start the REAL upload.
+    //
+    // Skip the wait for the probe (project_name=="verify_job"); return
+    // success immediately so SendJob/PrintJob proceeds to the real
+    // upload, where the wait below DOES apply.
+    if (params.project_name == "verify_job") {
+        BOOST_LOG_TRIVIAL(info)
+            << "virtual_lan_print: probe (project_name=verify_job) — "
+               "skipping bridge-dispatch wait";
         return 0;
     }
 
-    const std::string src_tag = "plate_" + std::to_string(src_idx);
-    const std::string dst_tag = "plate_0";
-    const std::string out_path = threemf_path + ".rewrite.tmp";
-    ::unlink(out_path.c_str());
-
-    mz_zip_archive out{};
-    if (!mz_zip_writer_init_file(&out, out_path.c_str(), 0)) {
-        mz_zip_reader_end(&in);
-        return -1;
-    }
-
-    auto rename_entry = [&](const std::string& nm) {
-        std::string o = nm;
-        auto subst = [&](const std::string& needle, const std::string& with) {
-            std::size_t p = 0;
-            while ((p = o.find(needle, p)) != std::string::npos) {
-                o.replace(p, needle.size(), with);
-                p += with.size();
+    // Wait for the bridge to finish dispatching this print to the real
+    // printer before returning. Without this, BBS's PrintJob considers
+    // the print "sent" the moment the local-FTPS-to-bridge upload
+    // finishes (a fraction of a second) and immediately redirects the
+    // user to the Device tab while the bridge is still uploading to
+    // the printer and waiting for the print to actually start
+    // (10–20 s after).
+    //
+    // The bridge writes a JSON status file at
+    //   /tmp/bridge-progress/<FFFF dev_id>.json
+    // and updates it on every plugin update_fn callback. We poll the
+    // file every 250 ms, mirror the (stage, code, info) into the
+    // caller's update_fn so the slicer's "Sending…" dialog shows
+    // progress, and return only when the bridge marks the upload
+    // `done` (rc=0) or `failed`. Bounded by a 120-second timeout so
+    // a totally hung bridge doesn't lock up BBS's print dialog.
+    {
+        const std::string progress_path =
+            "/tmp/bridge-progress/" + params.dev_id + ".json";
+        using namespace std::chrono;
+        const auto t0       = steady_clock::now();
+        const auto deadline = t0 + seconds(120);
+        std::string last_phase;
+        int         last_stage = -1, last_code = -1;
+        std::string last_info;
+        while (true) {
+            if (cancel_fn && cancel_fn()) {
+                BOOST_LOG_TRIVIAL(info)
+                    << "virtual_lan_print: cancelled while waiting for "
+                       "bridge dispatch";
+                return -2;
             }
-        };
-        subst(src_tag, dst_tag);
-        const std::string n = std::to_string(src_idx);
-        subst("plate_no_light_" + n, "plate_no_light_0");
-        subst("top_"  + n, "top_0");
-        subst("pick_" + n, "pick_0");
-        return o;
-    };
-
-    bool ok = true;
-    int n_renamed = 0;
-    for (mz_uint i = 0; i < n_files; ++i) {
-        char name[512];
-        if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
-        std::string nm(name);
-        std::string new_nm = rename_entry(nm);
-
-        std::vector<unsigned char> buf;
-        mz_zip_archive_file_stat st{};
-        if (!mz_zip_reader_file_stat(&in, i, &st)) { ok = false; break; }
-        buf.resize(static_cast<std::size_t>(st.m_uncomp_size));
-        if (st.m_uncomp_size > 0
-            && !mz_zip_reader_extract_to_mem(&in, i, buf.data(), buf.size(), 0)) {
-            ok = false; break;
-        }
-
-        if (new_nm == "Metadata/model_settings.config") {
-            std::string xml(buf.begin(), buf.end());
-            auto subst_all = [&](const std::string& needle, const std::string& with) {
-                std::size_t p = 0;
-                while ((p = xml.find(needle, p)) != std::string::npos) {
-                    xml.replace(p, needle.size(), with);
-                    p += with.size();
+            if (steady_clock::now() > deadline) {
+                BOOST_LOG_TRIVIAL(warning)
+                    << "virtual_lan_print: bridge dispatch wait timed out "
+                       "after 120s — returning success anyway so BBS "
+                       "doesn't strand the user";
+                return 0;
+            }
+            // Read + parse the progress file. Bridge writes atomically
+            // (tmp + rename) so a partial read won't happen.
+            std::ifstream f(progress_path);
+            if (f) {
+                std::stringstream ss; ss << f.rdbuf();
+                try {
+                    auto j2 = nlohmann::json::parse(ss.str());
+                    int stage = j2.value("stage", -1);
+                    int code  = j2.value("code",  -1);
+                    std::string info  = j2.value("info",  std::string{});
+                    std::string phase = j2.value("phase", std::string{});
+                    if (stage != last_stage || code != last_code
+                        || info != last_info || phase != last_phase) {
+                        if (update_fn) update_fn(stage, code, info);
+                        BOOST_LOG_TRIVIAL(info)
+                            << "virtual_lan_print: bridge progress phase="
+                            << phase << " stage=" << stage
+                            << " code=" << code << " info=" << info;
+                        last_stage = stage;
+                        last_code  = code;
+                        last_info  = info;
+                        last_phase = phase;
+                    }
+                    if (phase == "done") {
+                        BOOST_LOG_TRIVIAL(info)
+                            << "virtual_lan_print: bridge dispatch done; "
+                               "returning success";
+                        return 0;
+                    }
+                    if (phase == "failed") {
+                        BOOST_LOG_TRIVIAL(warning)
+                            << "virtual_lan_print: bridge dispatch failed; "
+                               "info=" << info;
+                        return code != 0 ? code : -1;
+                    }
+                } catch (...) {
+                    // Half-written file or stale; just retry.
                 }
-            };
-            const std::string n = std::to_string(src_idx);
-            subst_all(src_tag, dst_tag);
-            subst_all("plate_no_light_" + n, "plate_no_light_0");
-            subst_all("top_"  + n, "top_0");
-            subst_all("pick_" + n, "pick_0");
-            subst_all("plater_id\" value=\"" + n + "\"",
-                      "plater_id\" value=\"0\"");
-            buf.assign(xml.begin(), xml.end());
+            }
+            std::this_thread::sleep_for(milliseconds(250));
         }
-
-        if (!mz_zip_writer_add_mem(&out, new_nm.c_str(),
-                                   buf.empty() ? nullptr : buf.data(),
-                                   buf.size(), MZ_DEFAULT_COMPRESSION)) {
-            ok = false; break;
-        }
-        if (new_nm != nm) ++n_renamed;
     }
-    bool finalize_ok = ok && mz_zip_writer_finalize_archive(&out) && mz_zip_writer_end(&out);
-    mz_zip_reader_end(&in);
-    if (!finalize_ok) { ::unlink(out_path.c_str()); return -1; }
-    if (::rename(out_path.c_str(), threemf_path.c_str()) != 0) {
-        ::unlink(out_path.c_str()); return -1;
-    }
-    BOOST_LOG_TRIVIAL(info)
-        << "virtual_print_normalise_plate_to_zero: " << threemf_path
-        << " plate_" << src_idx << " -> plate_0 (renamed=" << n_renamed << ")";
-    return 0;
 }
+
 
 
 int NetworkAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+    snapshot_bbs_sent(params.dev_id, params.filename);
+    snapshot_print_cmd("start_print", params);
     if (is_virtual_dev_id(params.dev_id)) {
         BOOST_LOG_TRIVIAL(info) << "[bbs-virtual] start_print FFFF dev_id=" << params.dev_id;
         return virtual_lan_print_(params, update_fn, cancel_fn);
@@ -1646,6 +1961,8 @@ int NetworkAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, Wa
 
 int NetworkAgent::start_local_print_with_record(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+    snapshot_bbs_sent(params.dev_id, params.filename);
+    snapshot_print_cmd("start_local_print_with_record", params);
     if (is_virtual_dev_id(params.dev_id)) {
         BOOST_LOG_TRIVIAL(info) << "[bbs-virtual] start_local_print_with_record FFFF dev_id=" << params.dev_id;
         return virtual_lan_print_(params, update_fn, cancel_fn);
@@ -1662,6 +1979,8 @@ int NetworkAgent::start_local_print_with_record(PrintParams params, OnUpdateStat
 
 int NetworkAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+    snapshot_bbs_sent(params.dev_id, params.filename);
+    snapshot_print_cmd("start_send_gcode_to_sdcard", params);
     if (is_virtual_dev_id(params.dev_id)) {
         BOOST_LOG_TRIVIAL(info) << "[bbs-virtual] start_send_gcode_to_sdcard FFFF dev_id=" << params.dev_id;
         return virtual_lan_print_(params, update_fn, cancel_fn);
@@ -1682,6 +2001,8 @@ int NetworkAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusF
 
 int NetworkAgent::start_local_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
 {
+    snapshot_bbs_sent(params.dev_id, params.filename);
+    snapshot_print_cmd("start_local_print", params);
     if (is_virtual_dev_id(params.dev_id)) {
         BOOST_LOG_TRIVIAL(info) << "[bbs-virtual] start_local_print FFFF dev_id=" << params.dev_id;
         return virtual_lan_print_(params, update_fn, cancel_fn);

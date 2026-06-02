@@ -394,6 +394,11 @@ private:
     std::unique_ptr<::Slic3r::bridge::BridgeStorageBackend> m_bridge_storage;
     std::unique_ptr<std::thread>                            m_bridge_thread;
     std::unique_ptr<wxTimer>                                m_bridge_push_timer;
+    // (Periodic cloud-session refresh / watchdog moved to a std::thread
+    // in BridgeBootstrap.cpp — wxTimer events were not pumped reliably
+    // by the bridge child's invisible-GUI event loop. No member field
+    // needed; the thread captures `app` by value and self-terminates
+    // on _Exit / SELF-RESTART.)
 
     friend bool Slic3r::GUI::BridgeBootstrap::run_headless(GUI_App*);
     friend void Slic3r::GUI::BridgeBootstrap::install_gui_worker(GUI_App*);

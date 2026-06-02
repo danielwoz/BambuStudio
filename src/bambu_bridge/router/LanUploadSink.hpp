@@ -72,10 +72,50 @@ public:
 
     server::UploadResult deliver(server::UploadJob job) override;
 
+    // Dispatch a slicer-originated `print.command=gcode_file` MQTT
+    // payload. Called by MqttBroker as soon as it sees the slicer publish
+    // a print command on `device/<sn>/request`. Looks up the spool
+    // recorded by the matching `deliver()` for this (dev_id, filename),
+    // constructs a full LocalPrintParams from the MQTT JSON (ams_mapping,
+    // task flags, plate index, …) and asks the plugin to start the
+    // print via `start_local_print_with_record` — which handles the
+    // upload-to-real-printer AND the equivalent MQTT print command in
+    // one transaction. On A1 / FTPS-less printers the plugin's own
+    // fallback to `start_print` (cloud-relay) covers the case.
+    //
+    // Returns 0 on dispatch success (plugin accepted the job), nonzero
+    // on lookup or plugin failure. MqttBroker uses the return code only
+    // to decide whether to SUPPRESS the forward to the printer's MQTT
+    // (success → suppress; failure → fall back to verbatim forward so
+    // a broken interceptor degrades gracefully).
+    int dispatch_print_command(const std::string& dev_id,
+                               const std::string& virtual_dev_id,
+                               const std::string& mqtt_payload_json);
+
 private:
     mutable std::mutex                                    m_mu;
     std::shared_ptr<BambuNetworkingPluginHandle>          m_handle;
     std::unordered_map<std::string, LanUploadSinkDevice>  m_devices;
+
+    // Per-device spool registry. Each successful `deliver()` records its
+    // spooled tempfile path here keyed by (dev_id, basename of the STOR
+    // remote name the slicer sent), along with the matching settings-
+    // only `.3mf` sidecar (built by `make_settings_only_zip` from the
+    // main upload). The matching `dispatch_print_command` looks both
+    // up by the `print.param` field of the MQTT JSON and passes them
+    // to the plugin's start_local_print_with_record as
+    // (local_file_path, config_filename). The plugin requires BOTH —
+    // an empty config_filename causes a -3070 / -2030 cascade because
+    // the plugin can't upload the OSS config sidecar.
+    //
+    // Same (dev_id, filename) on a re-print overwrites — last upload wins.
+    struct SpoolEntry {
+        std::string main_path;     // /tmp/bridge-spool/<dev>/<basename>
+        std::string config_path;   // /tmp/bridge-spool/<dev>/<stem>_config.3mf
+                                   // empty if make_settings_only_zip failed
+    };
+    std::unordered_map<std::string,
+        std::unordered_map<std::string, SpoolEntry>>      m_spool_paths;
 
     // Per-device port-6000 BambuTunnel reachability cache. Populated by
     // a one-shot TCP-connect probe on the first upload for a dev_id and

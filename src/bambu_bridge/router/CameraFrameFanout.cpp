@@ -52,12 +52,34 @@ CameraFrameFanout::~CameraFrameFanout() {
 }
 
 bool CameraFrameFanout::open() {
-    if (m_running.load()) return true;
-    if (!m_upstream) return false;
+    // Race fix (2026-06-02): the old check-then-set sequence
+    //   if (m_running.load()) return true;
+    //   ...
+    //   m_running.store(true);
+    //   m_reader = std::thread(...);
+    // let two RTSP sessions opening concurrently both pass the first
+    // check, both spawn `m_reader = std::thread(...)`, and the second
+    // assignment overwrote the first joinable thread — that std::thread
+    // destructor then ran with joinable() true and aborted the process
+    // with "terminate called without an active exception". H2D bridge
+    // child died like this twice today (camera-fanout log shows
+    // "opened via Cloud" twice back-to-back right before the crash).
+    //
+    // CAS gates the upstream open + thread spawn to a single winner.
+    // Subsequent callers see m_running already true and return early —
+    // the upstream is reference-counted by the fanout, so the second
+    // caller's logical "open" is a no-op that just makes the new cursor
+    // start receiving from the existing reader.
+    bool expected = false;
+    if (!m_running.compare_exchange_strong(expected, true)) {
+        return true;  // another thread already in / past the spawn
+    }
+    if (!m_upstream) { m_running.store(false); return false; }
     if (!m_upstream->is_open() && !m_upstream->open()) {
         std::fprintf(stderr,
             "[camera-fanout] upstream->open() FAILED — fanout will stay closed\n");
         std::fflush(stderr);
+        m_running.store(false);  // CAS-loser rollback so next open() retries
         return false;
     }
     {
@@ -66,7 +88,9 @@ bool CameraFrameFanout::open() {
         m_writer_pos = 0;
         m_eos.store(false);
     }
-    m_running.store(true);
+    // Defensive: an earlier close() may have left a joinable handle if
+    // the race ever produced one. Join before reassigning.
+    if (m_reader.joinable()) m_reader.join();
     m_reader = std::thread(&CameraFrameFanout::reader_loop, this);
     return true;
 }
@@ -122,17 +146,74 @@ void CameraFrameFanout::reader_loop() {
     int idle_streak = 0;
     auto last_stat_log = std::chrono::steady_clock::now();
     std::size_t last_produced_at_log = 0;
+    // Auto-reopen budget. The proprietary BambuTunnel SDK drops the
+    // upstream link every few seconds (we've watched it open OK, read
+    // a handful of frames, then return rc=-1 / -107 mid-stream). When
+    // the fanout's caller is a slicer's media player, an EOS here means
+    // the slicer's video appears to freeze for the user. Instead of
+    // surfacing the drop, we tear the upstream down and reopen it; the
+    // slicer's RTSP session stays connected and starts getting frames
+    // again within ~1-2 s.
+    //
+    // Bound the attempts so a printer with the camera genuinely off
+    // doesn't burn CPU/threads forever; if we hit kMaxReopenAttempts
+    // back-to-back failures we give up and let cursors see EOS.
+    int  reopen_attempts          = 0;
+    auto last_reopen_attempt_at   = std::chrono::steady_clock::time_point{};
+    constexpr int kMaxReopenAttempts          = 20;
+    constexpr auto kReopenAttemptCooldown     = std::chrono::seconds(2);
     while (m_running.load()) {
         if (!m_upstream->is_open()) {
-            // Source dropped (EOS or error). Mark and exit — caller can
-            // re-open the fanout to start over with a fresh source.
-            m_eos.store(true);
-            m_cv.notify_all();
-            break;
+            // Upstream dropped (EOS or SDK error mid-stream). Try to
+            // reopen instead of giving up — see the comment above the
+            // loop for why.
+            if (reopen_attempts >= kMaxReopenAttempts) {
+                std::fprintf(stderr,
+                    "[camera-fanout] upstream dropped and reopen budget "
+                    "exhausted (%d attempts); marking EOS so cursors stop\n",
+                    reopen_attempts);
+                std::fflush(stderr);
+                m_eos.store(true);
+                m_cv.notify_all();
+                break;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (last_reopen_attempt_at.time_since_epoch().count() != 0
+                && now - last_reopen_attempt_at < kReopenAttemptCooldown) {
+                // Back off briefly so we don't pin the CPU between
+                // failed reopens. close() will still notice m_running
+                // flipping false promptly.
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(200));
+                continue;
+            }
+            last_reopen_attempt_at = now;
+            reopen_attempts++;
+            std::fprintf(stderr,
+                "[camera-fanout] upstream dropped — reopen attempt %d/%d\n",
+                reopen_attempts, kMaxReopenAttempts);
+            std::fflush(stderr);
+            // Force a clean close before reopening — the SDK is unhappy
+            // about reopen on top of a half-closed handle.
+            m_upstream->close();
+            if (m_upstream->open()) {
+                std::fprintf(stderr,
+                    "[camera-fanout] upstream reopen OK (attempt %d)\n",
+                    reopen_attempts);
+                std::fflush(stderr);
+                // Reset the budget on a successful reopen so a long-
+                // lived stream that just had a hiccup doesn't burn
+                // toward exhaustion forever.
+                reopen_attempts = 0;
+            }
+            continue;
         }
+        // We have an open upstream — successful read implicitly resets
+        // the reopen budget (any frame proves the stream is alive).
         auto frame = m_upstream->next_frame(m_cfg.upstream_poll_timeout_ms);
         if (frame) {
-            idle_streak = 0;
+            idle_streak       = 0;
+            reopen_attempts   = 0; // healthy frame — wipe the budget
             std::size_t produced_now = 0;
             {
                 std::lock_guard<std::mutex> lk(m_mu);

@@ -13,7 +13,7 @@
 #include "../server/MqttBroker.hpp"
 #include "../server/FtpsServer.hpp"
 #include "../server/RtspServer.hpp"
-#include "../server/TranscodingCameraSource.hpp"
+#include "../server/PassthroughCameraSource.hpp"
 #include "../server/VirtualTunnelServer.hpp"
 #include "../server/IUplink.hpp"
 #include "../server/IUploadSink.hpp"
@@ -543,6 +543,29 @@ bool BridgeApp::initialise() {
         // release-shaped behaviour.
         bcfg.max_clients_per_device = 4;
         m_mqtt = std::make_unique<server::MqttBroker>(bcfg);
+
+        // Wire the gcode_file interceptor. The slicer publishes
+        // `print.command=gcode_file` on `device/<sn>/request` right
+        // after the matching FTPS upload; LanUploadSink registered the
+        // spool path. This closure pulls the JSON, looks up the spool,
+        // and asks the plugin to drive the actual real-printer print
+        // command (`start_local_print_with_record`, with the adapter's
+        // built-in A1-cloud-fallback). The broker then suppresses the
+        // verbatim forward so the printer doesn't get a duplicate /
+        // contradicting print command.
+        if (m_mqtt && m_lan_sink) {
+            auto lan_sink_weak =
+                std::weak_ptr<router::LanUploadSink>(m_lan_sink);
+            m_mqtt->set_print_command_interceptor(
+                [lan_sink_weak](const std::string& dev_id,
+                                const std::string& virtual_dev_id,
+                                const std::string& json_payload) -> int {
+                    auto sink = lan_sink_weak.lock();
+                    if (!sink) return -1;
+                    return sink->dispatch_print_command(
+                        dev_id, virtual_dev_id, json_payload);
+                });
+        }
     }
     if (m_cfg.enable_ftps) {
         server::FtpsServerConfig fcfg;
@@ -1222,12 +1245,14 @@ void BridgeApp::add_device_locked(const VirtualPrinter& vp) {
             rdev.port        = state.rtsp_port;
             rdev.access_code = access_code;
             rdev.cert        = cert;
-            // Wrap the router in the MJPEG->H.264 transcoder so EVERY virtual
-            // printer republishes as uniform standard H.264 (the A1/P1 JPEG
-            // cameras get transcoded; H.264 LAN/cloud sources pass through
-            // untouched). Players that can't decode MJPEG-over-RTSP (e.g.
-            // Windows Media Foundation) then work the same as on Linux.
-            rdev.source      = std::make_shared<server::TranscodingCameraSource>(
+            // Wrap the router in a passthrough source. The router's inner
+            // BambuTunnel sources already de-encapsulate the printer's
+            // proprietary container into either H.264 Annex-B or MJPEG; the
+            // RtspServer's RTP packetiser republishes both as standard RTP
+            // (RFC 6184 for H.264, RFC 2435 for MJPEG). The slicer's video
+            // player decodes both wire formats natively (libBambuSource for
+            // BBS, GStreamer rtspsrc + jpegdec for Orca).
+            rdev.source      = std::make_shared<server::PassthroughCameraSource>(
                                    state.cam_router);
             // Camera RTSP transport. Default PLAIN RTSP: standard clients
             // (slicer GStreamer, VLC, ffmpeg) connect directly without

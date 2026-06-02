@@ -972,29 +972,84 @@ static std::string durationString(long duration)
 
 bool PrinterFileSystem::ParseThumbnail(File &file, std::istream &is)
 {
-    Slic3r::DynamicPrintConfig config;
-    Slic3r::Model              model;
-    Slic3r::PlateDataPtrs      plate_data_list;
-    Slic3r::Semver file_version;
-    if (!Slic3r::load_gcode_3mf_from_stream(is, &config, &model, &plate_data_list, &file_version))
+    // Bambu-Bridge instrumentation: ParseThumbnail crashed silently
+    // inside load_gcode_3mf_from_stream / _extract_project_config_from_archive
+    // when the bridge first started forwarding the binary `data` portion
+    // of SUB_FILE responses (2026-06-02). The crash produced no log entry
+    // because the worker thread died mid-call. These BOOST_LOG_TRIVIAL
+    // markers leave a precise trail in ~/.config/BambuStudio/log/ on the
+    // next recurrence; the try/catch converts unhandled exceptions into a
+    // clean `return false` so PFS just skips the file's metadata instead
+    // of crashing the slicer; and the model_info null-guards stop a
+    // shared_ptr deref from segfaulting on .3mfs without a Designer block.
+    BOOST_LOG_TRIVIAL(info)
+        << "ParseThumbnail: enter file.path=" << file.path
+        << " local_path_bytes=" << file.local_path.size();
+    try {
+        Slic3r::DynamicPrintConfig config;
+        Slic3r::Model              model;
+        Slic3r::PlateDataPtrs      plate_data_list;
+        Slic3r::Semver             file_version;
+        BOOST_LOG_TRIVIAL(info)
+            << "ParseThumbnail: -> load_gcode_3mf_from_stream";
+        if (!Slic3r::load_gcode_3mf_from_stream(is, &config, &model,
+                                                &plate_data_list,
+                                                &file_version)) {
+            BOOST_LOG_TRIVIAL(warning)
+                << "ParseThumbnail: load_gcode_3mf_from_stream false"
+                   " file.path=" << file.path;
+            return false;
+        }
+        BOOST_LOG_TRIVIAL(info)
+            << "ParseThumbnail: load_gcode_3mf_from_stream ok plates="
+            << plate_data_list.size()
+            << " model_info=" << (model.model_info ? "ptr" : "null");
+
+        float time   = 0.f;
+        float weight = 0.f;
+        for (auto &plate : plate_data_list) {
+            if (!plate) continue;
+            time   += atof(plate->gcode_prediction.c_str());
+            weight += atof(plate->gcode_weight.c_str());
+            if (!plate->gcode_file.empty() && !plate->thumbnail_file.empty())
+                file.metadata.emplace(
+                    "plate_thumbnail_" + std::to_string(plate->plate_index),
+                    plate->thumbnail_file);
+        }
+
+        // model.model_info is a shared_ptr — deref without a guard
+        // crashed Orca on 2026-06-02 for spool 3mfs whose Designer
+        // metadata was absent. Fall back to "" when missing.
+        const std::string title =
+            model.model_info ? model.model_info->model_name : std::string{};
+        std::string thumbnail =
+            model.model_info
+                ? model.model_info->metadata_items["Thumbnail"]
+                : std::string{};
+        if (thumbnail.empty() && !plate_data_list.empty()
+            && plate_data_list.front())
+            thumbnail = plate_data_list.front()->thumbnail_file;
+
+        file.metadata.emplace("Title",     title);
+        file.metadata.emplace("Time",      durationString(round(time)));
+        file.metadata.emplace("Weight",
+                              std::to_string(int(round(weight))) + 'g');
+        file.metadata.emplace("Thumbnail", thumbnail);
+
+        BOOST_LOG_TRIVIAL(info)
+            << "ParseThumbnail: ok title='" << title << "' time=" << time
+            << " weight=" << weight << " thumbnail='" << thumbnail << "'";
+        return true;
+    } catch (const std::exception &ex) {
+        BOOST_LOG_TRIVIAL(error)
+            << "ParseThumbnail: std::exception '" << ex.what()
+            << "' file.path=" << file.path;
         return false;
-    float time      = 0.f;
-    float weight    = 0.f;
-    for (auto &plate : plate_data_list) {
-        time += atof(plate->gcode_prediction.c_str());
-        weight += atof(plate->gcode_weight.c_str());
-        if (!plate->gcode_file.empty() && !plate->thumbnail_file.empty())
-            file.metadata.emplace("plate_thumbnail_" + std::to_string(plate->plate_index), plate->thumbnail_file);
+    } catch (...) {
+        BOOST_LOG_TRIVIAL(error)
+            << "ParseThumbnail: unknown exception file.path=" << file.path;
+        return false;
     }
-    file.metadata.emplace("Title", model.model_info->model_name);
-    file.metadata.emplace("Time", durationString(round(time)));
-    file.metadata.emplace("Weight", std::to_string(int(round(weight))) + 'g');
-    auto thumbnail = model.model_info->metadata_items["Thumbnail"];
-    if (thumbnail.empty() && !plate_data_list.empty()) {
-        thumbnail = plate_data_list.front()->thumbnail_file;
-    }
-    file.metadata.emplace("Thumbnail", thumbnail);
-    return true;
 }
 
 void PrinterFileSystem::UpdateFocusThumbnail2(std::shared_ptr<std::vector<File>> files, int type)

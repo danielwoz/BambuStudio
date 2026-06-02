@@ -187,7 +187,18 @@ void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
         m_remote_proto = 0;
         m_device_busy = false;
     }
-    Enable(obj && obj->is_info_ready() && obj->m_push_count > 0);
+    // FFFF-prefix (virtual) printers never see an `info.command=get_version`
+    // reply from the bridge — the bridge speaks plugin-MQTT over its own
+    // broker but does not synthesise a get_version response, so the
+    // slicer's `module_vers` map stays empty and `is_info_ready()` (which
+    // gates on module_vers) returns false forever. The Home-tab live
+    // status doesn't depend on module_vers, which is why the user sees
+    // "Online with live data" there but "Please confirm if the printer
+    // is connected" in the camera widget. Skip the version check for
+    // virtual dev_ids; m_push_count>0 is still required so we still
+    // gate on a real pushall having arrived.
+    const bool is_virtual = obj && Slic3r::NetworkAgent::is_virtual_dev_id(obj->get_dev_id());
+    Enable(obj && obj->is_info_ready(/*check_version=*/!is_virtual) && obj->m_push_count > 0);
     if (machine == m_machine) {
         if (m_last_state == MEDIASTATE_IDLE && IsEnabled())
             Play();
@@ -373,19 +384,21 @@ void MediaPlayCtrl::Play()
     // support would need a slicer→bridge port lookup.
     if (Slic3r::NetworkAgent::is_virtual_dev_id(m_machine) &&
         !m_lan_ip.empty()) {
-        // Standard PLAIN RTSP served by the bridge's own C++ RtspServer
-        // (server/RtspServer.cpp), NOT the proprietary bambu:/// scheme —
-        // virtual printers use standard streaming the slicer's native
-        // GStreamer rtspsrc plays directly (no libBambuSource).
+        // BBS's wxMediaCtrl3 backend ONLY speaks libBambuSource (BambuLib
+        // Bambu_Create + Bambu_Open) — it has no GStreamer rtspsrc and
+        // refuses plain `rtsp://` URLs. OrcaSlicer uses wxMediaCtrl2 with
+        // GStreamer integration and accepts rtsp:// natively, which is
+        // why the same bridge stream works in Orca but blew up here as
+        // "Please check the network and try again."
         //
-        // Port resolution: same shared resolver MQTT/FTPS/vtun use:
+        // libBambuSource recognises a tagged `bambu:///rtsp___…` scheme:
+        // it strips the prefix and dials a real RTSP connection
+        // internally, returning the H.264 samples through Bambu_ReadSample.
+        // The bridge's RtspServer ignores auth, so any user/pass works.
+        //
+        // Port resolution: same shared resolver MQTT/FTPS/vtun use —
         // live SSDP cache → persisted store → unicast probe of the
-        // bridge. Was store-only previously, which silently defaulted
-        // to the H2D's 38322 whenever the store hadn't captured this
-        // dev's mqtt_port yet — exactly the BBS-side regression that
-        // broke H2S/A1 video while H2D worked. Matches OrcaSlicer's
-        // build_virtual_live_url shape in
-        // OrcaSlicer-bridge/src/slic3r/GUI/Printer/MediaUrlBuilder.cpp.
+        // bridge.
         constexpr uint16_t kBridgeRtspPort = 38322;
         const uint16_t rtsp_port =
             Slic3r::VirtualSsdpDiscovery::port_for(
@@ -394,10 +407,16 @@ void MediaPlayCtrl::Play()
         // slicer-side flag; the bridge's BAMBU_BRIDGE_RTSP_TLS is the single
         // source of truth.
         const char* scheme = probe_rtsp_scheme(m_lan_ip, rtsp_port);
-        std::string url = std::string(scheme) + "://" +
-            m_lan_ip + ":" + std::to_string(rtsp_port) + "/streaming/live/1";
+        const std::string user   = m_lan_user.empty()   ? std::string("bblp") : m_lan_user;
+        const std::string passwd = m_lan_passwd.empty() ? std::string("bridge") : m_lan_passwd;
+        // bambu:///<scheme>___user:pass@host:port/path?proto=<scheme>
+        std::string url = std::string("bambu:///") + scheme + "___" +
+            user + ":" + passwd + "@" +
+            m_lan_ip + ":" + std::to_string(rtsp_port) +
+            "/streaming/live/1?proto=" + scheme;
         BOOST_LOG_TRIVIAL(info)
-            << "MediaPlayCtrl: virtual (standard rtsp) url " << url;
+            << "MediaPlayCtrl: virtual (bambu:///"
+            << scheme << "___) url " << url;
         m_url = url;
         load();
         m_button_play->SetIcon("media_stop");
@@ -606,7 +625,28 @@ void MediaPlayCtrl::Stop(wxString const &msg, wxString const &msg2)
 
     bool local = tunnel == "local" || tunnel == "rtsp" ||
                  tunnel == "rtsps";
-    if (m_failed_code < 0 && last_state != wxMEDIASTATE_PLAYING && local && (m_failed_retry > 1 || m_user_triggered)) {
+    // Skip the "LAN Connection Failed → re-enter IP/access code" modal
+    // for FFFF virtual dev_ids. The bridge's RTSP server accepts any
+    // user/pass and is reached at a fixed `bridge_ip:38322`, so the IP
+    // and code are already correct — they're set by the bridge, not by
+    // the user. A transient libBambuSource open hiccup (TUTK opening
+    // simultaneously with a second client, BambuTunnel start_stream
+    // would_block on a slow first iframe, etc.) on the bridge path is
+    // exactly the situation where the stock retry-with-modal flow is
+    // counterproductive: it interrupts the user with a credentials
+    // prompt that can't help, and clears m_next_retry so the natural
+    // 5-second back-off retry never fires. Empirically, "tried again
+    // a moment later and it worked" matches this — the underlying
+    // upstream stabilises within a few seconds, but BBS had already
+    // bailed out of the retry loop.
+    //
+    // For virtual dev_ids: keep retrying with the existing back-off
+    // (5 * m_failed_retry seconds) instead of popping the modal.
+    const bool is_virtual_for_retry =
+        Slic3r::NetworkAgent::is_virtual_dev_id(m_machine);
+    if (m_failed_code < 0 && last_state != wxMEDIASTATE_PLAYING && local
+            && (m_failed_retry > 1 || m_user_triggered)
+            && !is_virtual_for_retry) {
         m_next_retry = wxDateTime(); // stop retry
         if (wxGetApp().show_modal_ip_address_enter_dialog(false, _L("LAN Connection Failed (Failed to start liveview)"))) {
             m_failed_retry = 0;

@@ -41,6 +41,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -115,6 +116,34 @@ public:
     // constructed with a default `NullUplink`.
     void set_uplink(std::shared_ptr<IUplink> uplink);
 
+    // Slicer-side `print.command=gcode_file` interceptor. When set, the
+    // broker invokes this callback on every UPSTREAM publish whose JSON
+    // payload's `print.command` field equals `"gcode_file"`. If the
+    // callback returns 0 (handled), the broker SUPPRESSES the forward
+    // to the printer — the callback is responsible for driving the
+    // real-printer print via the plugin (which sends its own MQTT
+    // command). If it returns nonzero (file not yet spooled, parse
+    // error, plugin failure) the broker falls back to forwarding the
+    // slicer's verbatim message so a broken interceptor degrades
+    // gracefully.
+    //
+    // Wiring: BridgeApp gives the broker a closure that calls into
+    // LanUploadSink::dispatch_print_command, which has the spool
+    // registry and the plugin handle.
+    using PrintCommandInterceptor =
+        std::function<int(const std::string& dev_id,
+                          const std::string& virtual_dev_id,
+                          const std::string& json_payload)>;
+    void set_print_command_interceptor(PrintCommandInterceptor cb);
+
+    // Internal: called by the per-device session io loop when it
+    // detects a `print.command=gcode_file` payload. Returns the
+    // interceptor's rc (0 = handled, suppress forward) or 1 if no
+    // interceptor is installed (caller forwards verbatim).
+    int try_intercept_print_command(const std::string& dev_id,
+                                    const std::string& virtual_dev_id,
+                                    const std::string& json_payload);
+
     // Test hook: explicitly push a printer-side message into the
     // downstream pipe. No-op if the device has no active session.
     void inject_downstream(const std::string& dev_id,
@@ -150,6 +179,9 @@ private:
     mutable std::mutex                              m_devices_mu;
     std::unordered_map<std::string,
                        std::unique_ptr<Device>>     m_devices;
+
+    mutable std::mutex                              m_intercept_mu;
+    PrintCommandInterceptor                         m_print_intercept;
 };
 
 } // namespace server

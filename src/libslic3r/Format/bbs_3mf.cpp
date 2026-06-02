@@ -1632,10 +1632,24 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         }
         while (it != m_plater_data.end())
         {
-            if (it->first > m_plater_data.size())
+            // Upstream guard only checks the upper bound. A plate with
+            // `it->first == 0` (e.g. an OrcaSlicer plate_0-shaped 3mf
+            // already sitting on the printer's SD card from a print made
+            // before today's bridge plate_0→plate_1 normaliser) hits
+            // `plate_data_list[-1]` below and segfaults. Skip those
+            // plates so the rest of the metadata still parses. See
+            // memory `[[project_orca_plate_normaliser]]` for the cause
+            // pattern and `[[project_storage_data_forwarding]]` for the
+            // path that surfaced this crash inside ParseThumbnail.
+            if (it->first < 1 || it->first > m_plater_data.size())
             {
-                add_error("invalid plate index");
-                return false;
+                BOOST_LOG_TRIVIAL(warning)
+                    << __FUNCTION__ << ":" << __LINE__
+                    << " skipping plate with invalid index="
+                    << it->first << " (m_plater_data.size()="
+                    << m_plater_data.size() << ")";
+                ++it;
+                continue;
             }
             PlateData * plate = plate_data_list[it->first-1];
             plate->locked = it->second->locked;
@@ -2322,10 +2336,17 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         }
         while (it != m_plater_data.end())
         {
-            if (it->first > m_plater_data.size())
+            // Same lower-bound guard as load_gcode_3mf_from_stream's
+            // analogous loop — see comment + memory link there.
+            if (it->first < 1 || it->first > m_plater_data.size())
             {
-                add_error("invalid plate index");
-                return false;
+                BOOST_LOG_TRIVIAL(warning)
+                    << __FUNCTION__ << ":" << __LINE__
+                    << " skipping plate with invalid index="
+                    << it->first << " (m_plater_data.size()="
+                    << m_plater_data.size() << ")";
+                ++it;
+                continue;
             }
             plate_data_list[it->first-1]->locked = it->second->locked;
             plate_data_list[it->first-1]->plate_index = it->second->plate_index-1;

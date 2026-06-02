@@ -208,6 +208,11 @@ struct MqttBroker::Device {
     SSL_CTX*                ssl_ctx       = nullptr;
     int                     listen_fd     = -1;
     uint16_t                bound_port    = 0;
+    MqttBroker*             broker        = nullptr; // back-pointer so the
+                                                     // session io loop can
+                                                     // reach the broker's
+                                                     // print-command
+                                                     // interceptor.
 
     std::atomic<bool>       stopped{false};
     std::thread             accept_thread;
@@ -275,6 +280,7 @@ MqttBroker::Device* MqttBroker::find_locked(const std::string& dev_id) {
 void MqttBroker::add_device(MqttBrokerVirtualDevice dev) {
     auto d        = std::make_unique<Device>();
     d->spec       = std::move(dev);
+    d->broker     = this;
     d->ssl_ctx    = make_device_ctx(d->spec.cert);
     if (!d->ssl_ctx) {
         throw std::runtime_error("MqttBroker: failed to build SSL_CTX for dev_id="
@@ -846,9 +852,71 @@ void session_io_loop(MqttBroker::Device* dev,
                         }
                     }
                 }
-                uplink->on_publish(dev->spec.dev_id, pk->publish.topic,
-                                   std::move(pk->publish.payload),
-                                   pk->publish.qos);
+                // Interceptor for `print.command=gcode_file`. The
+                // slicer publishes this on `device/<sn>/request` right
+                // after the matching FTPS upload. LanUploadSink registered
+                // the upload's spool; the interceptor we set up in
+                // BridgeApp pulls that spool path out and drives the
+                // plugin's start_local_print_with_record (LAN) or
+                // start_print (cloud fallback) with the FULL AMS context
+                // from this JSON. If the callback returns 0 (handled),
+                // suppress the verbatim forward — the plugin's call
+                // sends its own equivalent MQTT command to the printer.
+                // On nonzero (not spooled, parse failure, plugin error),
+                // fall through to the verbatim forward so behaviour
+                // degrades gracefully.
+                bool intercepted = false;
+                if (dev->broker) {
+                    const auto& buf = pk->publish.payload;
+                    // Cheap pre-filter: avoid JSON-parsing every
+                    // heartbeat / status message. The `gcode_file`
+                    // command always appears as `"command":"gcode_file"`
+                    // in the payload (virtual_lan_print_ uses
+                    // j.dump() which emits compact JSON without
+                    // whitespace).
+                    static constexpr const char kNeedle[] =
+                        "\"command\":\"gcode_file\"";
+                    const size_t nlen = sizeof(kNeedle) - 1;
+                    bool maybe = false;
+                    if (buf.size() >= nlen) {
+                        for (size_t i = 0; i + nlen <= buf.size(); ++i) {
+                            if (std::memcmp(buf.data() + i, kNeedle, nlen) == 0) {
+                                maybe = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (maybe) {
+                        std::string json_str(
+                            reinterpret_cast<const char*>(buf.data()),
+                            buf.size());
+                        int rc = dev->broker->try_intercept_print_command(
+                            dev->spec.dev_id, dev->spec.virtual_dev_id,
+                            json_str);
+                        if (rc == 0) {
+                            intercepted = true;
+                            std::fprintf(stderr,
+                                "[mqtt-broker] dev=%s gcode_file "
+                                "INTERCEPTED (no verbatim forward)\n",
+                                dev->spec.dev_id.c_str());
+                            std::fflush(stderr);
+                        } else if (rc == 1) {
+                            // No interceptor — fall through to verbatim.
+                        } else {
+                            std::fprintf(stderr,
+                                "[mqtt-broker] dev=%s gcode_file "
+                                "interceptor rc=%d — falling back to "
+                                "verbatim forward\n",
+                                dev->spec.dev_id.c_str(), rc);
+                            std::fflush(stderr);
+                        }
+                    }
+                }
+                if (!intercepted) {
+                    uplink->on_publish(dev->spec.dev_id, pk->publish.topic,
+                                       std::move(pk->publish.payload),
+                                       pk->publish.qos);
+                }
             }
             if (pk->publish.qos == 1) {
                 auto ack = encode_puback(pk->publish.packet_id);
@@ -928,6 +996,23 @@ void MqttBroker::set_uplink(std::shared_ptr<IUplink> uplink) {
         return;
     }
     m_cfg.uplink = std::move(uplink);
+}
+
+void MqttBroker::set_print_command_interceptor(PrintCommandInterceptor cb) {
+    std::lock_guard<std::mutex> lk(m_intercept_mu);
+    m_print_intercept = std::move(cb);
+}
+
+int MqttBroker::try_intercept_print_command(const std::string& dev_id,
+                                            const std::string& virtual_dev_id,
+                                            const std::string& json_payload) {
+    PrintCommandInterceptor cb;
+    {
+        std::lock_guard<std::mutex> lk(m_intercept_mu);
+        cb = m_print_intercept;
+    }
+    if (!cb) return 1; // no interceptor installed; caller forwards verbatim
+    return cb(dev_id, virtual_dev_id, json_payload);
 }
 
 void MqttBroker::inject_downstream(const std::string& dev_id,
