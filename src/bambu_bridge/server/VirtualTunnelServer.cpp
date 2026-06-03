@@ -5,14 +5,7 @@
 
 #include "nlohmann/json.hpp"
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
+#include "../platform/WinsockShim.hpp"
 
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -148,9 +141,9 @@ int open_listener(const std::string& ip, uint16_t port, int backlog) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #ifdef SO_REUSEPORT
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 #endif
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -158,20 +151,20 @@ int open_listener(const std::string& ip, uint16_t port, int backlog) {
     if (ip.empty() || ip == "0.0.0.0") {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     } else if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd); return -1;
+        bambu_close_socket(fd); return -1;
     }
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd); return -1;
+        bambu_close_socket(fd); return -1;
     }
     if (::listen(fd, backlog) < 0) {
-        ::close(fd); return -1;
+        bambu_close_socket(fd); return -1;
     }
     return fd;
 }
 
 uint16_t bound_port_of(int fd) {
     sockaddr_in addr{};
-    socklen_t   len = sizeof(addr);
+    bridge_socklen_t len = sizeof(addr);
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
         return 0;
     return ntohs(addr.sin_port);
@@ -184,8 +177,8 @@ bool ssl_read_exact(SSL* ssl, uint8_t* buf, size_t n) {
     int my_seq = ++call_seq;
     const int fd0 = SSL_get_fd(ssl);
     auto now_ms = []() {
-        timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts);
-        return (long long)(ts.tv_sec * 1000) + ts.tv_nsec / 1000000;
+        return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
     };
     long long t_enter = now_ms();
     while (got < n) {
@@ -195,7 +188,7 @@ bool ssl_read_exact(SSL* ssl, uint8_t* buf, size_t n) {
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
                 continue;
             const int fd = SSL_get_fd(ssl);
-            int avail = -1;
+            unsigned long avail = 0;
             unsigned long ssl_err_q = ERR_peek_error();
             char ssl_err_buf[256] = {0};
             if (ssl_err_q) ERR_error_string_n(ssl_err_q, ssl_err_buf, sizeof(ssl_err_buf));
@@ -203,9 +196,11 @@ bool ssl_read_exact(SSL* ssl, uint8_t* buf, size_t n) {
             ssize_t peek_n = -1;
             int peek_errno = 0;
             if (fd >= 0) {
-                ::ioctl(fd, FIONREAD, &avail);
-                peek_n = ::recv(fd, peek, sizeof(peek), MSG_DONTWAIT|MSG_PEEK);
-                peek_errno = errno;
+                bambu_bytes_available(fd, &avail);
+                bambu_set_nonblocking(fd, true);
+                peek_n = ::recv(fd, reinterpret_cast<char*>(peek), sizeof(peek), MSG_PEEK);
+                bambu_set_nonblocking(fd, false);
+                peek_errno = bambu_last_socket_error();
             }
             return false;
         }
@@ -375,20 +370,20 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
                                  const std::string& slicer_cli_ver) {
     const std::string& dev_id = spec.dev_id;
     SSL* slicer_ssl = SSL_new(server_ctx);
-    if (!slicer_ssl) { ::close(client_fd); return; }
+    if (!slicer_ssl) { bambu_close_socket(client_fd); return; }
     SSL_set_fd(slicer_ssl, client_fd);
     const int acc_rc = SSL_accept(slicer_ssl);
     if (acc_rc != 1) {
         log_ssl_err("SSL_accept");
         SSL_free(slicer_ssl);
-        ::close(client_fd);
+        bambu_close_socket(client_fd);
         return;
     }
     {
-        int avail_after_accept = -1;
-        ::ioctl(client_fd, FIONREAD, &avail_after_accept);
-        int sock_err = 0; socklen_t se_len = sizeof(sock_err);
-        ::getsockopt(client_fd, SOL_SOCKET, SO_ERROR, &sock_err, &se_len);
+        unsigned long avail_after_accept = 0;
+        bambu_bytes_available(client_fd, &avail_after_accept);
+        int sock_err = 0; int se_len = sizeof(sock_err);
+        bambu_getsockopt(client_fd, SOL_SOCKET, SO_ERROR, &sock_err, &se_len);
     }
 
     // Shared write-side state. The backend's reply callback can fire on
@@ -537,7 +532,7 @@ static void session_loop_backend(SSL_CTX* server_ctx, int client_fd,
         SSL_free(slicer_ssl);
     }
     ::shutdown(client_fd, SHUT_RDWR);
-    ::close(client_fd);
+    bambu_close_socket(client_fd);
 }
 
 // Dispatch: hand each accepted vtun session to the
@@ -551,7 +546,7 @@ static void session_loop(SSL_CTX* server_ctx, int client_fd,
                          const std::string& slicer_cli_id,
                          const std::string& slicer_cli_ver) {
     if (!delegate) {
-        ::close(client_fd);
+        bambu_close_socket(client_fd);
         return;
     }
     session_loop_backend(server_ctx, client_fd, spec, delegate,
@@ -562,7 +557,7 @@ static void accept_loop(VirtualTunnelServer::Device* d, int io_timeout_s) {
     (void) io_timeout_s; // not used in Phase 1; sessions are stream-driven
     while (d->accepting.load()) {
         sockaddr_in caddr{};
-        socklen_t   clen = sizeof(caddr);
+        bridge_socklen_t clen = sizeof(caddr);
         // Use select so we can wake on shutdown.
         fd_set rfds; FD_ZERO(&rfds); FD_SET(d->listen_fd, &rfds);
         timeval tv{1, 0}; // 1s tick
@@ -571,7 +566,7 @@ static void accept_loop(VirtualTunnelServer::Device* d, int io_timeout_s) {
         int cfd = ::accept(d->listen_fd,
                            reinterpret_cast<sockaddr*>(&caddr), &clen);
         if (cfd < 0) {
-            if (errno == EINTR) continue;
+            if (bambu_last_socket_error() == EINTR) continue;
             break;
         }
         SSL_CTX*                                  ctx    = d->ssl_ctx;
@@ -609,7 +604,7 @@ void VirtualTunnelServer::stop_device(Device& d) {
     d.accepting.store(false);
     if (d.listen_fd >= 0) {
         ::shutdown(d.listen_fd, SHUT_RDWR);
-        ::close(d.listen_fd);
+        bambu_close_socket(d.listen_fd);
         d.listen_fd = -1;
     }
     if (d.accept_thread.joinable())

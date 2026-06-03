@@ -4,20 +4,16 @@
 // TLS settings mirror LocalControlTunnel (TLS 1.2 only, no cert verify,
 // AES256-GCM-SHA384, empty SNI — printer rejects connections with SNI set).
 
+#include "../platform/WinsockShim.hpp"
+
 #include "JpegCameraSource.hpp"
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
+#ifndef _WIN32
 #include <poll.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -74,14 +70,29 @@ bool contains_substr(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
 }
 
-int wait_writable(int fd, int timeout_ms) {
-    pollfd p{fd, POLLOUT, 0};
+// Portable single-fd poll wrapper. POSIX uses ::poll/struct pollfd;
+// Winsock provides the byte-compatible WSAPoll/WSAPOLLFD with the same
+// POLLIN/POLLOUT semantics. Both take the same (fds, nfds, timeout_ms)
+// shape, so this is a behaviour-preserving alias.
+inline int bridge_poll_one(int fd, short events, int timeout_ms) {
+#ifdef _WIN32
+    WSAPOLLFD p{};
+    p.fd      = static_cast<SOCKET>(fd);
+    p.events  = events;
+    p.revents = 0;
+    return ::WSAPoll(&p, 1, timeout_ms);
+#else
+    pollfd p{fd, events, 0};
     return ::poll(&p, 1, timeout_ms);
+#endif
+}
+
+int wait_writable(int fd, int timeout_ms) {
+    return bridge_poll_one(fd, POLLOUT, timeout_ms);
 }
 
 int wait_readable(int fd, int timeout_ms) {
-    pollfd p{fd, POLLIN, 0};
-    return ::poll(&p, 1, timeout_ms);
+    return bridge_poll_one(fd, POLLIN, timeout_ms);
 }
 
 // Connect TCP non-blocking, return fd or -1. Same shape as
@@ -99,23 +110,31 @@ int tcp_connect(const std::string& host, int port, int timeout_ms) {
 
     int fd = -1;
     for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-        fd = ::socket(ai->ai_family, ai->ai_socktype | SOCK_NONBLOCK, ai->ai_protocol);
+        // SOCK_NONBLOCK is a Linux socket()-flag extension with no Winsock
+        // equivalent; create the socket normally then flip it non-blocking
+        // via the shim (ioctlsocket FIONBIO on Windows, fcntl O_NONBLOCK on
+        // POSIX). Same end state.
+        fd = static_cast<int>(::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol));
         if (fd < 0) continue;
+        bambu_set_nonblocking(fd, true);
         int yes = 1;
-        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-        int rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
+        bambu_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+        int rc = ::connect(fd, ai->ai_addr, static_cast<bridge_socklen_t>(ai->ai_addrlen));
         if (rc == 0) break;
-        if (errno == EINPROGRESS) {
+        // A non-blocking connect in progress is EINPROGRESS on POSIX and
+        // WSAEWOULDBLOCK on Winsock; accept either.
+        const int conn_err = bambu_last_socket_error();
+        if (conn_err == EINPROGRESS || conn_err == EWOULDBLOCK) {
             int pr = wait_writable(fd, timeout_ms);
             if (pr > 0) {
                 int err = 0;
-                socklen_t errlen = sizeof(err);
-                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0 && err == 0) {
+                int errlen = sizeof(err);
+                if (bambu_getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0 && err == 0) {
                     break;
                 }
             }
         }
-        ::close(fd);
+        bambu_close_socket(fd);
         fd = -1;
     }
     ::freeaddrinfo(res);
@@ -313,7 +332,7 @@ bool JpegCameraSource::open() {
         std::fprintf(stderr,
             "[jpeg-camera] dev=%s open FAIL: tcp_connect %s:%u errno=%d\n",
             m_cfg.dev_id.c_str(), m_cfg.printer_ip.c_str(),
-            static_cast<unsigned>(m_cfg.printer_port), errno);
+            static_cast<unsigned>(m_cfg.printer_port), bambu_last_socket_error());
         std::fflush(stderr);
         return false;
     }

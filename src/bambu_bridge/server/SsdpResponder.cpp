@@ -15,14 +15,10 @@
 #include <string>
 #include <thread>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "../platform/WinsockShim.hpp"
+#ifndef _WIN32
+#  include <net/if.h>
+#endif
 
 namespace Slic3r {
 namespace bridge {
@@ -132,7 +128,7 @@ bool st_matches(const std::string& payload) {
 
 void close_fd(int& fd) {
     if (fd >= 0) {
-        ::close(fd);
+        bambu_close_socket(fd);
         fd = -1;
     }
 }
@@ -146,13 +142,13 @@ int open_udp_bound(const std::string& bind_addr, uint16_t port,
     if (fd < 0) return -1;
 
     int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #ifdef SO_REUSEPORT
     // Allow other SSDP listeners (e.g. avahi, BambuStudio itself) to coexist.
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 #endif
     if (allow_broadcast) {
-        ::setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+        bambu_setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
     }
 
     sockaddr_in addr{};
@@ -161,12 +157,12 @@ int open_udp_bound(const std::string& bind_addr, uint16_t port,
     if (bind_addr.empty() || bind_addr == "0.0.0.0") {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     } else if (::inet_pton(AF_INET, bind_addr.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
+        bambu_close_socket(fd);
         return -1;
     }
 
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
+        bambu_close_socket(fd);
         return -1;
     }
 
@@ -176,11 +172,11 @@ int open_udp_bound(const std::string& bind_addr, uint16_t port,
         mreq.imr_interface.s_addr = htonl(INADDR_ANY);
         // Non-fatal if it fails (lo-only test environments etc.) — recorded
         // through the caller's error path.
-        ::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+        bambu_setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
         // TTL=4 is what most upnp implementations use for SSDP; setting
         // it gives us reach across one router hop without flooding.
         unsigned char ttl = 4;
-        ::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+        bambu_setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
         // Disable loopback only for non-test code paths; we want loopback
         // *on* so the integration test can hear its own announces on lo.
     }
@@ -192,7 +188,7 @@ int open_udp_send_broadcast() {
     int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
     int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
     return fd;
 }
 
@@ -268,9 +264,9 @@ void SsdpResponder::start() {
     m_multicast_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (m_multicast_fd >= 0) {
         unsigned char ttl = 4;
-        ::setsockopt(m_multicast_fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+        bambu_setsockopt(m_multicast_fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
         unsigned char loop = 1;  // hear-yourself for loopback tests
-        ::setsockopt(m_multicast_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+        bambu_setsockopt(m_multicast_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
     }
 
     if (m_cfg.enable_bambu_broadcast) {
@@ -319,7 +315,7 @@ void SsdpResponder::recv_loop() {
         tv.tv_usec = 250 * 1000;        // 250 ms — bounded shutdown latency
         int rc = ::select(m_recv_fd_1900 + 1, &rfds, nullptr, nullptr, &tv);
         if (rc < 0) {
-            if (errno == EINTR) continue;
+            if (bambu_last_socket_error() == EINTR) continue;
             break;
         }
         if (rc == 0) continue;

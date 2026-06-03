@@ -26,9 +26,8 @@
 #ifndef SLIC3R_BAMBU_BRIDGE_HEADLESS_SIGNAL_HANDLER_HPP
 #define SLIC3R_BAMBU_BRIDGE_HEADLESS_SIGNAL_HANDLER_HPP
 
-#ifdef _WIN32
-#  error "phase 10 SignalHandler is Linux-only for now"
-#endif
+// Windows port: SignalHandler uses SetConsoleCtrlHandler instead of the
+// POSIX self-pipe + sigaction. See SignalHandler.cpp for the _WIN32 branch.
 
 #include <functional>
 

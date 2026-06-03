@@ -8,11 +8,7 @@
 #include <cstring>
 #include <sstream>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "../platform/WinsockShim.hpp"
 
 namespace Slic3r {
 namespace bridge {
@@ -45,11 +41,11 @@ int open_udp_listener(const std::string& bind_addr, uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
     int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #ifdef SO_REUSEPORT
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 #endif
-    ::setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -57,11 +53,11 @@ int open_udp_listener(const std::string& bind_addr, uint16_t port) {
     if (bind_addr.empty() || bind_addr == "0.0.0.0") {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     } else if (::inet_pton(AF_INET, bind_addr.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
+        bambu_close_socket(fd);
         return -1;
     }
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
+        bambu_close_socket(fd);
         return -1;
     }
     return fd;
@@ -87,7 +83,7 @@ bool SsdpListener::start() {
 
 void SsdpListener::stop() {
     if (!m_running.exchange(false)) return;
-    if (m_fd >= 0) { ::shutdown(m_fd, SHUT_RDWR); ::close(m_fd); m_fd = -1; }
+    if (m_fd >= 0) { ::shutdown(m_fd, SHUT_RDWR); bambu_close_socket(m_fd); m_fd = -1; }
     if (m_thread.joinable()) m_thread.join();
 }
 

@@ -35,9 +35,8 @@
 #ifndef SLIC3R_BAMBU_BRIDGE_SERVER_VIRTUAL_TUNNEL_SERVER_HPP
 #define SLIC3R_BAMBU_BRIDGE_SERVER_VIRTUAL_TUNNEL_SERVER_HPP
 
-#ifdef _WIN32
-#  error "VirtualTunnelServer is Linux-only for now"
-#endif
+// Windows port: socket types/calls route through platform/WinsockShim.hpp.
+#include "../platform/WinsockShim.hpp"
 
 #include <atomic>
 #include <cstdint>

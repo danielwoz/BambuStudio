@@ -64,15 +64,10 @@
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <signal.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "../platform/WinsockShim.hpp"
+#ifndef _WIN32
+#  include <signal.h>
+#endif
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -96,9 +91,11 @@ struct OpenSSLInit {
         // SIGPIPE on a broken TLS write would kill the process; ignore it.
         // MqttBroker relies on the same precondition (set up in LanUplink
         // earlier in the link order, but we re-arm here defensively).
+#ifndef _WIN32
         struct sigaction sa{};
         sa.sa_handler = SIG_IGN;
         ::sigaction(SIGPIPE, &sa, nullptr);
+#endif
     }
 };
 void ensure_openssl_init() {
@@ -168,7 +165,7 @@ int open_listener(const std::string& ip, uint16_t port, int backlog,
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -176,18 +173,18 @@ int open_listener(const std::string& ip, uint16_t port, int backlog,
     if (ip.empty() || ip == "0.0.0.0") {
         addr.sin_addr.s_addr = INADDR_ANY;
     } else if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
+        bambu_close_socket(fd);
         errno = EINVAL;
         return -1;
     }
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        const int saved = errno; ::close(fd); errno = saved; return -1;
+        const int saved = errno; bambu_close_socket(fd); errno = saved; return -1;
     }
     if (::listen(fd, backlog) < 0) {
-        const int saved = errno; ::close(fd); errno = saved; return -1;
+        const int saved = errno; bambu_close_socket(fd); errno = saved; return -1;
     }
     sockaddr_in actual{};
-    socklen_t len = sizeof(actual);
+    bridge_socklen_t len = sizeof(actual);
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&actual), &len) == 0) {
         bound_port_out = ntohs(actual.sin_port);
     } else {
@@ -475,17 +472,17 @@ void FtpsServer::start_device(Device& d) {
             int rc = ::select(d.listen_fd + 1, &rfds, nullptr, nullptr, &tv);
             if (rc <= 0) continue;
 
-            sockaddr_in peer{}; socklen_t plen = sizeof(peer);
+            sockaddr_in peer{}; bridge_socklen_t plen = sizeof(peer);
             int cfd = ::accept(d.listen_fd,
                                reinterpret_cast<sockaddr*>(&peer), &plen);
             if (cfd < 0) continue;
 
             int one = 1;
-            ::setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-            ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            bambu_setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+            bambu_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             if (cfg.io_timeout_seconds > 0) {
                 timeval rt{}; rt.tv_sec = cfg.io_timeout_seconds;
-                ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof(rt));
+                bambu_set_recv_timeout_ms(cfd, static_cast<unsigned>(rt.tv_sec * 1000 + rt.tv_usec / 1000));
             }
 
             // Reap any finished sessions.
@@ -502,7 +499,7 @@ void FtpsServer::start_device(Device& d) {
             }
 
             SSL* ssl = SSL_new(d.ssl_ctx);
-            if (!ssl) { ::close(cfd); continue; }
+            if (!ssl) { bambu_close_socket(cfd); continue; }
             SSL_set_fd(ssl, cfd);
 
             auto sess = std::make_unique<FtpsServer::Device::Session>();
@@ -523,7 +520,7 @@ void FtpsServer::start_device(Device& d) {
 void FtpsServer::stop_device(Device& d) {
     d.stopped.store(true);
     if (d.accept_thread.joinable()) d.accept_thread.join();
-    if (d.listen_fd >= 0) { ::close(d.listen_fd); d.listen_fd = -1; }
+    if (d.listen_fd >= 0) { bambu_close_socket(d.listen_fd); d.listen_fd = -1; }
 
     std::vector<std::unique_ptr<Device::Session>> drained;
     {
@@ -536,7 +533,7 @@ void FtpsServer::stop_device(Device& d) {
         if (s->fd >= 0) ::shutdown(s->fd, SHUT_RDWR);
         if (s->io_thread.joinable()) s->io_thread.join();
         if (s->ssl) { SSL_free(s->ssl); s->ssl = nullptr; }
-        if (s->fd >= 0) { ::close(s->fd); s->fd = -1; }
+        if (s->fd >= 0) { bambu_close_socket(s->fd); s->fd = -1; }
     }
 }
 
@@ -551,7 +548,7 @@ struct DataChannel {
     int  fd  = -1;
     void close() {
         if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); ssl = nullptr; }
-        if (fd >= 0) { ::close(fd); fd = -1; }
+        if (fd >= 0) { bambu_close_socket(fd); fd = -1; }
     }
 };
 
@@ -588,17 +585,17 @@ struct PasvState {
                 timeval tv{}; tv.tv_sec = 0; tv.tv_usec = 200 * 1000;
                 int rc = ::select(lfd + 1, &rfds, nullptr, nullptr, &tv);
                 if (rc <= 0) continue;
-                sockaddr_in peer{}; socklen_t plen = sizeof(peer);
+                sockaddr_in peer{}; bridge_socklen_t plen = sizeof(peer);
                 int cfd = ::accept(lfd,
                                    reinterpret_cast<sockaddr*>(&peer), &plen);
                 if (cfd < 0) continue;
                 SSL* ssl = SSL_new(ctx);
-                if (!ssl) { ::close(cfd); break; }
+                if (!ssl) { bambu_close_socket(cfd); break; }
                 SSL_set_fd(ssl, cfd);
                 if (SSL_accept(ssl) != 1) {
                     log_ssl_err("SSL_accept(data)");
                     SSL_free(ssl);
-                    ::close(cfd);
+                    bambu_close_socket(cfd);
                     break;
                 }
                 d.ssl = ssl;
@@ -627,7 +624,7 @@ struct PasvState {
         if (thr.joinable()) thr.join();
         // dc may still hold a live SSL+fd if take_channel wasn't called.
         dc.close();
-        if (listen_fd >= 0) { ::close(listen_fd); listen_fd = -1; port = 0; }
+        if (listen_fd >= 0) { bambu_close_socket(listen_fd); listen_fd = -1; port = 0; }
         ctx  = nullptr;
         done = false;
         stop_req.store(false);

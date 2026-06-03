@@ -66,15 +66,10 @@
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <signal.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "../platform/WinsockShim.hpp"
+#ifndef _WIN32
+#  include <signal.h>
+#endif
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -95,9 +90,11 @@ struct OpenSSLInit {
     OpenSSLInit() {
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
+#ifndef _WIN32
         struct sigaction sa{};
         sa.sa_handler = SIG_IGN;
         ::sigaction(SIGPIPE, &sa, nullptr);
+#endif
     }
 };
 void ensure_openssl_init() {
@@ -171,7 +168,7 @@ int open_listener(const std::string& ip, uint16_t port, int backlog,
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -179,18 +176,18 @@ int open_listener(const std::string& ip, uint16_t port, int backlog,
     if (ip.empty() || ip == "0.0.0.0") {
         addr.sin_addr.s_addr = INADDR_ANY;
     } else if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
+        bambu_close_socket(fd);
         errno = EINVAL;
         return -1;
     }
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        const int saved = errno; ::close(fd); errno = saved; return -1;
+        const int saved = errno; bambu_close_socket(fd); errno = saved; return -1;
     }
     if (::listen(fd, backlog) < 0) {
-        const int saved = errno; ::close(fd); errno = saved; return -1;
+        const int saved = errno; bambu_close_socket(fd); errno = saved; return -1;
     }
     sockaddr_in actual{};
-    socklen_t len = sizeof(actual);
+    bridge_socklen_t len = sizeof(actual);
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&actual), &len) == 0) {
         bound_port_out = ntohs(actual.sin_port);
     } else {
@@ -210,7 +207,8 @@ bool ssl_write_all(SSL* ssl, int fd, const void* data, size_t n) {
         if (ssl) {
             w = SSL_write(ssl, p + off, static_cast<int>(n - off));
         } else {
-            ssize_t s = ::send(fd, p + off, n - off, MSG_NOSIGNAL);
+            ssize_t s = ::send(fd, reinterpret_cast<const char*>(p + off),
+                               static_cast<int>(n - off), MSG_NOSIGNAL);
             w = static_cast<int>(s);
         }
         if (w <= 0) return false;
@@ -288,7 +286,7 @@ bool read_some(SSL* ssl, int fd, std::vector<uint8_t>& buf,
         if (ssl) {
             n = SSL_read(ssl, tmp, sizeof(tmp));
         } else {
-            ssize_t s = ::recv(fd, tmp, sizeof(tmp), 0);
+            ssize_t s = ::recv(fd, reinterpret_cast<char*>(tmp), sizeof(tmp), 0);
             n = static_cast<int>(s);
         }
         if (n > 0) {
@@ -298,8 +296,9 @@ bool read_some(SSL* ssl, int fd, std::vector<uint8_t>& buf,
         if (ssl) {
             int err = SSL_get_error(ssl, n);
             if (err == SSL_ERROR_WANT_READ) continue;
-        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            continue;
+        } else if (n < 0) {
+            const int e = bambu_last_socket_error();
+            if (e == EAGAIN || e == EWOULDBLOCK) continue;
         }
         return false;
     }
@@ -1311,17 +1310,17 @@ void RtspServer::start_device(Device& d) {
             int rc = ::select(d.listen_fd + 1, &rfds, nullptr, nullptr, &tv);
             if (rc <= 0) continue;
 
-            sockaddr_in peer{}; socklen_t plen = sizeof(peer);
+            sockaddr_in peer{}; bridge_socklen_t plen = sizeof(peer);
             int cfd = ::accept(d.listen_fd,
                                reinterpret_cast<sockaddr*>(&peer), &plen);
             if (cfd < 0) continue;
 
             int one = 1;
-            ::setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-            ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            bambu_setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+            bambu_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             if (cfg.io_timeout_seconds > 0) {
-                timeval rt{}; rt.tv_sec = cfg.io_timeout_seconds;
-                ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof(rt));
+                bambu_set_recv_timeout_ms(cfd,
+                    static_cast<unsigned>(cfg.io_timeout_seconds) * 1000u);
             }
             // 2026-06-02: BBS' wxMediaCtrl3 (libBambuSource RTSP client)
             // stops draining the TCP socket ~2s in when its decoder
@@ -1334,8 +1333,7 @@ void RtspServer::start_device(Device& d) {
             // with EAGAIN, ssl_write_all returns false, session_io_loop
             // returns, Cleanup flips stopped, and accept_thread reaps.
             {
-                timeval st{}; st.tv_sec  = 10;
-                ::setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &st, sizeof(st));
+                bambu_set_send_timeout_ms(cfd, 10u * 1000u);
             }
 
             // Reap finished sessions; enforce max_sessions_per_device.
@@ -1351,7 +1349,7 @@ void RtspServer::start_device(Device& d) {
                 }
                 if (cfg.max_sessions_per_device > 0 &&
                     static_cast<int>(d.sessions.size()) >= cfg.max_sessions_per_device) {
-                    ::close(cfd);
+                    bambu_close_socket(cfd);
                     continue;
                 }
             }
@@ -1359,7 +1357,7 @@ void RtspServer::start_device(Device& d) {
             SSL* ssl = nullptr;
             if (d.spec.tls) {
                 ssl = SSL_new(d.ssl_ctx);
-                if (!ssl) { ::close(cfd); continue; }
+                if (!ssl) { bambu_close_socket(cfd); continue; }
                 SSL_set_fd(ssl, cfd);
             }  // else: plain RTSP — io loop uses the raw fd directly
 
@@ -1381,7 +1379,7 @@ void RtspServer::start_device(Device& d) {
 void RtspServer::stop_device(Device& d) {
     d.stopped.store(true);
     if (d.accept_thread.joinable()) d.accept_thread.join();
-    if (d.listen_fd >= 0) { ::close(d.listen_fd); d.listen_fd = -1; }
+    if (d.listen_fd >= 0) { bambu_close_socket(d.listen_fd); d.listen_fd = -1; }
 
     std::vector<std::unique_ptr<Device::Session>> drained;
     {
@@ -1394,7 +1392,7 @@ void RtspServer::stop_device(Device& d) {
         if (s->fd >= 0) ::shutdown(s->fd, SHUT_RDWR);
         if (s->io_thread.joinable()) s->io_thread.join();
         if (s->ssl) { SSL_free(s->ssl); s->ssl = nullptr; }
-        if (s->fd >= 0) { ::close(s->fd); s->fd = -1; }
+        if (s->fd >= 0) { bambu_close_socket(s->fd); s->fd = -1; }
     }
     // Stop the fanout reader thread BEFORE closing the upstream — the
     // reader calls upstream->next_frame and we want it joined before

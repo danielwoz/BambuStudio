@@ -21,14 +21,7 @@
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "../platform/WinsockShim.hpp"
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -150,7 +143,7 @@ int open_listener(const std::string& ip, uint16_t port, int backlog,
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -158,25 +151,25 @@ int open_listener(const std::string& ip, uint16_t port, int backlog,
     if (ip.empty() || ip == "0.0.0.0") {
         addr.sin_addr.s_addr = INADDR_ANY;
     } else if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
+        bambu_close_socket(fd);
         errno = EINVAL;
         return -1;
     }
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         const int saved = errno;
-        ::close(fd);
+        bambu_close_socket(fd);
         errno = saved;
         return -1;
     }
     if (::listen(fd, backlog) < 0) {
         const int saved = errno;
-        ::close(fd);
+        bambu_close_socket(fd);
         errno = saved;
         return -1;
     }
     // Recover the actually-bound port (matters when port==0).
     sockaddr_in actual{};
-    socklen_t len = sizeof(actual);
+    bridge_socklen_t len = sizeof(actual);
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&actual), &len) == 0) {
         bound_port_out = ntohs(actual.sin_port);
     } else {
@@ -343,7 +336,11 @@ void serve_http_descriptor(int fd, const MqttBrokerVirtualDevice& spec) {
         char drain[2048];
         // Best-effort, single recv. If the slicer pipelined later
         // requests we just close after the first one.
-        (void) ::recv(fd, drain, sizeof(drain), MSG_DONTWAIT);
+        // MSG_DONTWAIT doesn't exist on Winsock; bracket with the
+        // non-blocking toggle to preserve the don't-block semantics.
+        bambu_set_nonblocking(fd, true);
+        (void) ::recv(fd, reinterpret_cast<char*>(drain), sizeof(drain), 0);
+        bambu_set_nonblocking(fd, false);
     }
 
     const std::string sn   = spec.virtual_dev_id.empty()
@@ -372,7 +369,7 @@ void serve_http_descriptor(int fd, const MqttBrokerVirtualDevice& spec) {
          << "\r\n"
          << body;
     const std::string r = resp.str();
-    (void) ::send(fd, r.data(), r.size(), MSG_NOSIGNAL);
+    (void) ::send(fd, reinterpret_cast<const char*>(r.data()), r.size(), MSG_NOSIGNAL);
 }
 }
 
@@ -440,7 +437,7 @@ void MqttBroker::start_device(Device& d) {
             if (rc <= 0) continue;
 
             sockaddr_in peer{};
-            socklen_t peer_len = sizeof(peer);
+            bridge_socklen_t peer_len = sizeof(peer);
             int cfd = ::accept(d.listen_fd,
                                reinterpret_cast<sockaddr*>(&peer), &peer_len);
             if (cfd < 0) continue;
@@ -454,12 +451,12 @@ void MqttBroker::start_device(Device& d) {
             // TCP connection.
             unsigned char first = 0;
             {
-                int peeked = ::recv(cfd, &first, 1, MSG_PEEK);
-                if (peeked <= 0) { ::close(cfd); continue; }
+                int peeked = ::recv(cfd, reinterpret_cast<char*>(&first), 1, MSG_PEEK);
+                if (peeked <= 0) { bambu_close_socket(cfd); continue; }
             }
             if (first != 0x16) {
                 serve_http_descriptor(cfd, d.spec);
-                ::close(cfd);
+                bambu_close_socket(cfd);
                 continue;
             }
 
@@ -476,7 +473,7 @@ void MqttBroker::start_device(Device& d) {
                     }
                 }
                 if (static_cast<int>(d.sessions.size()) >= max_clients) {
-                    ::close(cfd);
+                    bambu_close_socket(cfd);
                     continue;
                 }
             }
@@ -484,18 +481,19 @@ void MqttBroker::start_device(Device& d) {
             // Socket-level options: keep-alive + receive timeout so a dead
             // peer eventually gets reaped.
             int one = 1;
-            ::setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-            ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            bambu_setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+            bambu_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             if (io_timeout > 0) {
-                timeval rt{};
-                rt.tv_sec = io_timeout;
-                ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof(rt));
+                // SO_RCVTIMEO timeval { tv_sec = io_timeout, tv_usec = 0 }
+                // => io_timeout * 1000 ms.
+                bambu_set_recv_timeout_ms(cfd,
+                    static_cast<unsigned>(io_timeout) * 1000u);
             }
 
             // Build SSL object on this device's CTX.
             SSL* ssl = SSL_new(d.ssl_ctx);
             if (!ssl) {
-                ::close(cfd);
+                bambu_close_socket(cfd);
                 continue;
             }
             SSL_set_fd(ssl, cfd);
@@ -520,7 +518,7 @@ void MqttBroker::stop_device(Device& d) {
     d.stopped.store(true);
     if (d.accept_thread.joinable()) d.accept_thread.join();
     if (d.listen_fd >= 0) {
-        ::close(d.listen_fd);
+        bambu_close_socket(d.listen_fd);
         d.listen_fd = -1;
     }
     // Tear down active sessions.
@@ -536,7 +534,7 @@ void MqttBroker::stop_device(Device& d) {
         if (s->fd >= 0) ::shutdown(s->fd, SHUT_RDWR);
         if (s->io_thread.joinable()) s->io_thread.join();
         if (s->ssl) { SSL_free(s->ssl); s->ssl = nullptr; }
-        if (s->fd >= 0) { ::close(s->fd); s->fd = -1; }
+        if (s->fd >= 0) { bambu_close_socket(s->fd); s->fd = -1; }
     }
 }
 

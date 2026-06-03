@@ -50,9 +50,8 @@
 #ifndef SLIC3R_BAMBU_BRIDGE_SERVER_SSDP_RESPONDER_HPP
 #define SLIC3R_BAMBU_BRIDGE_SERVER_SSDP_RESPONDER_HPP
 
-#ifdef _WIN32
-#  error "phase 3 SsdpResponder is Linux-only for now"
-#endif
+// Windows port: socket types/calls route through platform/WinsockShim.hpp.
+#include "../platform/WinsockShim.hpp"
 
 #include <atomic>
 #include <chrono>

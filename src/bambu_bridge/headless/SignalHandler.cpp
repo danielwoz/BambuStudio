@@ -1,25 +1,42 @@
 // Bambu Bridge — SignalHandler implementation.
 //
-// Self-pipe trick: the signal handler only writes one byte to a pipe
-// (async-signal-safe), and a worker thread blocks on read() to dispatch
+// POSIX: self-pipe trick. The signal handler only writes one byte to a
+// pipe (async-signal-safe); a worker thread blocks on read() to dispatch
 // the user callback in normal context. The previous design called the
-// callback directly from the signal handler, which is undefined
-// behaviour for any callback that takes a `std::mutex` lock or notifies
-// a `std::condition_variable` (both of which BridgeApp::shutdown does).
-// In practice that manifested as a SIGSEGV / core dump on every Ctrl-C.
+// callback directly from the signal handler, which is undefined behaviour
+// for any callback that takes a std::mutex lock or notifies a
+// std::condition_variable (both of which BridgeApp::shutdown does).
+//
+// Windows: SetConsoleCtrlHandler. The console control handler already runs
+// on a dedicated OS thread (not an async-signal context), so it is safe to
+// signal a condition_variable directly; a worker thread dispatches the
+// callback to keep the handler return-path fast.
 
 #include "SignalHandler.hpp"
 
 #include <atomic>
-#include <cerrno>
-#include <csignal>
 #include <cstdio>
 #include <stdexcept>
 #include <thread>
 
-#include <fcntl.h>
-#include <signal.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <condition_variable>
+#  include <mutex>
+#else
+#  include <cerrno>
+#  include <csignal>
+#  include <functional>
+#  include <fcntl.h>
+#  include <signal.h>
+#  include <unistd.h>
+#endif
 
 namespace Slic3r {
 namespace bridge {
@@ -27,9 +44,54 @@ namespace headless {
 
 namespace {
 
-// Process-global state. Set by ctor, cleared by dtor. The signal
-// handler reads `g_write_fd` atomically and writes one byte; that's
-// the only signal-context operation it does.
+#ifdef _WIN32
+
+std::function<void()> g_cb;
+std::thread           g_worker;
+std::mutex            g_mtx;
+std::condition_variable g_cv;
+bool                  g_signalled = false;
+std::atomic<bool>     g_running{false};
+bool                  g_installed = false;
+
+BOOL WINAPI on_ctrl(DWORD type) {
+    switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT: {
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_signalled = true;
+        }
+        g_cv.notify_all();
+        return TRUE;  // handled — suppress default termination
+    }
+    default:
+        return FALSE;
+    }
+}
+
+void worker_loop() {
+    while (g_running.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> lk(g_mtx);
+        g_cv.wait(lk, [] { return g_signalled || !g_running.load(std::memory_order_acquire); });
+        if (!g_running.load(std::memory_order_acquire)) return;
+        g_signalled = false;
+        auto cb = g_cb;
+        lk.unlock();
+        if (cb) {
+            try { cb(); } catch (const std::exception&) {}
+        }
+    }
+}
+
+#else  // POSIX
+
+// Process-global state. Set by ctor, cleared by dtor. The signal handler
+// reads g_write_fd atomically and writes one byte; that's the only
+// signal-context operation it does.
 std::atomic<int>  g_write_fd{-1};
 int               g_read_fd  = -1;
 std::thread       g_worker;
@@ -44,9 +106,8 @@ extern "C" void on_signal(int /*signo*/) {
     if (fd < 0) return;
     const char b = 1;
     // write() is async-signal-safe per POSIX.1-2017 §2.4.3. EINTR/EAGAIN
-    // are both acceptable here — we'd rather drop a redundant
-    // notification than risk anything heavier in signal context. A
-    // single byte is enough to wake the worker thread's read().
+    // are both acceptable here — we'd rather drop a redundant notification
+    // than risk anything heavier in signal context.
     ssize_t r = ::write(fd, &b, 1);
     (void) r;
 }
@@ -56,7 +117,6 @@ void worker_loop(std::function<void()> cb) {
     while (g_running.load(std::memory_order_acquire)) {
         ssize_t n = ::read(g_read_fd, &buf, 1);
         if (n <= 0) {
-            // EINTR or pipe closed (shutdown path). Loop check handles it.
             if (n == 0) return;
             if (errno == EINTR) continue;
             return;
@@ -69,7 +129,43 @@ void worker_loop(std::function<void()> cb) {
     }
 }
 
+#endif
+
 } // namespace
+
+#ifdef _WIN32
+
+SignalHandler::SignalHandler(std::function<void()> cb) {
+    if (g_installed) {
+        throw std::runtime_error(
+            "SignalHandler: already installed (process-global)");
+    }
+    g_cb = std::move(cb);
+    g_signalled = false;
+    g_running.store(true, std::memory_order_release);
+    g_worker = std::thread(worker_loop);
+
+    if (!::SetConsoleCtrlHandler(on_ctrl, TRUE)) {
+        g_running.store(false, std::memory_order_release);
+        g_cv.notify_all();
+        if (g_worker.joinable()) g_worker.join();
+        g_cb = nullptr;
+        throw std::runtime_error("SignalHandler: SetConsoleCtrlHandler() failed");
+    }
+    g_installed = true;
+}
+
+SignalHandler::~SignalHandler() {
+    if (!g_installed) return;
+    ::SetConsoleCtrlHandler(on_ctrl, FALSE);
+    g_running.store(false, std::memory_order_release);
+    g_cv.notify_all();
+    if (g_worker.joinable()) g_worker.join();
+    g_cb = nullptr;
+    g_installed = false;
+}
+
+#else  // POSIX
 
 SignalHandler::SignalHandler(std::function<void()> cb) {
     if (g_installed) {
@@ -81,10 +177,6 @@ SignalHandler::SignalHandler(std::function<void()> cb) {
     if (::pipe(fds) != 0) {
         throw std::runtime_error("SignalHandler: pipe() failed");
     }
-    // Both ends non-blocking-safe: write side won't block in signal
-    // context (the pipe buffer is enough for many pending signals
-    // before back-pressure kicks in), and read side stays blocking so
-    // the worker thread is cheap when idle.
     int flags = ::fcntl(fds[1], F_GETFL, 0);
     ::fcntl(fds[1], F_SETFL, flags | O_NONBLOCK);
 
@@ -118,14 +210,14 @@ SignalHandler::~SignalHandler() {
     ::sigaction(SIGTERM, &g_prior_sigterm, nullptr);
 
     g_running.store(false, std::memory_order_release);
-    // Close the write end first so the worker's read() returns 0 (EOF)
-    // promptly. Then close the read end and join.
     const int wfd = g_write_fd.exchange(-1, std::memory_order_acq_rel);
     if (wfd >= 0) ::close(wfd);
     if (g_worker.joinable()) g_worker.join();
     if (g_read_fd >= 0) { ::close(g_read_fd); g_read_fd = -1; }
     g_installed = false;
 }
+
+#endif
 
 } // namespace headless
 } // namespace bridge
