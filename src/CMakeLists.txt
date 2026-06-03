@@ -87,6 +87,16 @@ if (SLIC3R_GUI)
         list(APPEND wxWidgets_LIBRARIES ${EXPAT_LIBRARIES})
     endif ()
 
+    # wxWidgets_LIBRARIES contains zlib.lib (the DLL import variant). Other
+    # deps (OpenCV / libpng / CGAL transitively) pull in zlibstatic.lib. On
+    # Windows both end up on BambuStudio.dll's link line and conflict with
+    # LNK1169/LNK2005. Filter zlib out the same way png/jpeg/tiff/expat are
+    # handled above. ZLIB_LIBRARIES from find_package(ZLIB) covers it.
+    if (ZLIB_FOUND)
+        list(FILTER wxWidgets_LIBRARIES EXCLUDE REGEX "zlib(\\.lib)?$")
+        list(APPEND wxWidgets_LIBRARIES ${ZLIB_LIBRARIES})
+    endif ()
+
     # This is an issue in the new wxWidgets cmake build, doesn't deal with librt
     find_library(LIBRT rt)
     if(LIBRT)
@@ -112,8 +122,24 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/msw/BambuStudio.manifest.in 
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/osx/Info.plist.in ${CMAKE_CURRENT_BINARY_DIR}/Info.plist @ONLY)
 if (WIN32)
     add_library(BambuStudio SHARED BambuStudio.cpp BambuStudio.hpp)
+    if (MSVC)
+        # MinGW runtime-symbol shims so MSVC can link the MinGW-built
+        # static archives (libiconv.a etc.) that reference GCC's
+        # stack-protector / fortify helpers. See the file header.
+        target_sources(BambuStudio PRIVATE mingw_compat_stubs.c)
+    endif ()
 else ()
     add_executable(BambuStudio BambuStudio.cpp BambuStudio.hpp)
+endif ()
+
+if (MSVC)
+    # This machine has a system-wide vcpkg integration (vcpkg integrate
+    # install) whose MSBuild targets auto-link EVERY *.lib in
+    # vcpkg\installed\x64-windows\lib onto every project. That drags in
+    # vcpkg's import libssl.lib/libcrypto.lib (-> libssl-3-x64.dll), which
+    # collides with the project's own static OpenSSL from deps\ (LNK2005
+    # "already defined"). Disable vcpkg's MSBuild injection for our targets.
+    set_target_properties(BambuStudio PROPERTIES VS_GLOBAL_VcpkgEnabled false)
 endif ()
 
 if (MINGW)
@@ -129,11 +155,14 @@ if (NOT WIN32 AND NOT APPLE)
 endif ()
 
 target_link_libraries(BambuStudio libslic3r cereal)
+# bambu_virtual_client is always linked (libslic3r_gui has unconditional
+# uses of Slic3r::VirtualLanPrinterStore in ReleaseNote.cpp / SelectMachinePop.cpp).
+target_link_libraries(BambuStudio bambu_virtual_client)
+
 if (BAMBU_BRIDGE)
     target_link_libraries(BambuStudio bambu_bridge)
     target_compile_definitions(BambuStudio PRIVATE BAMBU_BRIDGE)
     target_compile_definitions(libslic3r_gui PRIVATE BAMBU_BRIDGE)
-    target_link_libraries(BambuStudio bambu_virtual_client)
 
     # The bambu_virtual_cli standalone testbed now ships with the
     # bambu_virtual_client submodule (Utils/bambu_virtual_client/).
@@ -197,6 +226,23 @@ if (WIN32)
     add_dependencies(BambuStudio_app_gui BambuStudio)
     set_target_properties(BambuStudio_app_gui PROPERTIES OUTPUT_NAME "bambu-studio")
     target_link_libraries(BambuStudio_app_gui PRIVATE boost_headeronly)
+
+    # Console-subsystem launcher for the headless Bambu Bridge.
+    # Same wrapper source, but built WITHOUT SLIC3R_GUI (skips the OpenGL
+    # probe window — the bridge is headless) and WITHOUT
+    # SLIC3R_WRAPPER_NOCONSOLE, so it uses a plain console `wmain`. Its
+    # stdout/stderr are real console handles, so the PowerShell supervisor
+    # can RedirectStandardOutput the bridge's logs to a file (the GUI
+    # wrapper's AttachConsole/CONOUT$ output cannot be redirected).
+    add_executable(bambu-studio-bridge BambuStudio_app_msvc.cpp)
+    if(MSVC)
+        target_link_options(bambu-studio-bridge PUBLIC "$<$<CONFIG:RELEASE>:/DEBUG>")
+        set_target_properties(bambu-studio-bridge PROPERTIES VS_GLOBAL_VcpkgEnabled false)
+        set_target_properties(BambuStudio_app_gui PROPERTIES VS_GLOBAL_VcpkgEnabled false)
+    endif()
+    add_dependencies(bambu-studio-bridge BambuStudio)
+    set_target_properties(bambu-studio-bridge PROPERTIES OUTPUT_NAME "bambu-studio-bridge")
+    target_link_libraries(bambu-studio-bridge PRIVATE boost_headeronly)
 endif ()
 
 # Link the resources dir to where Slic3r GUI expects it
@@ -306,11 +352,14 @@ endif()
 message(STATUS "libslic3r-CMAKE_BUILD_TYPE: ${build_type}")
 message(STATUS "CMAKE_CURRENT_BINARY_DIR: ${CMAKE_CURRENT_BINARY_DIR}")
 if (WIN32)
-    install(TARGETS BambuStudio RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}")
+    # Relative DESTINATION so CPack's intermediate install (which sets
+    # CMAKE_ERROR_ON_ABSOLUTE_INSTALL_DESTINATION) doesn't fail. With a
+    # plain `cmake --install` these still resolve to CMAKE_INSTALL_PREFIX.
+    install(TARGETS BambuStudio RUNTIME DESTINATION ".")
     if (MSVC)
-        install(TARGETS BambuStudio_app_gui RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}")
+        install(TARGETS BambuStudio_app_gui RUNTIME DESTINATION ".")
     endif ()
-    install(FILES ${output_dlls_${build_type}} DESTINATION "${CMAKE_INSTALL_PREFIX}")
+    install(FILES ${output_dlls_${build_type}} DESTINATION ".")
 else ()
     if (APPLE)
     else()

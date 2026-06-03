@@ -56,6 +56,9 @@ else ()
 endif ()
 
 add_library(bambu_bridge STATIC
+    platform/WinsockShim.hpp
+    platform/PortablePaths.hpp
+    platform/BridgeLog.hpp
     BridgeService.cpp
     BridgeService.hpp
     BambuNetworkingPluginHandle.cpp
@@ -142,7 +145,23 @@ add_library(bambu_bridge STATIC
     headless/SignalHandler.hpp
 )
 
-target_link_libraries(bambu_bridge PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+if (BAMBU_BRIDGE_STANDALONE)
+    # Standalone: bambu_bridge + bridge_cli are the final link, so link
+    # OpenSSL directly.
+    target_link_libraries(bambu_bridge PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+else ()
+    # Inside the BambuStudio build, the parent target already links the
+    # slicer's OpenSSL into the final BambuStudio.dll. Propagating a second
+    # OpenSSL here (find_package may resolve a different static/shared
+    # flavour than the slicer uses) produces LNK2005 "already defined"
+    # collisions between libssl-lib-*.obj and libssl-3-x64.dll. So consume
+    # OpenSSL headers only; the parent's link resolves the symbols.
+    target_include_directories(bambu_bridge PRIVATE ${OPENSSL_INCLUDE_DIR})
+    # bridge_cli (a standalone exe defined below) still needs OpenSSL when
+    # built; link it there explicitly.
+endif ()
+# curl target (added on identical-to-gui for the camera/HTTP paths) — link
+# unconditionally as upstream does; revisit if the embedded build double-links.
 target_link_libraries(bambu_bridge PUBLIC ${BAMBU_BRIDGE_CURL_TARGET})
 
 target_include_directories(bambu_bridge
@@ -181,7 +200,14 @@ endif ()
 # building bambu_bridge standalone on Windows otherwise hits unresolved
 # winsock symbols.
 if (WIN32)
-    target_link_libraries(bambu_bridge PUBLIC ws2_32 crypt32)
+    # Winsock 2 (ws2_32), Windows cert store helpers (crypt32), and the
+    # IP-helper API (iphlpapi) for GetAdaptersAddresses in BridgeApp's
+    # LAN-IP detector (replaces getifaddrs).
+    target_link_libraries(bambu_bridge PUBLIC ws2_32 crypt32 iphlpapi)
+    # <winsock2.h> must precede <windows.h>; WinsockShim.hpp enforces this
+    # but define the guards project-wide so transitive <windows.h> includes
+    # don't pull in winsock1 (winsock.h) symbols and clash.
+    target_compile_definitions(bambu_bridge PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX)
 endif ()
 
 # ---- bridge_cli executable ----------------------------------------------
@@ -193,6 +219,11 @@ add_executable(bridge_cli
     cli/bridge_cli.cpp
 )
 target_link_libraries(bridge_cli PRIVATE bambu_bridge)
+if (NOT BAMBU_BRIDGE_STANDALONE)
+    # bambu_bridge no longer re-exports OpenSSL in the embedded build (see
+    # above); bridge_cli is its own exe so link OpenSSL directly here.
+    target_link_libraries(bridge_cli PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif ()
 set_target_properties(bridge_cli PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
@@ -203,7 +234,8 @@ if (BAMBU_BRIDGE_STANDALONE)
     # tests/bridge/ for us; do it here instead so a bare phase-0/1 configure
     # gives runnable tests.
     set(_bridge_tests_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/bridge")
-    if (EXISTS "${_bridge_tests_dir}/CMakeLists.txt")
+    if (EXISTS "${_bridge_tests_dir}/CMakeLists.txt" AND NOT WIN32)
+        # tests/bridge harness uses Linux-only shim-recorder machinery.
         add_subdirectory("${_bridge_tests_dir}" "${CMAKE_CURRENT_BINARY_DIR}/tests_bridge")
     endif ()
 endif ()

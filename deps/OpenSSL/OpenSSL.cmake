@@ -13,7 +13,9 @@ else()
 endif()
 
 if(WIN32)
-    set(_conf_cmd perl Configure )
+    # Force CC=cl so OpenSSL's generated makefile does not embed the full
+    # cl.exe path with spaces (which then breaks nmake invocation).
+    set(_conf_cmd ${CMAKE_COMMAND} -E env CC=cl perl Configure )
     set(_cross_comp_prefix_line "")
     set(_make_cmd nmake)
     set(_install_cmd nmake install_sw )

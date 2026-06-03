@@ -798,8 +798,15 @@ endif()
 # the build wiring doesn't bit-rot; the heavier SLIC3R_BUILD_TESTS suite stays
 # independent.
 if (BAMBU_BRIDGE)
+    # src/bambu_bridge/ now builds on Windows: POSIX socket calls route
+    # through src/bambu_bridge/platform/WinsockShim.hpp and the per-server
+    # #error guards have been removed. The bridge test harness
+    # (tests/bridge/) still uses Linux-only shim machinery, so it remains
+    # gated off on Windows.
     add_subdirectory(src/bambu_bridge)
-    add_subdirectory(tests/bridge)
+    if (NOT WIN32)
+        add_subdirectory(tests/bridge)
+    endif ()
 endif ()
 
 if (NOT WIN32 AND NOT APPLE)
@@ -815,7 +822,10 @@ endif()
 
 # Resources install target, configure fhs.hpp on UNIX
 if (WIN32)
-    install(DIRECTORY "${SLIC3R_RESOURCES_DIR}/" DESTINATION "${CMAKE_INSTALL_PREFIX}/resources")
+    # Note: relative DESTINATION (resolves to ${CMAKE_INSTALL_PREFIX}/resources
+    # for `cmake --install`) so that CPack's intermediate install step does
+    # not fail with "ABSOLUTE path INSTALL DESTINATION forbidden".
+    install(DIRECTORY "${SLIC3R_RESOURCES_DIR}/" DESTINATION "resources")
 elseif (SLIC3R_FHS)
     # CMAKE_INSTALL_FULL_DATAROOTDIR: read-only architecture-independent data root (share)
     set(SLIC3R_FHS_RESOURCES "${CMAKE_INSTALL_FULL_DATAROOTDIR}/BambuStudio")
@@ -850,3 +860,71 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT FLATPAK)
 endif ()
 
 configure_file(${LIBDIR}/platform/unix/fhs.hpp.in ${LIBDIR_BIN}/platform/unix/fhs.hpp)
+
+# ---- Windows installer (CPack/NSIS) ---------------------------------------
+# BambuStudio doesn't ship a CPack recipe upstream — official Windows
+# installers are produced by Bambu's internal CI. The block below mirrors
+# OrcaSlicer's CPack/NSIS config so that `cmake --build . --target package`
+# produces a single-file installer that bundles install_dir/ + the runtime
+# DLLs that aren't otherwise covered by install() rules.
+if (WIN32 AND MSVC)
+    # Runtime DLLs missing from the regular install rules.
+    # Sourced externally until the deps tree builds/ships them itself.
+    set(_BBS_VCPKG_BIN      "D:/vcpkg/installed/x64-windows/bin")
+    set(_BBS_STRAWBERRY_BIN "C:/Strawberry/c/bin")
+    foreach (_dll libcrypto-3-x64.dll libssl-3-x64.dll)
+        if (EXISTS "${_BBS_VCPKG_BIN}/${_dll}")
+            install(FILES "${_BBS_VCPKG_BIN}/${_dll}" DESTINATION ".")
+        endif ()
+    endforeach ()
+    # zlib1.dll: Strawberry's build exports the gz* API that OpenCV's
+    # persistence.obj relies on (vcpkg's zlib1.dll was built without it).
+    foreach (_dll zlib1.dll libiconv-2.dll libiconv-2__.dll)
+        if (EXISTS "${_BBS_STRAWBERRY_BIN}/${_dll}")
+            install(FILES "${_BBS_STRAWBERRY_BIN}/${_dll}" DESTINATION ".")
+        endif ()
+    endforeach ()
+    install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION "." OPTIONAL)
+
+    # Parse SLIC3R_VERSION (from version.inc) into NSIS-friendly components.
+    string(REPLACE "." ";" _bbs_ver_parts "${SLIC3R_VERSION}")
+    list(LENGTH _bbs_ver_parts _bbs_ver_n)
+    if (_bbs_ver_n GREATER_EQUAL 3)
+        list(GET _bbs_ver_parts 0 _bbs_ver_major)
+        list(GET _bbs_ver_parts 1 _bbs_ver_minor)
+        list(GET _bbs_ver_parts 2 _bbs_ver_patch)
+    else ()
+        set(_bbs_ver_major 0)
+        set(_bbs_ver_minor 0)
+        set(_bbs_ver_patch 0)
+    endif ()
+
+    set(CPACK_PACKAGE_NAME              "BambuStudio")
+    set(CPACK_PACKAGE_VENDOR            "Bambu Lab (bridge fork)")
+    set(CPACK_PACKAGE_VERSION_MAJOR     "${_bbs_ver_major}")
+    set(CPACK_PACKAGE_VERSION_MINOR     "${_bbs_ver_minor}")
+    set(CPACK_PACKAGE_VERSION_PATCH     "${_bbs_ver_patch}")
+    set(CPACK_PACKAGE_FILE_NAME         "BambuStudio-bridge_Windows_Installer_V${SLIC3R_VERSION}")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+        "BambuStudio bridge fork — FFFF virtual printer support")
+    set(CPACK_PACKAGE_HOMEPAGE_URL      "https://github.com/danielwoz/BambuStudio")
+    set(CPACK_PACKAGE_INSTALL_DIRECTORY "${CPACK_PACKAGE_NAME}")
+    set(CPACK_PACKAGE_ICON              "${CMAKE_SOURCE_DIR}/resources/images\\\\BambuStudio.ico")
+    set(CPACK_NSIS_MUI_ICON             "${CPACK_PACKAGE_ICON}")
+    set(CPACK_NSIS_MUI_UNIICON          "${CPACK_PACKAGE_ICON}")
+    set(CPACK_NSIS_INSTALLED_ICON_NAME  "$INSTDIR\\\\bambu-studio.exe")
+    set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "
+        CreateShortCut \\\"$DESKTOP\\\\BambuStudio.lnk\\\" \\\"$INSTDIR\\\\bambu-studio.exe\\\"
+    ")
+    set(CPACK_PACKAGE_CHECKSUM           SHA256)
+    set(CPACK_PACKAGE_INSTALL_REGISTRY_KEY "BambuStudio-bridge")
+    set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+    set(CPACK_NSIS_EXECUTABLES_DIRECTORY ".")
+    set(CPACK_PACKAGE_EXECUTABLES        "bambu-studio;BambuStudio")
+    set(CPACK_CREATE_DESKTOP_LINKS       "bambu-studio")
+    if (EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
+        set(CPACK_RESOURCE_FILE_LICENSE  "${CMAKE_SOURCE_DIR}/LICENSE")
+    endif ()
+    set(CPACK_GENERATOR NSIS)
+    include(CPack)
+endif ()
