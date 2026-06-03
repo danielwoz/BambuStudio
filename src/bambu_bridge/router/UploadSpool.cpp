@@ -2,14 +2,21 @@
 
 #include "UploadSpool.hpp"
 
+#include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
+#ifndef _WIN32
+#  include <sys/stat.h>   // ::chmod for 0600 hardening on POSIX
+#endif
 
 namespace Slic3r {
 namespace bridge {
@@ -46,61 +53,67 @@ static std::string safe_basename(const std::string& name) {
 }
 
 std::string spool_upload_to_tempfile(const server::UploadJob& job) {
-    const char* tmpdir_env = std::getenv("TMPDIR");
-    std::string parent = (tmpdir_env && *tmpdir_env ? tmpdir_env : "/tmp");
+    namespace fs = std::filesystem;
 
-    // Per-job tempdir so we can preserve the slicer's original filename
+    // temp_directory_path() honours TMPDIR on POSIX and TMP/TEMP/USERPROFILE
+    // on Windows — the cross-platform replacement for the old getenv("TMPDIR")
+    // / "/tmp" fallback.
+    std::error_code ec;
+    fs::path parent = fs::temp_directory_path(ec);
+    if (ec) return {};
+
+    // Per-job subdir so we can preserve the slicer's original filename
     // verbatim — that's what the GUI's SendJob would pass to the plugin
-    // (e.g. "MyProject_plate_3.3mf"). Plugin uses the filename in
-    // task-record / printer-side UI, so propagating it matters for
-    // parity. mkdtemp gives us "bridge-upload-XXXXXX/".
-    std::string dir_tmpl = parent + "/bridge-upload-XXXXXX";
-    std::vector<char> dbuf(dir_tmpl.begin(), dir_tmpl.end());
-    dbuf.push_back('\0');
-    if (::mkdtemp(dbuf.data()) == nullptr) return {};
-    std::string dir(dbuf.data());
+    // (e.g. "MyProject_plate_3.3mf"); the plugin uses it in the task record
+    // / printer-side UI, so propagating it matters for parity. This is the
+    // portable replacement for mkdtemp(): a process-unique directory name.
+    static std::atomic<std::uint64_t> s_counter{0};
+    const auto ns  = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    const std::uint64_t uniq = s_counter.fetch_add(1, std::memory_order_relaxed);
 
-    std::string final_path = dir + "/" + safe_basename(job.filename);
-    int fd = ::open(final_path.c_str(),
-                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0) {
-        ::rmdir(dir.c_str());
-        return {};
+    fs::path dir = parent / ("bridge-upload-"
+                       + std::to_string(static_cast<std::uint64_t>(ns))
+                       + "-" + std::to_string(static_cast<std::uint64_t>(tid))
+                       + "-" + std::to_string(uniq));
+    fs::create_directories(dir, ec);
+    if (ec) return {};
+
+    fs::path final_path = dir / safe_basename(job.filename);
+    {
+        std::ofstream out(final_path, std::ios::binary | std::ios::trunc);
+        if (!out) { fs::remove_all(dir, ec); return {}; }
+        if (!job.content.empty())
+            out.write(reinterpret_cast<const char*>(job.content.data()),
+                      static_cast<std::streamsize>(job.content.size()));
+        if (!out) { out.close(); fs::remove_all(dir, ec); return {}; }
     }
 
-    const auto* src = job.content.data();
-    std::size_t remaining = job.content.size();
-    while (remaining > 0) {
-        ssize_t w = ::write(fd, src, remaining);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            ::close(fd);
-            ::unlink(final_path.c_str());
-            ::rmdir(dir.c_str());
-            return {};
-        }
-        src       += w;
-        remaining -= static_cast<std::size_t>(w);
-    }
-    ::close(fd);
-    return final_path;
+#ifndef _WIN32
+    // Best-effort owner-only hardening on POSIX. On Windows the per-user
+    // %TEMP% directory is already ACL-restricted to the current user.
+    ::chmod(final_path.string().c_str(), 0600);
+#endif
+
+    return final_path.string();
 }
 
 void cleanup_upload_tempfile(const std::string& path) {
     if (path.empty()) return;
-    ::unlink(path.c_str());
-    // Spool layout is `<parent>/bridge-upload-XXXXXX/<basename>` — rmdir
-    // the directory we created. Defensive: only rmdir if the parent's
-    // basename starts with the spool prefix, so we never blow away a
-    // dir we didn't own.
-    auto pos = path.find_last_of('/');
-    if (pos == std::string::npos) return;
-    std::string dir = path.substr(0, pos);
-    auto dir_pos = dir.find_last_of('/');
-    std::string dir_base = (dir_pos == std::string::npos)
-                           ? dir : dir.substr(dir_pos + 1);
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    // Spool layout is `<parent>/bridge-upload-XXXX/<basename>` — remove the
+    // whole per-job directory we created. Defensive: only remove_all the
+    // dir if its basename starts with the spool prefix, so we never blow
+    // away a dir we didn't own.
+    fs::path p(path);
+    fs::path dir = p.parent_path();
+    const std::string dir_base = dir.filename().string();
     if (dir_base.rfind("bridge-upload-", 0) == 0) {
-        ::rmdir(dir.c_str());
+        fs::remove_all(dir, ec);
+    } else {
+        fs::remove(p, ec);
     }
 }
 

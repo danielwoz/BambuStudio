@@ -18,6 +18,13 @@
   #ifndef NOMINMAX
     #define NOMINMAX
   #endif
+  // WSAPoll() and `struct pollfd` require Windows Vista+ (0x0600). Raise an
+  // unset/too-low target so the bridge's non-blocking-connect probes
+  // (LocalControlTunnel, LanUploadSink port-6000) see them.
+  #if !defined(_WIN32_WINNT) || (_WIN32_WINNT < 0x0600)
+    #undef _WIN32_WINNT
+    #define _WIN32_WINNT 0x0601
+  #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <mswsock.h>

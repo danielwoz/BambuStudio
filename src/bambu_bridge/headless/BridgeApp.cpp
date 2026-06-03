@@ -36,16 +36,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dirent.h>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <sys/stat.h>
-#include <sys/types.h>
 
-#include <arpa/inet.h>
-#include <ifaddrs.h>
-#include <net/if.h>
-#include <sys/socket.h>
+#include "../platform/WinsockShim.hpp"   // inet_ntop, sockaddr_in (winsock2 first)
+#ifdef _WIN32
+#  include <iphlpapi.h>
+#  pragma comment(lib, "iphlpapi.lib")
+#else
+#  include <ifaddrs.h>
+#  include <net/if.h>
+#endif
 
 namespace Slic3r {
 namespace bridge {
@@ -81,36 +83,35 @@ resolve_mtls_paths(const std::string& dev_id) {
     //   BBL_BRIDGE_MTLS_KEY_<dev_id>=/abs/path/key.pem
     std::string cert_env_key = "BBL_BRIDGE_MTLS_CERT_" + dev_id;
     std::string key_env_key  = "BBL_BRIDGE_MTLS_KEY_"  + dev_id;
+    namespace fs = std::filesystem;
     const char* ec = std::getenv(cert_env_key.c_str());
     const char* ek = std::getenv(key_env_key.c_str());
     if (ec && *ec && ek && *ek) {
-        struct stat st;
-        if (::stat(ec, &st) == 0 && ::stat(ek, &st) == 0) {
+        std::error_code _se;
+        if (fs::exists(ec, _se) && fs::exists(ek, _se)) {
             return {ec, ek};
         }
     }
     // Scan the directory for files ending in
     // `_<dev_id>_chain.pem` / `_<dev_id>_key.pem`.
-    DIR* d = ::opendir(dir.c_str());
-    if (!d) return {{}, {}};
     std::string cert_path, key_path;
     const std::string chain_suffix = "_" + dev_id + "_chain.pem";
     const std::string key_suffix   = "_" + dev_id + "_key.pem";
-    while (struct dirent* e = ::readdir(d)) {
-        std::string name = e->d_name;
+    std::error_code _ec;
+    for (const auto& entry : fs::directory_iterator(dir, _ec)) {
+        const std::string name = entry.path().filename().string();
         auto ends_with = [&](const std::string& suf) {
             return name.size() >= suf.size() &&
                    name.compare(name.size() - suf.size(),
                                 suf.size(), suf) == 0;
         };
         if (cert_path.empty() && ends_with(chain_suffix)) {
-            cert_path = dir + "/" + name;
+            cert_path = entry.path().string();
         } else if (key_path.empty() && ends_with(key_suffix)) {
-            key_path = dir + "/" + name;
+            key_path = entry.path().string();
         }
         if (!cert_path.empty() && !key_path.empty()) break;
     }
-    ::closedir(d);
     return {cert_path, key_path};
 }
 
@@ -118,6 +119,52 @@ resolve_mtls_paths(const std::string& dev_id) {
 // IPv4 address as a dotted string. Used to fill the SSDP NOTIFY's
 // LOCATION header so we don't advertise `http://0.0.0.0:...` (which a
 // strict slicer may reject).
+#ifdef _WIN32
+static std::string detect_primary_lan_ip() {
+    // GetAdaptersAddresses replaces getifaddrs on Windows. Same heuristic:
+    // first up, non-loopback IPv4 on a non-virtual adapter. Hyper-V virtual
+    // switches surface as "vEthernet (...)"; filter those plus the obvious
+    // tunnelling / loopback pseudo-adapters.
+    ULONG family = AF_INET;
+    ULONG flags  = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                   GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG size   = 15 * 1024;
+    std::vector<unsigned char> buffer(size);
+    auto* addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+    ULONG rc = ::GetAdaptersAddresses(family, flags, nullptr, addrs, &size);
+    if (rc == ERROR_BUFFER_OVERFLOW) {
+        buffer.resize(size);
+        addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+        rc = ::GetAdaptersAddresses(family, flags, nullptr, addrs, &size);
+    }
+    if (rc != NO_ERROR) return {};
+
+    std::string best;
+    for (auto* ad = addrs; ad; ad = ad->Next) {
+        if (ad->OperStatus != IfOperStatusUp)        continue;
+        if (ad->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        if (ad->IfType == IF_TYPE_TUNNEL)            continue;
+        std::wstring fname = ad->FriendlyName ? ad->FriendlyName : L"";
+        auto starts_with = [&](const wchar_t* p) { return fname.rfind(p, 0) == 0; };
+        if (starts_with(L"vEthernet")) continue;
+        if (starts_with(L"Loopback"))  continue;
+        for (auto* ua = ad->FirstUnicastAddress; ua; ua = ua->Next) {
+            if (!ua->Address.lpSockaddr) continue;
+            if (ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+            auto* in = reinterpret_cast<const sockaddr_in*>(ua->Address.lpSockaddr);
+            char buf[INET_ADDRSTRLEN] = {0};
+            if (!::inet_ntop(AF_INET, (PVOID)&in->sin_addr, buf, sizeof(buf))) continue;
+            std::string ip = buf;
+            if (ip.rfind("127.", 0) == 0)     continue;
+            if (ip.rfind("169.254.", 0) == 0) continue;  // APIPA link-local
+            best = ip;
+            break;
+        }
+        if (!best.empty()) break;
+    }
+    return best;
+}
+#else
 static std::string detect_primary_lan_ip() {
     struct ifaddrs* ifa_list = nullptr;
     if (::getifaddrs(&ifa_list) != 0) return {};
@@ -143,6 +190,7 @@ static std::string detect_primary_lan_ip() {
     ::freeifaddrs(ifa_list);
     return best;
 }
+#endif
 
 // Build the virtual serial advertised in SSDP from the real serial.
 // The slicer's NetworkAgent matches on this prefix to decide that the

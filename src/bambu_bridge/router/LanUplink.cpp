@@ -18,16 +18,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <random>
 #include <string>
-#include <thread>
-#include <sys/stat.h>
+#include <sys/stat.h>     // ::stat / struct stat — available on MSVC too
 #include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <thread>
+#ifndef _WIN32
+#  include <fcntl.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -160,26 +163,34 @@ std::string resolve_helper_path_once() {
 // Write payload to a private temp file. Returns path, empty on failure.
 std::string write_tmp_payload(const std::vector<uint8_t>& payload,
                               const std::string& dev_id) {
-    char tmpl[] = "/tmp/bblbridge_print_XXXXXX";
-    int fd = ::mkstemp(tmpl);
-    if (fd < 0) {
+    // Portable replacement for mkstemp(): a process-unique name in the
+    // platform temp dir (TMPDIR on POSIX, TMP/TEMP on Windows).
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path parent = fs::temp_directory_path(ec);
+    if (ec) {
         std::fprintf(stderr,
-            "[print-via-cert/diag dev=%s] mkstemp failed: %s\n",
-            dev_id.c_str(), std::strerror(errno));
+            "[print-via-cert/diag dev=%s] temp_directory_path failed\n",
+            dev_id.c_str());
         return {};
     }
-    size_t off = 0;
-    while (off < payload.size()) {
-        ssize_t w = ::write(fd, payload.data() + off, payload.size() - off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            ::close(fd); ::unlink(tmpl);
-            return {};
-        }
-        off += static_cast<size_t>(w);
+    static std::atomic<unsigned> s_seq{0};
+    const auto ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    fs::path path = parent / ("bblbridge_print_"
+                       + std::to_string(static_cast<unsigned long long>(ns))
+                       + "_" + std::to_string(s_seq.fetch_add(1)));
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        std::fprintf(stderr,
+            "[print-via-cert/diag dev=%s] temp create failed\n",
+            dev_id.c_str());
+        return {};
     }
-    ::close(fd);
-    return std::string(tmpl);
+    if (!payload.empty())
+        out.write(reinterpret_cast<const char*>(payload.data()),
+                  static_cast<std::streamsize>(payload.size()));
+    if (!out) { out.close(); std::error_code _e; fs::remove(path, _e); return {}; }
+    return path.string();
 }
 
 // Generate a slicer-shaped client_id: "slicer:<unix>:<rand>".
@@ -235,6 +246,17 @@ int spawn_raw_mqtt_helper(const std::string& helper_path,
         nullptr,
     };
 
+#ifdef _WIN32
+    // The cert-bypass diagnostic shells out to a POSIX-spawned python3
+    // helper (fork/execvp/waitpid). Not ported to Windows — the cert path
+    // is a Linux-only diagnostic and the normal cloud/LAN relay does not
+    // depend on it. Report "unavailable" so the caller falls through.
+    (void)argv; (void)dev_id;
+    std::fprintf(stderr,
+        "[print-via-cert/diag dev=%s] python-helper spawn unsupported on Windows\n",
+        dev_id.c_str());
+    return -1;
+#else
     pid_t pid = ::fork();
     if (pid < 0) {
         std::fprintf(stderr,
@@ -287,6 +309,7 @@ int spawn_raw_mqtt_helper(const std::string& helper_path,
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return -100 - WTERMSIG(status);
     return -200;
+#endif // !_WIN32
 }
 
 } // namespace

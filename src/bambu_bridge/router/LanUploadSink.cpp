@@ -15,13 +15,12 @@
 
 #include <nlohmann/json.hpp>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
+#include "../platform/WinsockShim.hpp"   // sockets (winsock2 before windows.h)
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifndef _WIN32
+#  include <poll.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -29,10 +28,12 @@
 #include <cstdio>
 #include <cstdlib>     // getenv
 #include <cstring>
-#include <ctime>       // clock_gettime, gmtime_r
+#include <ctime>       // timestamp formatting
 #include <set>
 #include <string>
-#include <unistd.h>
+#ifndef _WIN32
+#  include <unistd.h>
+#endif
 #include <utility>
 #include <vector>
 
@@ -102,37 +103,40 @@ bool probe_bambu_tunnel_port_6000(const std::string& ip,
     if (fd < 0) return false;
 
     // Non-blocking connect so we can apply the timeout via poll().
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        ::close(fd);
-        return false;
-    }
+    bambu_set_nonblocking(fd, true);
 
     sockaddr_in sa{};
     sa.sin_family = AF_INET;
     sa.sin_port   = htons(6000);
     if (::inet_pton(AF_INET, ip.c_str(), &sa.sin_addr) != 1) {
-        ::close(fd);
+        bambu_close_socket(fd);
         return false;
     }
 
     int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
     bool ok = false;
+    const int conn_err = bambu_last_socket_error();
     if (rc == 0) {
         ok = true;                          // immediate success (loopback)
-    } else if (errno == EINPROGRESS) {
-        pollfd p{fd, POLLOUT, 0};
-        int pr = ::poll(&p, 1, static_cast<int>(timeout.count()));
+    } else if (conn_err == EINPROGRESS || conn_err == EWOULDBLOCK) {
+        pollfd p{};
+        p.fd = fd; p.events = POLLOUT;
+        int pr;
+#ifdef _WIN32
+        pr = ::WSAPoll(&p, 1, static_cast<int>(timeout.count()));
+#else
+        pr = ::poll(&p, 1, static_cast<int>(timeout.count()));
+#endif
         if (pr > 0 && (p.revents & POLLOUT)) {
-            int       so_err = 0;
-            socklen_t slen   = sizeof(so_err);
-            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &slen) == 0 &&
+            int so_err = 0;
+            int slen   = sizeof(so_err);
+            if (bambu_getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &slen) == 0 &&
                 so_err == 0) {
                 ok = true;
             }
         }
     }
-    ::close(fd);
+    bambu_close_socket(fd);
     return ok;
 }
 
@@ -1035,10 +1039,13 @@ int LanUploadSink::dispatch_print_command(const std::string& dev_id,
         const bool  cap_on  = !cap_env || std::strcmp(cap_env, "0") != 0;
         if (cap_on) {
             // Timestamped, plate-tagged directory name.
-            timespec ts{};
-            ::clock_gettime(CLOCK_REALTIME, &ts);
+            std::time_t now_t = std::time(nullptr);
             struct tm tm{};
-            ::gmtime_r(&ts.tv_sec, &tm);
+#ifdef _WIN32
+            ::gmtime_s(&tm, &now_t);
+#else
+            ::gmtime_r(&now_t, &tm);
+#endif
             char ts_buf[64];
             std::snprintf(ts_buf, sizeof(ts_buf),
                 "%04d%02d%02dT%02d%02d%02d.%03ldZ",

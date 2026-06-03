@@ -16,15 +16,10 @@
 #include <string>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <signal.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
+#include "../platform/WinsockShim.hpp"   // sockets/select/timeval (winsock2 first)
+#ifndef _WIN32
+#  include <signal.h>
+#endif
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -40,8 +35,10 @@ void ensure_openssl_init() {
     std::call_once(once, []{
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
+#ifndef _WIN32
         // SIGPIPE-on-EPIPE protection: SSL_write into a half-closed
-        // TCP socket would otherwise raise SIGPIPE process-wide.
+        // TCP socket would otherwise raise SIGPIPE process-wide. Winsock
+        // has no SIGPIPE, so this is POSIX-only.
         struct sigaction cur{};
         if (::sigaction(SIGPIPE, nullptr, &cur) == 0
             && cur.sa_handler == SIG_DFL) {
@@ -50,6 +47,7 @@ void ensure_openssl_init() {
             ::sigemptyset(&sa.sa_mask);
             ::sigaction(SIGPIPE, &sa, nullptr);
         }
+#endif
     });
 }
 
@@ -70,25 +68,25 @@ int tcp_connect(const std::string& ip, uint16_t port,
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port);
     if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd); errno = EINVAL; return -1;
+        bambu_close_socket(fd); return -1;
     }
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    bambu_set_nonblocking(fd, true);
     int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    if (rc < 0 && errno != EINPROGRESS) { ::close(fd); return -1; }
+    const int cerr = bambu_last_socket_error();
+    if (rc < 0 && cerr != EINPROGRESS && cerr != EWOULDBLOCK) { bambu_close_socket(fd); return -1; }
     if (rc < 0) {
         fd_set wfds; FD_ZERO(&wfds); FD_SET(fd, &wfds);
-        timeval tv{}; tv.tv_sec = timeout.count();
+        timeval tv{}; tv.tv_sec = static_cast<long>(timeout.count());
         int sr = ::select(fd + 1, nullptr, &wfds, nullptr, &tv);
-        if (sr <= 0) { ::close(fd); return -1; }
-        int so_err = 0; socklen_t len = sizeof(so_err);
-        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &len) < 0
-            || so_err != 0) { ::close(fd); return -1; }
+        if (sr <= 0) { bambu_close_socket(fd); return -1; }
+        int so_err = 0; int len = sizeof(so_err);
+        if (bambu_getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &len) < 0
+            || so_err != 0) { bambu_close_socket(fd); return -1; }
     }
-    ::fcntl(fd, F_SETFL, flags);
+    bambu_set_nonblocking(fd, false);   // restore blocking
     int one = 1;
-    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    bambu_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    bambu_setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
     return fd;
 }
 
@@ -259,13 +257,13 @@ int raw_mqtt_publish_oneshot(const RawMqttPublishConfig& cfg,
     SSL_CTX* ctx = make_client_ctx(cfg.mtls_cert_path,
                                    cfg.mtls_key_path,
                                    cfg.dev_id);
-    if (!ctx) { ::close(fd); return -2; }
+    if (!ctx) { bambu_close_socket(fd); return -2; }
     SSL* ssl = SSL_new(ctx);
-    if (!ssl) { SSL_CTX_free(ctx); ::close(fd); return -2; }
+    if (!ssl) { SSL_CTX_free(ctx); bambu_close_socket(fd); return -2; }
     SSL_set_fd(ssl, fd);
     if (SSL_connect(ssl) != 1) {
         log_ssl_err("SSL_connect", cfg.dev_id);
-        SSL_free(ssl); SSL_CTX_free(ctx); ::close(fd);
+        SSL_free(ssl); SSL_CTX_free(ctx); bambu_close_socket(fd);
         return -2;
     }
 
@@ -275,7 +273,7 @@ int raw_mqtt_publish_oneshot(const RawMqttPublishConfig& cfg,
                                      /*keepalive*/ 30,
                                      /*clean_session*/ true);
     if (!ssl_write_all(ssl, connect_pkt)) {
-        SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); ::close(fd);
+        SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); bambu_close_socket(fd);
         return -3;
     }
     // CONNACK: 0x20, RL=2, [flags, rc]
@@ -287,13 +285,13 @@ int raw_mqtt_publish_oneshot(const RawMqttPublishConfig& cfg,
             "[raw-mqtt dev=%s] CONNACK header read fail (got 0x%02x)\n",
             cfg.dev_id.c_str(), hdr[0]);
         std::fflush(stderr);
-        SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); ::close(fd);
+        SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); bambu_close_socket(fd);
         return -3;
     }
     uint8_t connack[2];
     if (!ssl_read_exact(ssl, fd, connack, 2,
         std::chrono::milliseconds(cfg.io_timeout))) {
-        SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); ::close(fd);
+        SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); bambu_close_socket(fd);
         return -3;
     }
     if (connack[1] != 0) {
@@ -301,7 +299,7 @@ int raw_mqtt_publish_oneshot(const RawMqttPublishConfig& cfg,
             "[raw-mqtt dev=%s] CONNACK rc=%u (expected 0)\n",
             cfg.dev_id.c_str(), unsigned(connack[1]));
         std::fflush(stderr);
-        SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); ::close(fd);
+        SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); bambu_close_socket(fd);
         return -3;
     }
 
@@ -315,7 +313,7 @@ int raw_mqtt_publish_oneshot(const RawMqttPublishConfig& cfg,
     auto pub_pkt = encode_publish(topic, payload, qos, /*retain=*/false,
                                   /*dup=*/false, pid);
     if (!ssl_write_all(ssl, pub_pkt)) {
-        SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); ::close(fd);
+        SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); bambu_close_socket(fd);
         return -4;
     }
 
@@ -356,7 +354,7 @@ int raw_mqtt_publish_oneshot(const RawMqttPublishConfig& cfg,
     SSL_shutdown(ssl);
     SSL_free(ssl);
     SSL_CTX_free(ctx);
-    ::close(fd);
+    bambu_close_socket(fd);
     return rc;
 }
 

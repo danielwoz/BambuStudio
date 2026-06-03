@@ -15,15 +15,10 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "../platform/WinsockShim.hpp"   // sockets (winsock2 before windows.h)
+#ifndef _WIN32
+#  include <poll.h>
+#endif
 
 #include <cerrno>
 #include <cstdio>
@@ -93,16 +88,18 @@ bool decode_header(const uint8_t in[16], Header& h)
     return h.magic0 == kMagic0 && h.magic1 == kMagic1;
 }
 
-int wait_writable(int fd, int timeout_ms)
+int bridge_poll1(int fd, short events, int timeout_ms)
 {
-    pollfd p{fd, POLLOUT, 0};
+    pollfd p{};
+    p.fd = fd; p.events = events;
+#ifdef _WIN32
+    return ::WSAPoll(&p, 1, timeout_ms);
+#else
     return ::poll(&p, 1, timeout_ms);
+#endif
 }
-int wait_readable(int fd, int timeout_ms)
-{
-    pollfd p{fd, POLLIN, 0};
-    return ::poll(&p, 1, timeout_ms);
-}
+int wait_writable(int fd, int timeout_ms) { return bridge_poll1(fd, POLLOUT, timeout_ms); }
+int wait_readable(int fd, int timeout_ms) { return bridge_poll1(fd, POLLIN,  timeout_ms); }
 
 int tcp_connect(const std::string& host, int port, int timeout_ms)
 {
@@ -115,23 +112,27 @@ int tcp_connect(const std::string& host, int port, int timeout_ms)
 
     int fd = -1;
     for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-        fd = ::socket(ai->ai_family, ai->ai_socktype | SOCK_NONBLOCK, ai->ai_protocol);
+        // SOCK_NONBLOCK is a Linux socket() flag with no Winsock analogue;
+        // create blocking then toggle via the shim.
+        fd = static_cast<int>(::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol));
         if (fd < 0) continue;
+        bambu_set_nonblocking(fd, true);
         int yes = 1;
-        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-        int rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
+        bambu_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+        int rc = ::connect(fd, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
         if (rc == 0) break;
-        if (errno == EINPROGRESS) {
+        const int cerr = bambu_last_socket_error();
+        if (cerr == EINPROGRESS || cerr == EWOULDBLOCK) {
             int pr = wait_writable(fd, timeout_ms);
             if (pr > 0) {
                 int err = 0;
-                socklen_t errlen = sizeof(err);
-                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0 && err == 0) {
+                int errlen = sizeof(err);
+                if (bambu_getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0 && err == 0) {
                     break;
                 }
             }
         }
-        ::close(fd);
+        bambu_close_socket(fd);
         fd = -1;
     }
     ::freeaddrinfo(res);
@@ -371,7 +372,7 @@ void LocalControlTunnel::close_()
 {
     if (ssl_)     { SSL_shutdown(ssl_); SSL_free(ssl_); ssl_ = nullptr; }
     if (ssl_ctx_) { SSL_CTX_free(ssl_ctx_);             ssl_ctx_ = nullptr; }
-    if (fd_ >= 0) { ::close(fd_);                        fd_ = -1; }
+    if (fd_ >= 0) { bambu_close_socket(fd_);            fd_ = -1; }
 }
 
 }  // namespace router
