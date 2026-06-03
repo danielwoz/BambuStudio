@@ -1581,6 +1581,11 @@ int CLI::run(int argc, char **argv)
             // Bambu's cloud cert with CURLE_PEER_FAILED_VERIFICATION
             // (http_code=60). Set the env var here, matching the same
             // probe list CurlGlobalInit uses.
+#ifndef _WIN32
+            // Linux/macOS: point OpenSSL at a system CA bundle so the
+            // plugin's cloud TLS verifies. On Windows OpenSSL uses the
+            // Windows certificate store (crypt32) and these POSIX paths
+            // don't exist, so the whole probe is compiled out.
             if (!std::getenv("SSL_CERT_FILE")) {
                 static const char* const ca_bundles[] = {
                     "/etc/pki/tls/certs/ca-bundle.crt",
@@ -1597,6 +1602,7 @@ int CLI::run(int argc, char **argv)
                     }
                 }
             }
+#endif
 
             // Probe for the slicer_base64.cer the plugin uses to verify
             // TLS to Bambu's cloud. CLI::run runs before set_resources_dir,

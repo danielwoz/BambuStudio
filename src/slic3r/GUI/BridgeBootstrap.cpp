@@ -43,8 +43,20 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <ctime>
 #include <cstdlib>
-#include <dirent.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h> // GetCurrentThreadId
+#endif
+#ifndef _WIN32
+#include <dirent.h> // /proc/self/task thread-count probe (Linux only)
+#endif
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -1200,7 +1212,9 @@ void install_gui_worker(GUI_App* app)
                 };
                 ::signal(SIGTERM, handler);
                 ::signal(SIGINT,  handler);
-                ::signal(SIGHUP,  handler);
+#ifdef SIGHUP
+                ::signal(SIGHUP,  handler); // no SIGHUP on Windows
+#endif
                 std::fprintf(stderr,
                     "[bridge-shutdown] handler installed for SIGTERM/SIGINT/SIGHUP\n");
                 std::fflush(stderr);
@@ -1275,6 +1289,7 @@ void install_gui_worker(GUI_App* app)
 
                 // ----- A. Health probes --------------------------------------
                 const int thread_count = [] {
+#ifndef _WIN32
                     DIR* d = ::opendir("/proc/self/task");
                     if (!d) return -1;
                     int n = 0;
@@ -1283,6 +1298,11 @@ void install_gui_worker(GUI_App* app)
                     }
                     ::closedir(d);
                     return n;
+#else
+                    // No /proc on Windows; thread-count probe is a
+                    // Linux-only diagnostic. Report -1 (== unavailable).
+                    return -1;
+#endif
                 }();
 
                 // Sample push_count for the bridge's target printer
@@ -2027,11 +2047,19 @@ int on_filter_event(wxEvent& event)
     auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
                   now.time_since_epoch()).count() % 1000;
     struct tm lt;
+#ifdef _WIN32
+    localtime_s(&lt, &tt);
+#else
     localtime_r(&tt, &lt);
+#endif
     char ts[16];
     std::snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03lld",
         lt.tm_hour, lt.tm_min, lt.tm_sec, (long long) ms);
+#ifdef _WIN32
+    unsigned long tid = (unsigned long) ::GetCurrentThreadId() & 0xFFFFF;
+#else
     unsigned long tid = (unsigned long) pthread_self() & 0xFFFFF;
+#endif
 
     std::fprintf(stderr,
         "[gui_event] %s tid=%lu %s class=%s name=%s label=%s "

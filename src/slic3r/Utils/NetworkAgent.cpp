@@ -28,6 +28,13 @@
 #include "slic3r/Utils/FileTransferUtils.hpp"
 #include "slic3r/Utils/CertificateVerify.hpp"
 
+// Portable file-op shims (bridge_mkdir / bridge_hardlink) for the
+// diagnostic snapshot/capture blocks below. Keeps ::mkdir(path,mode) and
+// ::link(old,new) one-liners on both Linux and Windows (MSVC).
+#include "bambu_bridge/platform/PortablePaths.hpp"
+#include <ctime>
+#include <chrono>
+
 #if defined(BAMBU_BRIDGE_HARNESS_ENABLE)
 // Pulled in only when the harness build option is set. The ShimRecorder
 // is process-wide; the wrap function defined near the bottom of this
@@ -85,7 +92,7 @@ inline void snapshot_bbs_sent(const std::string& dev_id,
     if (::stat(src_path.c_str(), &st) != 0) return;
     std::string dbg = "/tmp/bbs-sent-" + dev_id + ".3mf";
     ::unlink(dbg.c_str());
-    if (::link(src_path.c_str(), dbg.c_str()) != 0) {
+    if (bridge_hardlink(src_path.c_str(), dbg.c_str()) != 0) {
         FILE* in  = std::fopen(src_path.c_str(), "rb");
         FILE* out = std::fopen(dbg.c_str(),      "wb");
         if (in && out) {
@@ -247,16 +254,25 @@ inline void snapshot_print_cmd(const char* call_site,
         const bool  cap_on  = !cap_env || std::strcmp(cap_env, "0") != 0;
         if (!cap_on) return;
 
-        timespec ts{};
-        ::clock_gettime(CLOCK_REALTIME, &ts);
+        // Portable UTC timestamp (chrono + gmtime_s/gmtime_r). Replaces
+        // POSIX clock_gettime/gmtime_r so this builds on MSVC.
+        const auto now_tp = std::chrono::system_clock::now();
+        const std::time_t now_tt = std::chrono::system_clock::to_time_t(now_tp);
+        const long millis = static_cast<long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now_tp.time_since_epoch()).count() % 1000);
         struct tm tm{};
-        ::gmtime_r(&ts.tv_sec, &tm);
+#ifdef _WIN32
+        ::gmtime_s(&tm, &now_tt);
+#else
+        ::gmtime_r(&now_tt, &tm);
+#endif
         char ts_buf[64];
         std::snprintf(ts_buf, sizeof(ts_buf),
             "%04d%02d%02dT%02d%02d%02d.%03ldZ",
             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
             tm.tm_hour, tm.tm_min, tm.tm_sec,
-            long(ts.tv_nsec / 1000000));
+            millis);
 
         const std::string cap_root = "/tmp/slicer-capture";
         const std::string cap_dev  = cap_root + "/" + p.dev_id;
@@ -264,9 +280,9 @@ inline void snapshot_print_cmd(const char* call_site,
         std::snprintf(plate_buf, sizeof(plate_buf), "_plate%d", p.plate_index);
         const std::string cap_dir = cap_dev + "/" + ts_buf + plate_buf
                                   + "_" + call_site;
-        ::mkdir(cap_root.c_str(), 0700);
-        ::mkdir(cap_dev.c_str(),  0700);
-        ::mkdir(cap_dir.c_str(),  0700);
+        bridge_mkdir(cap_root.c_str(), 0700);
+        bridge_mkdir(cap_dev.c_str(),  0700);
+        bridge_mkdir(cap_dir.c_str(),  0700);
 
         auto link_or_copy = [](const std::string& src,
                                 const std::string& dst) -> bool {
@@ -274,7 +290,7 @@ inline void snapshot_print_cmd(const char* call_site,
             struct stat st{};
             if (::stat(src.c_str(), &st) != 0) return false;
             ::unlink(dst.c_str());
-            if (::link(src.c_str(), dst.c_str()) == 0) return true;
+            if (bridge_hardlink(src.c_str(), dst.c_str()) == 0) return true;
             FILE* in_f  = std::fopen(src.c_str(),  "rb");
             FILE* out_f = std::fopen(dst.c_str(), "wb");
             if (!in_f || !out_f) {

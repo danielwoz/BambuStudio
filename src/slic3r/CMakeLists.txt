@@ -745,8 +745,21 @@ if (BAMBU_BRIDGE)
     # and slicer headers it pulls in transitively #include <wx/setup.h>.
     set(BAMBU_VIRTUAL_CLIENT_WX_INCLUDE_DIRS    "${wxWidgets_INCLUDE_DIRS}"
         CACHE STRING "wxWidgets include dirs for bambu_virtual_client" FORCE)
+    # OCCT (OpenCASCADE) headers: VirtualSsdpDiscovery.cpp pulls in
+    # GUI/DeviceCore/DevManager.h which transitively reaches
+    # libslic3r/Format/STEP.hpp (XCAFDoc_*.hxx etc.). The headers are
+    # installed under a version-specific subdir of the deps prefix — it is
+    # "occt" in the current deps build (not "opencascade"), and the deps
+    # tree resolves through CMAKE_PREFIX_PATH rather than the in-tree
+    # ${CMAKE_SOURCE_DIR}/deps path on some worktrees. Resolve it robustly
+    # by locating the canonical OCCT header rather than hardcoding a name.
+    find_path(_bvc_occt_include_dir
+        NAMES XCAFDoc_DocumentTool.hxx
+        PATHS ${CMAKE_PREFIX_PATH} ${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local
+        PATH_SUFFIXES include/occt include/opencascade include
+        NO_DEFAULT_PATH)
     set(BAMBU_VIRTUAL_CLIENT_EXTRA_INCLUDE_DIRS
-        "${CMAKE_BINARY_DIR}/src/libslic3r;${CMAKE_BINARY_DIR}/src/slic3r;${CMAKE_BINARY_DIR}/src/platform;${CMAKE_SOURCE_DIR}/src/eigen;${CMAKE_SOURCE_DIR}/src/libigl;${CMAKE_SOURCE_DIR}/src/hidapi/include;${CMAKE_SOURCE_DIR}/src/libnest2d/include;${CMAKE_SOURCE_DIR}/src/miniz;${CMAKE_SOURCE_DIR}/src/glu-libtess/include;${CMAKE_SOURCE_DIR}/src/clipper2/Clipper2Lib/include;${CMAKE_SOURCE_DIR}/src/minilzo;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include/opencascade"
+        "${CMAKE_BINARY_DIR}/src/libslic3r;${CMAKE_BINARY_DIR}/src/slic3r;${CMAKE_BINARY_DIR}/src/platform;${CMAKE_SOURCE_DIR}/src/eigen;${CMAKE_SOURCE_DIR}/src/libigl;${CMAKE_SOURCE_DIR}/src/hidapi/include;${CMAKE_SOURCE_DIR}/src/libnest2d/include;${CMAKE_SOURCE_DIR}/src/miniz;${CMAKE_SOURCE_DIR}/src/glu-libtess/include;${CMAKE_SOURCE_DIR}/src/clipper2/Clipper2Lib/include;${CMAKE_SOURCE_DIR}/src/minilzo;${CMAKE_SOURCE_DIR}/deps/build/destdir/usr/local/include;${_bvc_occt_include_dir}"
         CACHE STRING "extra include dirs (generated headers) for bambu_virtual_client" FORCE)
     set(BAMBU_VIRTUAL_CLIENT_BUILD_CLI OFF CACHE BOOL "" FORCE)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/Utils/bambu_virtual_client

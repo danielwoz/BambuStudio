@@ -65,7 +65,11 @@
 
 #include <cstdio>
 #include <cstdlib>
+#ifndef _WIN32
 #include <unistd.h>
+#else
+#include <direct.h> // _chdir / chdir alias on MSVC
+#endif
 
 namespace fs = boost::filesystem;
 
