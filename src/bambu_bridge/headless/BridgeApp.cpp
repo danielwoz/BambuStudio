@@ -40,6 +40,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "../platform/PortablePaths.hpp"
 #include "../platform/WinsockShim.hpp"   // inet_ntop, sockaddr_in (winsock2 first)
 #ifdef _WIN32
 #  include <iphlpapi.h>
@@ -271,7 +272,7 @@ static bool save_port_map(const std::string& path,
             if (i == dir.size() || dir[i] == '/') {
                 if (!acc.empty() && acc != "/") {
                     // mkdir returns -1 + EEXIST if it's already there; fine.
-                    ::mkdir(acc.c_str(), 0755);
+                    bridge_mkdir(acc.c_str(), 0755);
                 }
             }
             if (i < dir.size()) acc.push_back(dir[i]);

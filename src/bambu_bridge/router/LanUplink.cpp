@@ -126,7 +126,9 @@ std::string resolve_helper_path_once() {
             struct stat st;
             if (::stat(env, &st) == 0) { cached = env; return; }
         }
-        // 2) walk up from /proc/self/exe
+        // 2) walk up from /proc/self/exe (Linux-only; the cert-diag helper
+        //    is not spawned on Windows anyway — see spawn_raw_mqtt_helper).
+#ifndef _WIN32
         char buf[4096] = {0};
         ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
         if (n > 0) {
@@ -149,6 +151,7 @@ std::string resolve_helper_path_once() {
                 if (::stat(p.c_str(), &st) == 0) { cached = p; return; }
             }
         }
+#endif // !_WIN32
         // 3) canonical source-tree path (developer machines)
         const char* canonical =
             "/home/danielwoz/BambuStudio-bridge/src/bambu_bridge/router/"

@@ -25,12 +25,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <fcntl.h>
-#include <pthread.h>
 #include <string>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  include <windows.h>     // GetCurrentThreadId
+#else
+#  include <fcntl.h>
+#  include <pthread.h>
+#  include <sys/stat.h>
+#  include <sys/types.h>
+#  include <unistd.h>
+#endif
 
 #if __has_include(<execinfo.h>)
 #include <execinfo.h>
@@ -40,7 +44,9 @@
 #include <cxxabi.h>
 #define BAMBU_BRIDGE_HAVE_CXXABI 1
 #endif
+#if __has_include(<dlfcn.h>)
 #include <dlfcn.h>
+#endif
 
 namespace Slic3r {
 namespace plugin_trace {
@@ -74,16 +80,26 @@ inline void write_prefix(FILE* f) {
     auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
                   now.time_since_epoch()).count() % 1000;
     struct tm lt;
+#ifdef _WIN32
+    localtime_s(&lt, &tt);
+#else
     localtime_r(&tt, &lt);
+#endif
     char ts[16];
     std::snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03lld",
         lt.tm_hour, lt.tm_min, lt.tm_sec, (long long) ms);
-    // pthread_self() is opaque; cast and mask to a usable short id.
+    // thread id, masked to a usable short id.
+#ifdef _WIN32
+    unsigned long tid = (unsigned long) ::GetCurrentThreadId();
+#else
     unsigned long tid = (unsigned long) pthread_self();
+#endif
     std::fprintf(f, "[plugincall] %s tid=%lu ", ts, tid & 0xFFFFF);
 }
 
-inline void log_event(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+#if defined(__GNUC__)
+__attribute__((format(printf, 1, 2)))
+#endif
 inline void log_event(const char* fmt, ...) {
     if (!enabled()) return;
     write_prefix(stderr);
@@ -110,6 +126,11 @@ inline void snapshot_path(const char* call,
                           const char* role,
                           const std::string& src_path) {
     if (!snapshot_enabled() || src_path.empty()) return;
+#ifdef _WIN32
+    // The .3mf snapshot facility is a Linux dev diagnostic (/tmp + hardlink).
+    (void) call; (void) role;
+    return;
+#else
     struct stat st{};
     if (::stat(src_path.c_str(), &st) != 0) {
         log_event("SNAPSHOT %s %s missing: %s",
@@ -148,6 +169,7 @@ inline void snapshot_path(const char* call,
     log_event("SNAPSHOT %s %s src=%s size=%lld -> %s",
         call, role, src_path.c_str(),
         (long long) st.st_size, out);
+#endif // !_WIN32
 }
 
 // Backtrace dump for one log line. Enabled by BAMBU_BRIDGE_PLUGIN_STACK=1

@@ -16,11 +16,13 @@
 #include <nlohmann/json.hpp>
 
 #include "../platform/WinsockShim.hpp"   // sockets (winsock2 before windows.h)
-#include <sys/stat.h>
-#include <sys/types.h>
+#include "../platform/PortablePaths.hpp"
 #ifndef _WIN32
+#  include <sys/stat.h>
+#  include <sys/types.h>
 #  include <poll.h>
 #endif
+#include <filesystem>
 
 #include <algorithm>
 #include <cctype>
@@ -264,7 +266,7 @@ static std::string make_settings_only_zip(const std::string& threemf_path,
     auto dot = base.find_last_of('.');
     std::string stem = (dot == std::string::npos) ? base : base.substr(0, dot);
     std::string out_path = dir + "/" + stem + "_config.3mf";
-    ::unlink(out_path.c_str());
+    { std::error_code ec; std::filesystem::remove(out_path, ec); }
 
     if (!mz_zip_writer_init_file(&out, out_path.c_str(), 0)) {
         std::fprintf(stderr,
@@ -298,7 +300,7 @@ static std::string make_settings_only_zip(const std::string& threemf_path,
             std::fflush(stderr);
             mz_zip_writer_end(&out);
             mz_zip_reader_end(&in);
-            ::unlink(out_path.c_str());
+            { std::error_code ec; std::filesystem::remove(out_path, ec); }
             return {};
         }
         ++n_copied;
@@ -310,7 +312,7 @@ static std::string make_settings_only_zip(const std::string& threemf_path,
             dev_id.c_str());
         std::fflush(stderr);
         mz_zip_reader_end(&in);
-        ::unlink(out_path.c_str());
+        { std::error_code ec; std::filesystem::remove(out_path, ec); }
         return {};
     }
     mz_zip_reader_end(&in);
@@ -383,7 +385,7 @@ static bool normalise_orca_plate_to_one(const std::string& in_path,
     // Build the rewritten archive at a sibling path; rename atomically
     // on success.
     const std::string out_path = in_path + ".normalised";
-    ::unlink(out_path.c_str());
+    { std::error_code ec; std::filesystem::remove(out_path, ec); }
     mz_zip_archive out{};
     if (!mz_zip_writer_init_file(&out, out_path.c_str(), 0)) {
         std::fprintf(stderr,
@@ -494,7 +496,7 @@ static bool normalise_orca_plate_to_one(const std::string& in_path,
     mz_zip_reader_end(&in);
 
     if (!ok) {
-        ::unlink(out_path.c_str());
+        { std::error_code ec; std::filesystem::remove(out_path, ec); }
         std::fprintf(stderr,
             "[lan-upload] dev=%s normalise-plate: rewrite failed\n",
             dev_id.c_str());
@@ -508,7 +510,7 @@ static bool normalise_orca_plate_to_one(const std::string& in_path,
             dev_id.c_str(), out_path.c_str(), in_path.c_str(),
             std::strerror(errno));
         std::fflush(stderr);
-        ::unlink(out_path.c_str());
+        { std::error_code ec; std::filesystem::remove(out_path, ec); }
         return false;
     }
     std::fprintf(stderr,
@@ -651,8 +653,8 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
             // original path and we still get to inspect the bytes after
             // the per-job tempdir is rmdir'd. Falls back to a plain copy
             // if link() fails (cross-filesystem etc.).
-            ::unlink(dbg.c_str());
-            if (::link(tmp_path.c_str(), dbg.c_str()) != 0) {
+            { std::error_code ec; std::filesystem::remove(dbg, ec); }
+            if (bridge_hardlink(tmp_path.c_str(), dbg.c_str()) != 0) {
                 FILE* in  = std::fopen(tmp_path.c_str(), "rb");
                 FILE* out = std::fopen(dbg.c_str(),      "wb");
                 if (in && out) {
@@ -762,8 +764,8 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
     // then cleanup_upload_tempfile rmdir's the tempfile's containing
     // dir — the spool path survives because of the link.
     std::string spool_dir = "/tmp/bridge-spool/" + job.dev_id;
-    ::mkdir("/tmp/bridge-spool", 0700);
-    ::mkdir(spool_dir.c_str(), 0700);
+    bridge_mkdir("/tmp/bridge-spool", 0700);
+    bridge_mkdir(spool_dir.c_str(), 0700);
     std::string spool_basename =
         job.filename.empty() ? std::string("lan_print.3mf") : job.filename;
     // Strip any leading '/' (job.filename is whatever the slicer sent in
@@ -771,8 +773,8 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
     while (!spool_basename.empty() && spool_basename.front() == '/')
         spool_basename.erase(0, 1);
     std::string spool_path = spool_dir + "/" + spool_basename;
-    ::unlink(spool_path.c_str());
-    if (::link(tmp_path.c_str(), spool_path.c_str()) != 0) {
+    { std::error_code ec; std::filesystem::remove(spool_path, ec); }
+    if (bridge_hardlink(tmp_path.c_str(), spool_path.c_str()) != 0) {
         // Cross-fs / EXDEV fallback: stream-copy.
         FILE* in_f  = std::fopen(tmp_path.c_str(),  "rb");
         FILE* out_f = std::fopen(spool_path.c_str(), "wb");
@@ -802,8 +804,8 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
         std::string stem = (dot == std::string::npos)
                            ? spool_basename : spool_basename.substr(0, dot);
         spool_config_path = spool_dir + "/" + stem + "_config.3mf";
-        ::unlink(spool_config_path.c_str());
-        if (::link(settings_path.c_str(), spool_config_path.c_str()) != 0) {
+        { std::error_code ec; std::filesystem::remove(spool_config_path, ec); }
+        if (bridge_hardlink(settings_path.c_str(), spool_config_path.c_str()) != 0) {
             // EXDEV fallback: stream-copy.
             FILE* in_f  = std::fopen(settings_path.c_str(),  "rb");
             FILE* out_f = std::fopen(spool_config_path.c_str(), "wb");
@@ -841,7 +843,7 @@ server::UploadResult LanUploadSink::deliver(server::UploadJob job) {
     // Now clean up the per-job tempdir — the hard link above keeps the
     // bytes alive at spool_path.
     if (!settings_path.empty() && settings_path != tmp_path)
-        ::unlink(settings_path.c_str());
+        { std::error_code ec; std::filesystem::remove(settings_path, ec); }
     cleanup_upload_tempfile(tmp_path);
 
     res.ok = true;
@@ -859,7 +861,7 @@ static void write_bridge_progress(const std::string& virtual_dev_id,
                                   const std::string& info,
                                   const std::string& phase) {
     if (virtual_dev_id.empty()) return;
-    ::mkdir("/tmp/bridge-progress", 0700);
+    bridge_mkdir("/tmp/bridge-progress", 0700);
     std::string path = "/tmp/bridge-progress/" + virtual_dev_id + ".json";
     std::string tmp_path = path + ".tmp";
     FILE* f = std::fopen(tmp_path.c_str(), "wb");
@@ -1051,22 +1053,22 @@ int LanUploadSink::dispatch_print_command(const std::string& dev_id,
                 "%04d%02d%02dT%02d%02d%02d.%03ldZ",
                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                 tm.tm_hour, tm.tm_min, tm.tm_sec,
-                long(ts.tv_nsec / 1000000));
+                0L);
             std::string cap_root = "/tmp/bridge-capture";
             std::string cap_dev  = cap_root + "/" + dev_id;
             char plate_buf[32];
             std::snprintf(plate_buf, sizeof(plate_buf), "_plate%d", lp.plate_index);
             std::string cap_dir  = cap_dev + "/" + ts_buf + plate_buf;
-            ::mkdir(cap_root.c_str(), 0700);
-            ::mkdir(cap_dev.c_str(),  0700);
-            int mkdir_rc = ::mkdir(cap_dir.c_str(),  0700);
+            bridge_mkdir(cap_root.c_str(), 0700);
+            bridge_mkdir(cap_dev.c_str(),  0700);
+            int mkdir_rc = bridge_mkdir(cap_dir.c_str(),  0700);
 
             // Best-effort hard-link copies; on EXDEV fall back to stream-copy.
             auto link_or_copy = [](const std::string& src,
                                     const std::string& dst) -> bool {
                 if (src.empty()) return false;
-                ::unlink(dst.c_str());
-                if (::link(src.c_str(), dst.c_str()) == 0) return true;
+                { std::error_code ec; std::filesystem::remove(dst, ec); }
+                if (bridge_hardlink(src.c_str(), dst.c_str()) == 0) return true;
                 FILE* in_f  = std::fopen(src.c_str(),  "rb");
                 FILE* out_f = std::fopen(dst.c_str(), "wb");
                 if (!in_f || !out_f) {

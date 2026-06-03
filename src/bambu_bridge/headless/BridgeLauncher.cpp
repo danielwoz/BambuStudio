@@ -4,11 +4,13 @@
 
 #include <nlohmann/json.hpp>
 
+#ifndef _WIN32
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <unistd.h>
 #include <pwd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +31,7 @@ namespace headless {
 
 namespace {
 
+#ifndef _WIN32
 // Sigchld-safe: only sets a flag. main thread polls.
 std::atomic<int>           g_stop_signal{0};
 std::vector<pid_t>         g_children;
@@ -57,6 +60,7 @@ void install_signal_handlers() {
     // Ignore SIGPIPE; children may pipe-fail us on TLS teardown.
     ::signal(SIGPIPE, SIG_IGN);
 }
+#endif // !_WIN32
 
 // Read $HOME/.config/BambuStudio/BambuStudio.conf and return the keys of
 // the `access_code` object. Those keys are the real device serials
@@ -65,10 +69,12 @@ void install_signal_handlers() {
 std::vector<std::string> read_dev_ids_from_conf() {
     std::vector<std::string> out;
     const char* home = std::getenv("HOME");
+#ifndef _WIN32
     if (!home || !*home) {
         if (struct passwd* pw = ::getpwuid(::getuid()); pw && pw->pw_dir)
             home = pw->pw_dir;
     }
+#endif
     if (!home || !*home) return out;
     std::string path = std::string(home) + "/.config/BambuStudio/BambuStudio.conf";
     std::ifstream f(path);
@@ -137,10 +143,12 @@ uint16_t parse_u16(const std::string& s, uint16_t def) {
 std::string prepare_child_config_dir(const std::string& dev_id) {
     namespace fs = std::filesystem;
     const char* home = std::getenv("HOME");
+#ifndef _WIN32
     if (!home || !*home) {
         if (struct passwd* pw = ::getpwuid(::getuid()); pw && pw->pw_dir)
             home = pw->pw_dir;
     }
+#endif
     if (!home || !*home) return {};
     fs::path parent = fs::path(home) / ".config" / "BambuStudio";
     fs::path child  = parent / "bridge-multi" / dev_id;
@@ -263,6 +271,19 @@ int run_bridge_multi(int argc, char** argv) {
         print_usage();
         return 0;
     }
+
+#ifdef _WIN32
+    // --bridge-multi spawns one child process per printer via fork/execv and
+    // supervises them with waitpid + POSIX signals. That model has no portable
+    // Windows equivalent, so multi-process mode is unsupported here. Run a
+    // single --bridge-only instance per process instead.
+    (void)argc;
+    (void)argv;
+    std::fprintf(stderr,
+        "[bridge-multi] --bridge-multi is not supported on Windows; "
+        "launch one --bridge-only process per printer instead\n");
+    return 2;
+#else
 
     std::vector<std::string> printers = get_all_args(argc, argv, "printer");
     if (printers.empty()) {
@@ -389,6 +410,7 @@ int run_bridge_multi(int argc, char** argv) {
     }
     std::fflush(stderr);
     return worst_rc;
+#endif // _WIN32
 }
 
 } // namespace headless

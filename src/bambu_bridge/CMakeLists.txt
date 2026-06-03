@@ -174,6 +174,12 @@ target_include_directories(bambu_bridge
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
+# CloudDeviceList.cpp / CloudSession.cpp use <boost/log/trivial.hpp>. In the
+# embedded build Boost lives in the parent's dep stack; surface its headers.
+if (NOT BAMBU_BRIDGE_STANDALONE)
+    target_include_directories(bambu_bridge PRIVATE ${Boost_INCLUDE_DIRS})
+endif ()
+
 set_target_properties(bambu_bridge PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON

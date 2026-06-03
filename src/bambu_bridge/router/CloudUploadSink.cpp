@@ -22,7 +22,9 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <utility>
 
 namespace Slic3r {

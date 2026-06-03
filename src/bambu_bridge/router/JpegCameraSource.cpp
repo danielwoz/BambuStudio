@@ -397,7 +397,7 @@ void JpegCameraSource::close_locked_() {
         m_ssl_ctx = nullptr;
     }
     if (m_fd >= 0) {
-        ::close(m_fd);
+        bambu_close_socket(m_fd);
         m_fd = -1;
     }
 }

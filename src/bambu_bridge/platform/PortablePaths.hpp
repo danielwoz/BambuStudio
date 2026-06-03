@@ -67,3 +67,37 @@ inline std::filesystem::path bridge_temp_root() {
 }
 
 }}} // namespace Slic3r::bridge::platform
+
+// ---- Portable file-op shims (POSIX mkdir/link -> Windows equivalents) ------
+// Diagnostic/capture code in the branch uses raw ::mkdir(path,mode) and
+// ::link(old,new) (hardlink). These free functions keep those callsites
+// one-line on both platforms.
+#ifdef _WIN32
+#  include <direct.h>   // _mkdir
+#  include <io.h>       // _close
+#else
+#  include <sys/stat.h>
+#  include <unistd.h>
+#endif
+
+inline int bridge_mkdir(const char* path, int mode) {
+#ifdef _WIN32
+    (void) mode; return ::_mkdir(path);
+#else
+    return ::mkdir(path, static_cast<mode_t>(mode));
+#endif
+}
+inline int bridge_hardlink(const char* oldp, const char* newp) {
+#ifdef _WIN32
+    return ::CreateHardLinkA(newp, oldp, nullptr) ? 0 : -1;
+#else
+    return ::link(oldp, newp);
+#endif
+}
+inline int bridge_close_fd(int fd) {
+#ifdef _WIN32
+    return ::_close(fd);
+#else
+    return ::close(fd);
+#endif
+}

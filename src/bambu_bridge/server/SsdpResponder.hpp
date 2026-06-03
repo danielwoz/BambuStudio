@@ -62,10 +62,10 @@
 #include <thread>
 #include <vector>
 
-// Forward-declare the POSIX sockaddr_in via its system header — declaring
-// it ourselves inside a namespace would introduce a different type from
-// the one in <netinet/in.h>. The header is small and zero-cost.
-#include <netinet/in.h>
+// Pull in sockaddr_in via the platform socket header (winsock2 on Windows,
+// <netinet/in.h> on POSIX) — declaring it ourselves would introduce a
+// different type from the system one.
+#include "../platform/WinsockShim.hpp"
 
 namespace Slic3r {
 namespace bridge {
