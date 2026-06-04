@@ -206,8 +206,14 @@ int main(int argc, char** argv) {
                 std::string topic(reinterpret_cast<const char*>(body + 2), tl);
                 std::string payload(reinterpret_cast<const char*>(body + 2 + tl), rl - 2 - tl);
                 ++pub_count;
-                std::printf("[cli] <- PUBLISH %s len=%zu\n%.1200s\n",
-                            topic.c_str(), payload.size(), payload.c_str());
+                // Print the FULL payload (not truncated) so state-verifying
+                // greps (tray_color, dry_time, dry_setting) can see the
+                // whole `print.ams` section even when it lands deep in a
+                // 23 KB pushall report.
+                std::printf("[cli] <- PUBLISH %s len=%zu\n",
+                            topic.c_str(), payload.size());
+                std::fwrite(payload.data(), 1, payload.size(), stdout);
+                std::fputc('\n', stdout);
             }
             pos = i + rl;
         }

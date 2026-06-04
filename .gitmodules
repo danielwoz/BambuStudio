@@ -1,3 +1,6 @@
 [submodule "src/slic3r/Utils/bambu_virtual_client"]
 	path = src/slic3r/Utils/bambu_virtual_client
 	url = https://github.com/danielwoz/bambu-virtual-client.git
+[submodule "deps/minhook"]
+	path = deps/minhook
+	url = https://github.com/TsudaKageyu/minhook.git

@@ -27,6 +27,7 @@
 
 #include "slic3r/Utils/FileTransferUtils.hpp"
 #include "slic3r/Utils/CertificateVerify.hpp"
+#include "slic3r/Utils/PluginVerifyRedirect.hpp"
 
 // Portable file-op shims (bridge_mkdir / bridge_hardlink) for the
 // diagnostic snapshot/capture blocks below. Keeps ::mkdir(path,mode) and
@@ -593,6 +594,12 @@ std::string NetworkAgent::get_libpath_in_current_directory(std::string library_n
 
 int NetworkAgent::initialize_network_module(bool using_backup, bool validate_cert)
 {
+    // Bridge: satisfy the plugin's "signed studio" gate for our forked DLL by
+    // redirecting its Authenticode check of this DLL to the genuine official
+    // BambuStudio.dll. Opt-in via BAMBU_BRIDGE_SIGN_REDIRECT; must run before the
+    // plugin is loaded below. No-op when disabled / off Windows.
+    install_plugin_verify_redirect();
+
     //int ret = -1;
     std::string library;
     std::string data_dir_str = data_dir();

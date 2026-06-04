@@ -7,6 +7,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdarg>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -14,6 +16,22 @@
 
 
 namespace Slic3r {
+
+// File-based diagnostic sink (GUI app has no usable stderr — see
+// BridgeBootstrap.cpp gui_diag). Appends to $BAMBU_BRIDGE_GUI_LOG when set.
+static void adapter_diag(const char* fmt, ...) {
+    const char* path = std::getenv("BAMBU_BRIDGE_GUI_LOG");
+    if (!path || !*path) return;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    FILE* f = std::fopen(path, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(f, fmt, ap);
+    va_end(ap);
+    std::fclose(f);
+}
 
 void NetworkAgentPluginAdapter::set_dispatcher_inputs_resolver(
         DispatcherInputsResolver r) {
@@ -211,11 +229,43 @@ int NetworkAgentPluginAdapter::unsubscribe_device(const std::string& dev_id) {
 
 int NetworkAgentPluginAdapter::publish_to_device(
         const std::string& dev_id, const std::string& json_payload, int qos) {
-    if (!m_agent) return -1;
+    if (!m_agent) {
+        std::fprintf(stderr,
+            "[adapter] publish_to_device dev=%s NO AGENT\n", dev_id.c_str());
+        std::fflush(stderr);
+        return -1;
+    }
     // NetworkAgent::send_message hits the plugin's cloud `send_message`
     // export (bambu_network_send_message). `flag` is reserved upstream;
     // pass 0 to match what GUI_App's own publishers do.
-    return m_agent->send_message(dev_id, json_payload, qos, 0);
+    int rc = m_agent->send_message(dev_id, json_payload, qos, 0);
+    // Control writes (print.command=*) need the plugin's enc_msg gate open
+    // for this dev_id; if it returns 0 but firmware still drops the write,
+    // try the LAN send_message_to_printer path too (which the plugin signs
+    // when a connect_printer session is live). Log both rcs to the file
+    // sink so the control path is observable in the invisible GUI.
+    bool is_control = json_payload.find("\"command\"") != std::string::npos
+                      && json_payload.find("\"print\"") != std::string::npos;
+    int rc_lan = -999;
+    if (is_control) {
+        rc_lan = m_agent->send_message_to_printer(dev_id, json_payload, qos, 0);
+    }
+    adapter_diag(
+        "[publish_to_device] dev=%s qos=%d bytes=%zu rc_cloud=%d rc_lan=%d "
+        "control=%d login=%d server=%d head=%.90s\n",
+        dev_id.c_str(), qos, json_payload.size(), rc, rc_lan, int(is_control),
+        int(m_agent->is_user_login()), int(m_agent->is_server_connected()),
+        json_payload.c_str());
+    std::fprintf(stderr,
+        "[adapter] publish_to_device(CLOUD send_message) dev=%s qos=%d "
+        "bytes=%zu rc=%d login=%d server=%d payload_head=%.80s\n",
+        dev_id.c_str(), qos, json_payload.size(), rc,
+        int(m_agent->is_user_login()), int(m_agent->is_server_connected()),
+        json_payload.c_str());
+    std::fflush(stderr);
+    // Prefer a successful LAN signed send for control writes.
+    if (is_control && rc_lan == 0) return 0;
+    return rc;
 }
 
 int NetworkAgentPluginAdapter::upload_gcode_to_sdcard(

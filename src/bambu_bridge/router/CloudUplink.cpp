@@ -260,11 +260,23 @@ void CloudUplink::on_publish(const std::string& dev_id, std::string topic,
         have_device = m_impl->devices.count(dev_id) > 0;
         h = m_impl->handle;
     }
-    if (!h || !have_device) return;
+    if (!h || !have_device) {
+        std::fprintf(stderr,
+            "[cloud-uplink] on_publish DROP dev=%s handle=%d have_device=%d "
+            "bytes=%zu\n",
+            dev_id.c_str(), int(bool(h)), int(have_device), payload.size());
+        std::fflush(stderr);
+        return;
+    }
     // The slicer's payload is raw JSON (phase 4 confirmed). The plugin
     // wraps it in whatever cloud envelope it needs.
     std::string json(payload.begin(), payload.end());
-    h->publish_to_device(dev_id, json, static_cast<int>(qos));
+    int rc = h->publish_to_device(dev_id, json, static_cast<int>(qos));
+    std::fprintf(stderr,
+        "[cloud-uplink] on_publish dev=%s bytes=%zu qos=%u "
+        "publish_to_device rc=%d\n",
+        dev_id.c_str(), payload.size(), unsigned(qos), rc);
+    std::fflush(stderr);
 }
 
 void CloudUplink::on_unsubscribe(const std::string& dev_id, std::string topic) {

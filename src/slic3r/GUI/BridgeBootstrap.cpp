@@ -38,8 +38,10 @@
 #include <wx/window.h>
 
 #include <boost/log/trivial.hpp>
+#include <boost/algorithm/string/predicate.hpp> // boost::algorithm::starts_with
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -58,6 +60,7 @@
 #include <dirent.h> // /proc/self/task thread-count probe (Linux only)
 #endif
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -180,6 +183,26 @@ bool is_invisible_gui()
 namespace {
 std::mutex                                                       g_inbound_mu;
 std::map<std::string, std::chrono::steady_clock::time_point>     g_inbound_at;
+
+// File-based diagnostic sink for the invisible-GUI bridge. The GUI is a
+// WIN32-subsystem app with no console, so the [bridge-gui] stderr fprintfs
+// are lost (redirecting the parent's stderr does NOT reach a GUI app's CRT
+// stderr). When BAMBU_BRIDGE_GUI_LOG is set we append the same diagnostics
+// to that file so the cert-handshake / control-path can be observed.
+void gui_diag(const char* fmt, ...)
+{
+    const char* path = std::getenv("BAMBU_BRIDGE_GUI_LOG");
+    if (!path || !*path) return;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    FILE* f = std::fopen(path, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(f, fmt, ap);
+    va_end(ap);
+    std::fclose(f);
+}
 
 void note_inbound(const std::string& dev_id)
 {
@@ -436,9 +459,57 @@ bool run_headless(GUI_App* app)
                     "REST) body_len=%zu\n", body.size());
                 std::fflush(stderr);
             }
-            // NOTE: parse_user_print_info crashes the bridge child with
-            // SIGSEGV — it dives into GUI code that expects parts of
-            // GUI_App we haven't initialised. Skipping.
+            // Populate DeviceManager with REAL MachineObjects from the
+            // cloud device-list. This is the key to making CONTROL commands
+            // take effect: the proprietary plugin's cloud send_message only
+            // accepts publishes that ride the plugin's natural,
+            // MachineObject-driven state machine (synthesised raw publishes
+            // get rc=-2 / are dropped by firmware unsigned). With real
+            // MachineObjects present + selected, the natural
+            // set_on_printer_connected_fn handshake runs against a live obj,
+            // the plugin's enc_msg gate opens, and print.* control publishes
+            // get signed + applied.
+            //
+            // Historically this call SIGSEGV'd in --bridge-only mode because
+            // it dove into GUI state (preset_bundle / sidebar) we hadn't
+            // initialised. We now call it on the wx main thread (the only
+            // thread allowed to mutate DeviceManager) and guard the
+            // GUI-touching bits (see DeviceManager::parse_user_print_info —
+            // app_config is live; _parse_printer_type / get_all_subseries
+            // tolerate empty preset data and just yield a best-effort model
+            // string). Gated default-ON; set BAMBU_BRIDGE_NO_DEVLIST_PARSE=1
+            // to fall back to the old skip-and-synthesise behaviour.
+            {
+                const char* skip = std::getenv("BAMBU_BRIDGE_NO_DEVLIST_PARSE");
+                const bool do_parse = !(skip && *skip && *skip != '0')
+                                      && !body.empty();
+                if (do_parse) {
+                    std::string body_copy = body;
+                    app->CallAfter([app, body_copy = std::move(body_copy)]() mutable {
+                        if (app->is_closing() || !app->m_device_manager) return;
+                        try {
+                            app->m_device_manager->parse_user_print_info(body_copy);
+                            auto n = app->m_device_manager
+                                         ->get_user_machinelist().size();
+                            std::fprintf(stderr,
+                                "[bridge] parse_user_print_info OK — "
+                                "userMachineList size=%zu\n", n);
+                            std::fflush(stderr);
+                        } catch (const std::exception& ex) {
+                            std::fprintf(stderr,
+                                "[bridge] parse_user_print_info threw: %s\n",
+                                ex.what());
+                            std::fflush(stderr);
+                        }
+                    });
+                } else {
+                    std::fprintf(stderr,
+                        "[bridge] device-list parse skipped "
+                        "(NO_DEVLIST_PARSE=%s body_empty=%d)\n",
+                        skip ? skip : "0", int(body.empty()));
+                    std::fflush(stderr);
+                }
+            }
             // Poll is_server_connected for up to 20s.
             bool server_ok = false;
             for (int i = 0; i < 40; ++i) {
@@ -542,6 +613,98 @@ bool run_headless(GUI_App* app)
                             "install_device_cert; waiting 5s for cert_report\n",
                             round, d.c_str(), sel_rc2);
                         std::fflush(stderr);
+
+                        // ── Device-connect handshake (GUI parity) ──
+                        //
+                        // The bare install_device_cert above is NOT what opens
+                        // the plugin's enc_msg gate on its own. The GUI's
+                        // set_on_printer_connected_fn (GUI_App.cpp:2154-2160)
+                        // runs a MachineObject handshake immediately
+                        // before/with install_device_cert:
+                        //   command_request_push_all(true)  → pushing.pushall
+                        //   command_get_version()           → info.get_version
+                        //   erase_user_access_code()        → (local only)
+                        //   command_get_access_code()       → system.get_access_code
+                        // Each of those is just `m_agent->send_message(dev_id,
+                        // <json>, qos, flag)` (MachineObject::cloud_publish_json,
+                        // DeviceManager.cpp:2357). The get_version + the
+                        // surrounding push/access-code requests are what prompt
+                        // the printer's cert_report reply, which the plugin
+                        // parses to populate device_pub_key_map[dev_id]; that is
+                        // what makes subsequent print.* control publishes get
+                        // signed and applied by firmware.
+                        //
+                        // We CANNOT route this through a MachineObject here:
+                        // in --bridge-only mode DeviceManager's userMachineList
+                        // is EMPTY (parse_user_print_info is skipped because it
+                        // SIGSEGVs against the partially-initialised GUI_App,
+                        // see the device-list note above), so get_my_machine /
+                        // get_user_machinelist return nothing. Publish the same
+                        // JSON the command_* methods build straight through the
+                        // agent — identical bytes on the wire, no MachineObject
+                        // dependency. Runs on this bringup thread (send_message
+                        // is thread-safe in the plugin; the bridge's own
+                        // gate-cycle install_device_cert calls already run here).
+                        // Prefer the real MachineObject handshake (GUI-
+                        // identical) — that is the path the plugin's state
+                        // machine trusts. It must run on the wx main thread.
+                        // If DeviceManager has no MachineObject for this dev
+                        // (parse skipped/failed), fall back to publishing the
+                        // same JSON straight through the agent.
+                        app->CallAfter([app, ag, d, round] {
+                            if (app->is_closing() || !app->m_device_manager)
+                                return;
+                            MachineObject* obj =
+                                app->m_device_manager->get_my_machine(d);
+                            if (!obj) {
+                                auto ul = app->m_device_manager
+                                              ->get_user_machinelist();
+                                auto it = ul.find(d);
+                                if (it != ul.end()) obj = it->second;
+                            }
+                            if (obj) {
+                                obj->command_request_push_all(true);
+                                obj->command_get_version();
+                                obj->erase_user_access_code();
+                                obj->command_get_access_code();
+                                if (app->m_agent)
+                                    app->m_agent->install_device_cert(
+                                        obj->get_dev_id(),
+                                        obj->is_lan_mode_printer());
+                                std::fprintf(stderr,
+                                    "[bridge] (gate-cycle r%d) dev=%s "
+                                    "MachineObject handshake done lan_mode=%d\n",
+                                    round, obj->get_dev_id().c_str(),
+                                    int(obj->is_lan_mode_printer()));
+                                std::fflush(stderr);
+                                return;
+                            }
+                            // Fallback: direct agent publish (no MachineObject).
+                            static int s_seq = 9200;
+                            auto pub = [&](const char* tag,
+                                           const std::string& js) {
+                                int rc = ag->send_message(d, js, 1, 0);
+                                std::fprintf(stderr,
+                                    "[bridge] (gate-cycle r%d) dev=%s "
+                                    "handshake(direct) %s rc=%d\n",
+                                    round, d.c_str(), tag, rc);
+                                std::fflush(stderr);
+                            };
+                            pub("pushall",
+                                std::string("{\"pushing\":{\"sequence_id\":\"")
+                                + std::to_string(s_seq++)
+                                + "\",\"command\":\"pushall\","
+                                "\"version\":1,\"push_target\":1}}");
+                            pub("get_version",
+                                std::string("{\"info\":{\"sequence_id\":\"")
+                                + std::to_string(s_seq++)
+                                + "\",\"command\":\"get_version\"}}");
+                            pub("get_access_code",
+                                std::string("{\"system\":{\"sequence_id\":\"")
+                                + std::to_string(s_seq++)
+                                + "\",\"command\":\"get_access_code\"}}");
+                        });
+
                         std::this_thread::sleep_for(5s);
                     }
                 }
@@ -756,11 +919,22 @@ bool run_headless(GUI_App* app)
             if (!app->m_device_manager) return;
             if (!app->m_agent || !app->m_agent->is_user_login()) return;
             std::vector<Slic3r::bridge::headless::VirtualPrinter> snap;
+            // Scope to this child's owned dev_id(s). Before parse_user_print_info
+            // populated DeviceManager, user_machinelist was empty and this loop
+            // never ran; now it holds ALL of the user's cloud printers. Each
+            // --bridge-only child owns exactly one printer (--only-dev-id), so
+            // advertising the siblings here would make this child LAN-connect /
+            // mirror printers another child already owns (port + cert thrash).
+            // Filter to g_bridge_only_cfg.only_dev_ids when set.
+            const auto& owned = g_bridge_only_cfg.only_dev_ids;
             for (const auto& kv : app->m_device_manager->get_user_machinelist()) {
                 MachineObject* mo = kv.second;
                 if (!mo) continue;
                 std::string id = mo->get_dev_id();
                 if (id.empty()) continue;
+                if (!owned.empty()
+                    && std::find(owned.begin(), owned.end(), id) == owned.end())
+                    continue;
                 Slic3r::bridge::headless::VirtualPrinter p;
                 p.dev_id      = std::move(id);
                 p.dev_name    = mo->get_dev_name();
@@ -1414,13 +1588,37 @@ void install_gui_worker(GUI_App* app)
                             app->m_device_manager->parse_user_print_info(body_copy);
                             app->m_device_manager->load_last_machine();
                             auto* sel = app->m_device_manager->get_selected_machine();
-                            if (sel && app->m_agent) {
-                                std::vector<std::string> subs{ sel->get_dev_id() };
-                                int sub_rc = app->m_agent->add_subscribe(subs);
-                                std::fprintf(stderr,
-                                    "[bridge-refresh] add_subscribe(%s) rc=%d\n",
-                                    sel->get_dev_id().c_str(), sub_rc);
-                                std::fflush(stderr);
+                            // Re-assert the FULL subscribe set (selected machine
+                            // plus every owned dev_id), not just the selected
+                            // one — otherwise the periodic refresh would narrow
+                            // the cloud subscription back to a single printer and
+                            // drop the sibling printers' report streams.
+                            if (app->m_agent && app->m_device_manager) {
+                                app->m_agent->enable_multi_machine(true);
+                                app->m_device_manager->EnableMultiMachine(true);
+                                const auto& owned =
+                                    Slic3r::GUI::g_bridge_only_cfg.only_dev_ids;
+                                std::vector<std::string> subs;
+                                for (const auto& kv :
+                                     app->m_device_manager->get_user_machinelist()) {
+                                    const std::string& id = kv.first;
+                                    if (id.empty()) continue;
+                                    if (!owned.empty() &&
+                                        std::find(owned.begin(), owned.end(), id)
+                                            == owned.end())
+                                        continue;
+                                    subs.push_back(id);
+                                }
+                                if (subs.empty() && sel)
+                                    subs.push_back(sel->get_dev_id());
+                                if (!subs.empty()) {
+                                    app->m_device_manager->subscribe_device_list(subs);
+                                    int sub_rc = app->m_agent->add_subscribe(subs);
+                                    std::fprintf(stderr,
+                                        "[bridge-refresh] multi-subscribe n=%zu "
+                                        "rc=%d\n", subs.size(), sub_rc);
+                                    std::fflush(stderr);
+                                }
                             }
                         } catch (const std::exception& ex) {
                             std::fprintf(stderr,
@@ -1652,28 +1850,255 @@ void install_gui_worker(GUI_App* app)
                                     "userMachineList.size=%zu\n",
                                     app->m_device_manager->get_user_machinelist().size());
                                 app->m_device_manager->load_last_machine();
+
+                                // --- Per-printer signing selection ----------
+                                // The proprietary plugin keys its enc_msg gate
+                                // + cert handshake off set_user_selected_machine
+                                // (BambuNetworkingPluginHandle.hpp:251): until
+                                // device_pub_key_map[dev_id] is populated via a
+                                // completed install_device_cert handshake for the
+                                // SELECTED machine, the gate refuses to sign
+                                // print.* and firmware drops the (unsigned)
+                                // control write — even though the cloud
+                                // send_message returns rc=0. Reports relay for
+                                // any *subscribed* dev_id, but CONTROL needs the
+                                // dev_id to be the selected machine.
+                                //
+                                // load_last_machine picks the GUI's pinned /
+                                // first machine (A1), which has no standard AMS
+                                // and can't be the control probe. Let an operator
+                                // override the selected printer by dev_id suffix
+                                // (BAMBU_BRIDGE_SELECT_SUFFIX, e.g. BC582502312
+                                // for H2S) so the full select + cert handshake
+                                // runs against the printer we actually want to
+                                // drive. Suffix-match is robust to the FFFF /
+                                // crosstalk dev_id prefix differences.
+                                if (const char* sfx =
+                                        std::getenv("BAMBU_BRIDGE_SELECT_SUFFIX");
+                                    sfx && *sfx && app->m_device_manager) {
+                                    std::string suffix = sfx;
+                                    std::string match;
+                                    for (const auto& kv :
+                                         app->m_device_manager->get_user_machinelist()) {
+                                        const std::string& id = kv.first;
+                                        if (id.size() >= suffix.size() &&
+                                            id.compare(id.size() - suffix.size(),
+                                                       suffix.size(), suffix) == 0) {
+                                            match = id;
+                                            break;
+                                        }
+                                    }
+                                    if (!match.empty()) {
+                                        app->m_device_manager->set_selected_machine(match);
+                                        std::fprintf(stderr,
+                                            "[bridge-gui] PROBE SELECT_SUFFIX=%s "
+                                            "-> set_selected_machine(%s)\n",
+                                            suffix.c_str(), match.c_str());
+                                    } else {
+                                        std::fprintf(stderr,
+                                            "[bridge-gui] PROBE SELECT_SUFFIX=%s "
+                                            "matched no dev_id\n", suffix.c_str());
+                                    }
+                                    std::fflush(stderr);
+                                }
+
                                 auto* sel = app->m_device_manager->get_selected_machine();
                                 std::fprintf(stderr,
                                     "[bridge-gui] PROBE load_last_machine fired; "
                                     "selected=%s\n",
                                     sel ? sel->get_dev_id().c_str() : "<none>");
+
+                                // Drive the per-device cert handshake for the
+                                // selected printer so the plugin's enc_msg gate
+                                // opens and print.* control writes get signed.
+                                // Mirrors GUI_App::set_on_printer_connected_fn
+                                // (GUI_App.cpp:2155-2160): push_all + get_version
+                                // + get_access_code + install_device_cert, and
+                                // the run_headless gate-open cycle above (this
+                                // file ~line 585): a SINGLE install_device_cert
+                                // is timing-flaky (~1/3 races on H2S) because the
+                                // gate only opens once the printer's cert_report
+                                // reply lands and the plugin parses it into
+                                // device_pub_key_map[dev_id]. Loop 3 rounds × 5s,
+                                // re-asserting set_user_selected_machine +
+                                // install_device_cert + the MachineObject
+                                // handshake each round, exactly as the stock GUI
+                                // and the headless cascade do, so the cert_report
+                                // round-trip has time to complete and the gate
+                                // opens reliably. Runs on a detached thread that
+                                // re-dispatches the per-round work onto the wx
+                                // main thread (the only thread allowed to touch
+                                // MachineObject / DeviceManager).
+                                if (sel && app->m_agent) {
+                                    const std::string sel_dev = sel->get_dev_id();
+                                    std::thread([app, sel_dev]{
+                                        using namespace std::chrono_literals;
+
+                                        // STEP 1: establish a LIVE LAN session
+                                        // to the printer. install_device_cert
+                                        // only populates device_pub_key_map (and
+                                        // thus opens the enc_msg signing gate) if
+                                        // the cert_request rides a live LAN socket
+                                        // (BambuNetworkingPluginHandle.hpp:260).
+                                        // A cloud-relayed printer has no LAN
+                                        // session by default, so we connect_printer
+                                        // first. dev_ip is often empty for a cloud
+                                        // printer (cloud device list omits the LAN
+                                        // IP); allow an explicit override.
+                                        app->CallAfter([app, sel_dev]{
+                                            if (app->is_closing() ||
+                                                !app->m_device_manager || !app->m_agent)
+                                                return;
+                                            MachineObject* obj =
+                                                app->m_device_manager->get_my_machine(sel_dev);
+                                            if (!obj) return;
+                                            app->m_agent->set_user_selected_machine(sel_dev);
+                                            if (obj->get_dev_ip().empty()) {
+                                                if (const char* fip = std::getenv(
+                                                        "BAMBU_BRIDGE_SELECT_IP");
+                                                    fip && *fip)
+                                                    obj->set_dev_ip(fip);
+                                            }
+                                            int conn_rc =
+                                                obj->connect(obj->local_use_ssl_for_mqtt);
+                                            gui_diag(
+                                                "[gate connect] dev=%s ip=%s ac=%s "
+                                                "ssl=%d rc=%d login=%d server=%d\n",
+                                                obj->get_dev_id().c_str(),
+                                                obj->get_dev_ip().c_str(),
+                                                obj->get_access_code().c_str(),
+                                                int(obj->local_use_ssl_for_mqtt),
+                                                conn_rc,
+                                                int(app->m_agent->is_user_login()),
+                                                int(app->m_agent->is_server_connected()));
+                                        });
+
+                                        // STEP 2: give the plugin's LAN MQTT
+                                        // session time to come up + the printer's
+                                        // first push to land (set_on_local_connect
+                                        // _fn fires after the SUBACK). The headless
+                                        // cascade waits 15s here; mirror that.
+                                        std::this_thread::sleep_for(15s);
+
+                                        // STEP 3: now that the LAN socket is live,
+                                        // run the cert handshake rounds. A single
+                                        // install_device_cert is timing-flaky
+                                        // (~1/3 races on H2S); loop 4 rounds × 5s,
+                                        // re-asserting the MachineObject handshake
+                                        // (push_all/get_version/get_access_code)
+                                        // that prompts the printer's cert_report
+                                        // reply the plugin parses into
+                                        // device_pub_key_map[dev_id].
+                                        for (int round = 0; round < 4; ++round) {
+                                            app->CallAfter([app, sel_dev, round]{
+                                                if (app->is_closing() ||
+                                                    !app->m_device_manager ||
+                                                    !app->m_agent)
+                                                    return;
+                                                MachineObject* obj =
+                                                    app->m_device_manager
+                                                        ->get_my_machine(sel_dev);
+                                                if (!obj) return;
+                                                app->m_agent
+                                                    ->set_user_selected_machine(sel_dev);
+                                                // Keep the LAN session warm in case
+                                                // it dropped between rounds.
+                                                if (obj->connection_type() != "lan")
+                                                    obj->connect(obj->local_use_ssl_for_mqtt);
+                                                obj->command_request_push_all(true);
+                                                obj->command_get_version();
+                                                obj->erase_user_access_code();
+                                                obj->command_get_access_code();
+                                                app->m_agent->install_device_cert(
+                                                    obj->get_dev_id(),
+                                                    obj->is_lan_mode_printer());
+                                                gui_diag(
+                                                    "[gate r%d] dev=%s handshake done "
+                                                    "connection_type=%s lan_mode=%d "
+                                                    "is_connected=%d\n",
+                                                    round, obj->get_dev_id().c_str(),
+                                                    obj->connection_type().c_str(),
+                                                    int(obj->is_lan_mode_printer()),
+                                                    int(obj->is_connected()));
+                                            });
+                                            std::this_thread::sleep_for(5s);
+                                        }
+                                    }).detach();
+                                }
                                 // GUI's set_on_server_connected_fn handler
                                 // explicitly calls subscribe_device_list /
                                 // add_subscribe in multi-machine mode; the
                                 // cascade we removed was doing the same thing
-                                // for single-machine bridge mode. Restore JUST
-                                // that one plugin call: add_subscribe for the
-                                // selected dev_id. set_user_selected_machine
-                                // alone isn't sufficient — the plugin needs
-                                // an explicit subscribe request for the cloud
-                                // broker to deliver SUBACK and fire
-                                // set_on_printer_connected_fn.
-                                if (sel && app->m_agent) {
-                                    std::vector<std::string> subs{ sel->get_dev_id() };
-                                    int sub_rc = app->m_agent->add_subscribe(subs);
-                                    std::fprintf(stderr,
-                                        "[bridge-gui] PROBE add_subscribe(%s) rc=%d\n",
-                                        sel->get_dev_id().c_str(), sub_rc);
+                                // for single-machine bridge mode.
+                                //
+                                // SINGLE-machine subscribe (just the selected
+                                // dev_id) is why only the GUI's auto-selected
+                                // printer (A1) ever relayed reports — the cloud
+                                // broker only delivered SUBACK for that one
+                                // dev_id, so set_on_printer_connected_fn fired
+                                // for A1 alone and only A1's reports + signed
+                                // control channel came up. H2S/H2D had their
+                                // bridge ports bound (via the 5s push pump) but
+                                // got zero report traffic.
+                                //
+                                // Fix: subscribe ALL of the user's cloud printers
+                                // (or, when the multi-process launcher scopes us
+                                // with --only-dev-id, just our owned set). This
+                                // is the exact multi-machine flow the stock GUI
+                                // runs via DeviceManager::subscribe_device_list:
+                                // the selected machine plus every listed dev_id.
+                                // The plugin then delivers SUBACK per dev_id and
+                                // fires set_on_printer_connected_fn for each, so
+                                // every printer's reports relay AND each gets its
+                                // command_request_push_all / install_device_cert
+                                // handshake (the per-device signing context that
+                                // makes print.* control writes take effect).
+                                if (app->m_agent && app->m_device_manager) {
+                                    // Enable multi-machine on the plugin so its
+                                    // cloud reactor multiplexes reports for more
+                                    // than one dev_id (single-machine mode tracks
+                                    // only the user-selected printer).
+                                    app->m_agent->enable_multi_machine(true);
+                                    app->m_device_manager->EnableMultiMachine(true);
+
+                                    const auto& owned =
+                                        Slic3r::GUI::g_bridge_only_cfg.only_dev_ids;
+                                    std::vector<std::string> subs;
+                                    for (const auto& kv :
+                                         app->m_device_manager->get_user_machinelist()) {
+                                        const std::string& id = kv.first;
+                                        if (id.empty()) continue;
+                                        if (!owned.empty() &&
+                                            std::find(owned.begin(), owned.end(), id)
+                                                == owned.end())
+                                            continue;
+                                        subs.push_back(id);
+                                    }
+                                    // Fall back to the selected machine if the
+                                    // list walk yielded nothing (e.g. owned set
+                                    // didn't match the parsed ids).
+                                    if (subs.empty() && sel)
+                                        subs.push_back(sel->get_dev_id());
+
+                                    if (!subs.empty()) {
+                                        // subscribe_device_list pins the selected
+                                        // machine first, then the rest — mirrors
+                                        // the GUI's multi-machine subscribe and
+                                        // keeps subscribe_list_cache coherent for
+                                        // the re-subscribe-on-reconnect path.
+                                        app->m_device_manager
+                                            ->subscribe_device_list(subs);
+                                        int sub_rc = app->m_agent->add_subscribe(subs);
+                                        std::string joined;
+                                        for (const auto& s : subs) {
+                                            if (!joined.empty()) joined += ',';
+                                            joined += s;
+                                        }
+                                        std::fprintf(stderr,
+                                            "[bridge-gui] PROBE multi-subscribe "
+                                            "n=%zu ids=[%s] add_subscribe rc=%d\n",
+                                            subs.size(), joined.c_str(), sub_rc);
+                                    }
                                 }
                                 std::fflush(stderr);
                             } catch (const std::exception& ex) {
@@ -1883,28 +2308,28 @@ void install_networking_callbacks(GUI_App* app)
         // Must run unconditionally (i.e. even during shutdown) so we
         // don't accidentally drop a probe-reply.
         note_inbound(dev_id);
-        if (app->is_closing()) return;
-        app->CallAfter([app, dev_id, msg] {
-            if (app->is_closing()) return;
-            if (!app->m_device_manager) return;
-            if (MachineObject* obj = app->m_device_manager->get_my_machine(dev_id)) {
-                obj->parse_json("cloud", msg);
-            }
-        });
+        // NB: we deliberately do NOT call obj->parse_json() here, even
+        // though DeviceManager now holds REAL MachineObjects (populated by
+        // parse_user_print_info so the device-connect handshake can run).
+        // MachineObject::parse_json dives into GUI-only state
+        // (preset_bundle / sidebar / fila-manager sync) that --bridge-only
+        // never initialises, and parsing a full status report into a real
+        // obj SIGSEGVs the child. The bridge does not need DeviceManager's
+        // parsed status: it forwards every inbound report verbatim to its
+        // MQTT subscribers via the uplink receiver path (LanUplink /
+        // CloudUplink receiver), and the push pump sources dev_ip /
+        // access_code / model from parse_user_print_info + SSDP, not from
+        // parse_json. So we keep the MachineObjects unparsed-but-present:
+        // enough for command_request_push_all / get_version /
+        // get_access_code / install_device_cert (which only publish), and
+        // safe headless.
     });
 
     // Same idea for LAN push_status (real LAN printers, plus cloud
-    // local-tunnelled). Bridge tap wraps this too.
+    // local-tunnelled). Bridge tap wraps this too. Same parse_json caveat
+    // as the cloud branch above — record liveness only.
     app->m_agent->set_on_local_message_fn([app](std::string dev_id, std::string msg) {
         note_inbound(dev_id); // see cloud branch above
-        if (app->is_closing()) return;
-        app->CallAfter([app, dev_id, msg] {
-            if (app->is_closing()) return;
-            if (!app->m_device_manager) return;
-            if (MachineObject* obj = app->m_device_manager->get_my_machine(dev_id)) {
-                obj->parse_json("lan", msg);
-            }
-        });
     });
 
     // The agent uses this to hop work back to the wx main thread
@@ -1912,6 +2337,114 @@ void install_networking_callbacks(GUI_App* app)
     app->m_agent->set_queue_on_main_fn([app](std::function<void()> callback) {
         app->CallAfter(callback);
     });
+
+    // ── set_on_printer_connected_fn — the real "device-tab click" ──
+    //
+    // This is the gap that made CONTROL commands (ams_filament_setting,
+    // ams_filament_drying, ams_control, …) relay without error yet get
+    // IGNORED by the printer while STATUS reads kept working.
+    //
+    // In the full GUI this callback fires when the plugin's cloud/LAN
+    // subscribe for an owned dev_id completes (GUI_App.cpp:2130-2162). It
+    // runs the per-printer handshake that opens the plugin's enc_msg gate
+    // — command_request_push_all(true) / command_get_version() /
+    // erase_user_access_code() / command_get_access_code() /
+    // install_device_cert(). Without that handshake the plugin's
+    // device_pub_key_map[dev_id] stays empty and every print.* publish
+    // (send_message cloud / send_message_to_printer LAN) is dropped
+    // unsigned — exactly the "writes ignored, reads fine" symptom.
+    //
+    // The bridge-only path returns from on_init_inner before
+    // GUI_App::init_networking_callbacks runs, so this callback was NEVER
+    // registered. run_headless' manual gate-cycle calls install_device_cert
+    // bare, WITHOUT the preceding MachineObject handshake — which is why
+    // the gate stayed shut. Register it here, mirroring the GUI body but
+    // with no plater/sidebar/dialog work (none of which exists headless).
+    app->m_agent->set_on_printer_connected_fn([app](std::string dev_id) {
+        std::fprintf(stderr,
+            "[bridge-callback] set_on_printer_connected_fn FIRED dev=%s\n",
+            dev_id.c_str());
+        std::fflush(stderr);
+        if (app->is_closing()) return;
+        app->CallAfter([app, dev_id] {
+            if (app->is_closing()) return;
+            if (!app->m_device_manager) return;
+            bool tunnel = boost::algorithm::starts_with(dev_id, "tunnel/");
+            std::string real = tunnel ? dev_id.substr(7) : dev_id;
+            MachineObject* obj = app->m_device_manager->get_my_machine(real);
+            if (!obj) {
+                auto ulist = app->m_device_manager->get_user_machinelist();
+                auto it = ulist.find(real);
+                if (it != ulist.end()) obj = it->second;
+            }
+            std::fprintf(stderr,
+                "[bridge-callback] on_printer_connected callafter dev=%s "
+                "tunnel=%d obj=%p\n",
+                dev_id.c_str(), int(tunnel), (void*)obj);
+            std::fflush(stderr);
+            if (!obj) return;
+            // Mirror GUI_App.cpp:2154-2160 exactly. This is the handshake
+            // that opens the plugin's enc_msg gate so subsequent control
+            // publishes are signed + applied by firmware.
+            obj->is_tunnel_mqtt = tunnel;
+            obj->command_request_push_all(true);
+            obj->command_get_version();
+            obj->erase_user_access_code();
+            obj->command_get_access_code();
+            if (app->m_agent) {
+                app->m_agent->install_device_cert(
+                    obj->get_dev_id(), obj->is_lan_mode_printer());
+                std::fprintf(stderr,
+                    "[bridge-callback] handshake complete dev=%s "
+                    "(push_all+get_version+get_access_code+"
+                    "install_device_cert lan_only=%d)\n",
+                    obj->get_dev_id().c_str(),
+                    int(obj->is_lan_mode_printer()));
+                std::fflush(stderr);
+            }
+        });
+    });
+
+    // ── set_on_local_connect_fn — the LAN-session equivalent ──
+    //
+    // Fires when the plugin's LAN connect_printer for an owned dev_id
+    // succeeds/fails (GUI_App.cpp:2178-2247). For LAN-mode printers the
+    // OK branch runs command_request_push_all(true) + command_get_version()
+    // — the LAN handshake that primes the printer's report stream and (in
+    // concert with the cert install) the LAN enc_msg gate. We mirror only
+    // the success path's handshake; all the dialog / select-machine event
+    // plumbing is GUI-only and irrelevant headless.
+    app->m_agent->set_on_local_connect_fn(
+        [app](int state, std::string dev_id, std::string msg) {
+            std::fprintf(stderr,
+                "[bridge-callback] set_on_local_connect_fn FIRED dev=%s "
+                "state=%d msg=%s\n",
+                dev_id.c_str(), state, msg.c_str());
+            std::fflush(stderr);
+            if (app->is_closing()) return;
+            app->CallAfter([app, state, dev_id] {
+                if (app->is_closing()) return;
+                if (!app->m_device_manager) return;
+                if (state != BBL::ConnectStatusOk) return;
+                MachineObject* obj = app->m_device_manager->get_my_machine(dev_id);
+                if (!obj) {
+                    auto ulist = app->m_device_manager->get_user_machinelist();
+                    auto it = ulist.find(dev_id);
+                    if (it != ulist.end()) obj = it->second;
+                }
+                if (!obj) return;
+                obj->command_request_push_all(true);
+                obj->command_get_version();
+                if (app->m_agent) {
+                    app->m_agent->install_device_cert(
+                        obj->get_dev_id(), obj->is_lan_mode_printer());
+                }
+                std::fprintf(stderr,
+                    "[bridge-callback] local_connect handshake complete "
+                    "dev=%s\n", obj->get_dev_id().c_str());
+                std::fflush(stderr);
+            });
+        });
 
     BOOST_LOG_TRIVIAL(info)
         << "install_networking_callbacks: exit (bridge-only)";
