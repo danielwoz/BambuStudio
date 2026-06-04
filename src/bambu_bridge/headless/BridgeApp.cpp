@@ -231,6 +231,13 @@ static std::string mangle_serial(const std::string& real_sn) {
 static std::string default_port_map_path() {
     if (const char* p = std::getenv("BAMBU_BRIDGE_PORT_MAP_FILE"); p && *p)
         return p;
+#ifdef _WIN32
+    // POSIX HOME/XDG aren't set on Windows; the old "/tmp" fallback wrote
+    // to a junk path and the save's rename failed (errno 17). Use the
+    // per-user runtime root (%LOCALAPPDATA%\BambuBridge).
+    return (platform::bridge_runtime_root() / "bambu-bridge" / "port-map")
+        .string();
+#else
     std::string base;
     if (const char* x = std::getenv("XDG_CONFIG_HOME"); x && *x) {
         base = x;
@@ -240,6 +247,7 @@ static std::string default_port_map_path() {
         base = "/tmp"; // last-ditch fallback
     }
     return base + "/bambu-bridge/port-map";
+#endif
 }
 
 // Best-effort load; missing or unreadable file => empty result, no error.
@@ -290,10 +298,15 @@ static bool save_port_map(const std::string& path,
         out << "# bambu-bridge port-map (dev_id offset) — managed automatically\n";
         for (const auto& kv : m) out << kv.first << ' ' << kv.second << '\n';
     }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    // std::filesystem::rename REPLACES an existing target on both POSIX and
+    // Windows (C's ::rename fails with EEXIST on Windows when the target
+    // exists — that was the errno=17 port-map-save failure).
+    std::error_code _ec;
+    std::filesystem::rename(tmp, path, _ec);
+    if (_ec) {
         std::fprintf(stderr,
-            "[bridge-app] port-map save FAILED: rename %s -> %s errno=%d\n",
-            tmp.c_str(), path.c_str(), errno);
+            "[bridge-app] port-map save FAILED: rename %s -> %s : %s\n",
+            tmp.c_str(), path.c_str(), _ec.message().c_str());
         return false;
     }
     return true;
