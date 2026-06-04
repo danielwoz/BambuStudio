@@ -530,6 +530,20 @@ bool BridgeApp::initialise() {
         m_session_router->set_lan_uplink(m_lan_uplink);
         m_session_router->set_cloud_uplink(m_cloud_uplink);
         m_session_router->set_health_monitor(m_health);
+        {
+            // Command (MQTT publish) route. SessionRouter's lan_ok only
+            // checks the LAN uplink EXISTS, not that it can publish — and
+            // the plugin's LAN send_message_to_printer returns -4 in this
+            // setup (no live LAN publish channel despite connect_printer ok),
+            // so the default prefer_lan=true silently drops every command.
+            // The cloud path (publish_to_device -> send_message) works once
+            // server_connected. Default to cloud; BAMBU_BRIDGE_PREFER_LAN=1
+            // forces LAN.
+            router::SessionRouter::Policy pol;
+            const char* e = std::getenv("BAMBU_BRIDGE_PREFER_LAN");
+            pol.prefer_lan = (e && *e && *e != '0');
+            m_session_router->set_policy(pol);
+        }
 
         m_upload_router = std::make_shared<router::UploadSinkRouter>();
         m_upload_router->set_lan_sink(m_lan_sink);

@@ -696,11 +696,19 @@ void session_io_loop(MqttBroker::Device* dev,
     // device record has an empty access_code we treat it as an
     // accept-all-passwords dev (handy for tests; not for production).
     const std::string supplied_pass(con.password.begin(), con.password.end());
+    // Test/debug bypass: BAMBU_BRIDGE_SKIP_AUTH=1 accepts any password so a
+    // probe client (e.g. bridge_test_cli) can connect without the printer's
+    // real access code. Off by default; never set in production.
+    static const bool skip_auth = []{
+        const char* e = std::getenv("BAMBU_BRIDGE_SKIP_AUTH");
+        return e && *e && std::strcmp(e, "0") != 0;
+    }();
     const bool auth_ok =
-        con.has_username && con.has_password &&
-        con.username == "bblp" &&
-        (dev->spec.access_code.empty() ||
-         secure_streq(supplied_pass, dev->spec.access_code));
+        skip_auth ||
+        (con.has_username && con.has_password &&
+         con.username == "bblp" &&
+         (dev->spec.access_code.empty() ||
+          secure_streq(supplied_pass, dev->spec.access_code)));
     if (!auth_ok) {
         std::fprintf(stderr,
             "[mqtt-broker] CONNECT auth fail dev_id=%s client_id=%s user='%s' pass_len=%zu expected_len=%zu\n",

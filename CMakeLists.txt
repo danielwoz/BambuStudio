@@ -804,6 +804,8 @@ if (BAMBU_BRIDGE)
     # (tests/bridge/) still uses Linux-only shim machinery, so it remains
     # gated off on Windows.
     add_subdirectory(src/bambu_bridge)
+    # Minimal MQTT-over-TLS probe (OpenSSL + Winsock only; no slicer deps).
+    add_subdirectory(src/bridge_test_cli)
     if (NOT WIN32)
         add_subdirectory(tests/bridge)
     endif ()
