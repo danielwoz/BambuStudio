@@ -176,6 +176,11 @@ int main(int argc, char** argv) {
                 sn.c_str(), req_json.size(), req_json.c_str());
 
     // Read inbound for idle_s seconds, decode PUBLISH frames.
+    // If the request was a filament/AMS setting change, watch the printer's
+    // gcode_state so we can warn when a running print blocks it.
+    const bool is_filament_cmd =
+        req_json.find("ams_filament_setting") != std::string::npos;
+    std::string gcode_state;   // latest print state seen in reports
     bambu_set_recv_timeout_ms(fd, 1000);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(idle_s);
     std::vector<uint8_t> buf;
@@ -214,12 +219,52 @@ int main(int argc, char** argv) {
                             topic.c_str(), payload.size());
                 std::fwrite(payload.data(), 1, payload.size(), stdout);
                 std::fputc('\n', stdout);
+                // Track the printer's print state. A running/paused/preparing
+                // print makes the firmware REJECT ams_filament_setting.
+                {
+                    // Handle both compact ("gcode_state":"X") and pretty-printed
+                    // ("gcode_state": "X") report formats.
+                    static const char key[] = "\"gcode_state\"";
+                    size_t p = payload.find(key);
+                    if (p != std::string::npos) {
+                        p += sizeof(key) - 1;
+                        while (p < payload.size() &&
+                               (payload[p] == ':' || payload[p] == ' ' ||
+                                payload[p] == '\t' || payload[p] == '\n' || payload[p] == '\r'))
+                            ++p;
+                        if (p < payload.size() && payload[p] == '"') {
+                            ++p;
+                            size_t e = payload.find('"', p);
+                            if (e != std::string::npos) gcode_state = payload.substr(p, e - p);
+                        }
+                    }
+                }
             }
             pos = i + rl;
         }
         buf.erase(buf.begin(), buf.begin() + pos);
     }
     std::printf("[cli] done. inbound PUBLISH frames=%d\n", pub_count);
+    if (is_filament_cmd) {
+        const bool printing =
+            gcode_state == "RUNNING" || gcode_state == "PAUSE" ||
+            gcode_state == "PREPARE" || gcode_state == "SLICING";
+        if (printing) {
+            std::printf(
+                "[cli] *** WARNING: printer gcode_state=%s — a print is in "
+                "progress. The firmware REJECTS ams_filament_setting / filament "
+                "colour changes while printing. The command was relayed and "
+                "signed, but it will NOT take effect until the print finishes "
+                "or is stopped. ***\n",
+                gcode_state.c_str());
+        } else if (!gcode_state.empty()) {
+            std::printf("[cli] printer gcode_state=%s (not printing) — a filament "
+                        "change should apply.\n", gcode_state.c_str());
+        } else {
+            std::printf("[cli] note: could not read gcode_state from the report; "
+                        "if the change doesn't apply, the printer may be busy.\n");
+        }
+    }
     SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); bambu_close_socket(fd);
     return pub_count > 0 ? 0 : 3;
 }
