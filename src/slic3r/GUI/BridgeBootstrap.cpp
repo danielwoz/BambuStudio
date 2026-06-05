@@ -1041,6 +1041,39 @@ void install_gui_worker(GUI_App* app)
         // legacy single-process mode allowed several); the GUI's
         // user_last_selected_machine slot only holds one. Pick the
         // first — that's the canonical printer for this child.
+        //
+        // Also populate g_bridge_only_cfg.only_dev_ids with the FULL
+        // list so the bridge serves ONLY these printers. In invisible-
+        // GUI mode only_dev_ids was never set (it only came from the
+        // old --bridge-only --only-dev-id CLI), so the owned-filter at
+        // parse_user_print_info / subscribe / snapshot was a no-op and
+        // the bridge exposed every cloud printer on the account.
+        // Sourcing it from TARGET_DEV here matches REMOVE-BRIDGE-ONLY-
+        // PLAN.md and gives a true single-printer bridge.
+        {
+            auto& owned = Slic3r::GUI::g_bridge_only_cfg.only_dev_ids;
+            owned.clear();
+            std::string list = td;
+            size_t start = 0;
+            while (start <= list.size()) {
+                size_t c = list.find(',', start);
+                std::string id = list.substr(
+                    start, c == std::string::npos ? std::string::npos
+                                                  : c - start);
+                // trim ASCII whitespace
+                while (!id.empty() && std::isspace((unsigned char) id.front()))
+                    id.erase(id.begin());
+                while (!id.empty() && std::isspace((unsigned char) id.back()))
+                    id.pop_back();
+                if (!id.empty()) owned.push_back(id);
+                if (c == std::string::npos) break;
+                start = c + 1;
+            }
+            std::fprintf(stderr,
+                "[bridge-gui] only_dev_ids set from BAMBU_BRIDGE_TARGET_DEV "
+                "(%zu printer(s)); bridge serves ONLY these\n", owned.size());
+            std::fflush(stderr);
+        }
         std::string val = td;
         const auto comma = val.find(',');
         if (comma != std::string::npos) val.resize(comma);
@@ -1952,23 +1985,17 @@ void install_gui_worker(GUI_App* app)
                                             MachineObject* obj =
                                                 app->m_device_manager->get_my_machine(sel_dev);
                                             if (!obj) return;
+                                            // Pin the selected machine so the plugin's
+                                            // cloud send_message accepts this dev_id.
+                                            // Do NOT obj->connect() — cert_report lands
+                                            // over the existing CLOUD session (see the
+                                            // round body + project_plugin_enc_gate).
                                             app->m_agent->set_user_selected_machine(sel_dev);
-                                            if (obj->get_dev_ip().empty()) {
-                                                if (const char* fip = std::getenv(
-                                                        "BAMBU_BRIDGE_SELECT_IP");
-                                                    fip && *fip)
-                                                    obj->set_dev_ip(fip);
-                                            }
-                                            int conn_rc =
-                                                obj->connect(obj->local_use_ssl_for_mqtt);
                                             gui_diag(
-                                                "[gate connect] dev=%s ip=%s ac=%s "
-                                                "ssl=%d rc=%d login=%d server=%d\n",
+                                                "[gate select] dev=%s ac=%s "
+                                                "login=%d server=%d\n",
                                                 obj->get_dev_id().c_str(),
-                                                obj->get_dev_ip().c_str(),
                                                 obj->get_access_code().c_str(),
-                                                int(obj->local_use_ssl_for_mqtt),
-                                                conn_rc,
                                                 int(app->m_agent->is_user_login()),
                                                 int(app->m_agent->is_server_connected()));
                                         });
@@ -2001,10 +2028,23 @@ void install_gui_worker(GUI_App* app)
                                                 if (!obj) return;
                                                 app->m_agent
                                                     ->set_user_selected_machine(sel_dev);
-                                                // Keep the LAN session warm in case
-                                                // it dropped between rounds.
-                                                if (obj->connection_type() != "lan")
-                                                    obj->connect(obj->local_use_ssl_for_mqtt);
+                                                // NB: deliberately NO obj->connect()
+                                                // here. The plugin holds exactly ONE
+                                                // global LAN connection; re-connecting
+                                                // each round churns/resets that state
+                                                // and drops the printer's cert_report
+                                                // before the plugin parses it into
+                                                // device_pub_key_map — which is why the
+                                                // gate never opened. The proven
+                                                // run_headless cascade NEVER connects;
+                                                // it lands cert_report over the existing
+                                                // CLOUD session (user-confirmed: the
+                                                // Linux bridge populates the map with
+                                                // connection_type=cloud, no LAN socket).
+                                                // The handshake below publishes over
+                                                // that cloud session (cloud_publish_json)
+                                                // which is what prompts cert_report.
+                                                // See project_plugin_enc_gate memory.
                                                 obj->command_request_push_all(true);
                                                 obj->command_get_version();
                                                 obj->erase_user_access_code();

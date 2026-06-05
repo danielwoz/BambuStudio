@@ -239,15 +239,24 @@ int NetworkAgentPluginAdapter::publish_to_device(
     // export (bambu_network_send_message). `flag` is reserved upstream;
     // pass 0 to match what GUI_App's own publishers do.
     int rc = m_agent->send_message(dev_id, json_payload, qos, 0);
-    // Control writes (print.command=*) need the plugin's enc_msg gate open
-    // for this dev_id; if it returns 0 but firmware still drops the write,
-    // try the LAN send_message_to_printer path too (which the plugin signs
-    // when a connect_printer session is live). Log both rcs to the file
-    // sink so the control path is observable in the invisible GUI.
     bool is_control = json_payload.find("\"command\"") != std::string::npos
                       && json_payload.find("\"print\"") != std::string::npos;
+    // CLOUD-FIRST for control writes. The bridge owns CLOUD-BOUND printers
+    // (lan_mode=0); such a printer verifies a control command against its
+    // CLOUD session. A LAN-routed control to a cloud-bound printer fails the
+    // printer's signature check — the report comes back
+    //   result:"failed" reason:"mqtt message verify failed".
+    // This was intermittent precisely because the old code PREFERRED LAN:
+    // it worked whenever the LAN session happened to be down (rc_lan!=0 →
+    // we returned the cloud rc) and broke the moment the LAN session came up
+    // (rc_lan==0 → we preferred the LAN route). Mirror the GUI path
+    // (send_message_to_printer / MachineObject::cloud_publish_json): prefer
+    // cloud, and only fall back to LAN for true LAN-only printers where the
+    // cloud route itself fails (rc!=0). See memory
+    // [[windows_bridge_command_route]] (prefer_lan=false) and
+    // [[project_plugin_enc_gate]].
     int rc_lan = -999;
-    if (is_control) {
+    if (is_control && rc != 0) {
         rc_lan = m_agent->send_message_to_printer(dev_id, json_payload, qos, 0);
     }
     adapter_diag(
@@ -257,13 +266,16 @@ int NetworkAgentPluginAdapter::publish_to_device(
         int(m_agent->is_user_login()), int(m_agent->is_server_connected()),
         json_payload.c_str());
     std::fprintf(stderr,
-        "[adapter] publish_to_device(CLOUD send_message) dev=%s qos=%d "
-        "bytes=%zu rc=%d login=%d server=%d payload_head=%.80s\n",
-        dev_id.c_str(), qos, json_payload.size(), rc,
+        "[adapter] publish_to_device(CLOUD-first) dev=%s qos=%d "
+        "bytes=%zu rc_cloud=%d rc_lan=%d control=%d login=%d server=%d "
+        "payload_head=%.80s\n",
+        dev_id.c_str(), qos, json_payload.size(), rc, rc_lan, int(is_control),
         int(m_agent->is_user_login()), int(m_agent->is_server_connected()),
         json_payload.c_str());
     std::fflush(stderr);
-    // Prefer a successful LAN signed send for control writes.
+    // Prefer the cloud route (correct for cloud-bound printers); LAN only as
+    // a fallback for LAN-only printers where cloud failed.
+    if (rc == 0) return 0;
     if (is_control && rc_lan == 0) return 0;
     return rc;
 }
