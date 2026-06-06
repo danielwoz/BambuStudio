@@ -925,13 +925,16 @@ RtspServer::Device* RtspServer::find_locked(const std::string& dev_id) {
 void RtspServer::add_device(RtspVirtualDevice dev) {
     auto d     = std::make_unique<Device>();
     d->spec    = std::move(dev);
-    if (d->spec.tls) {
-        d->ssl_ctx = make_device_ctx(d->spec.cert);
-        if (!d->ssl_ctx) {
-            throw std::runtime_error("RtspServer: failed to build SSL_CTX for dev_id="
-                                     + d->spec.dev_id);
-        }
-    }  // else: plain RTSP, no TLS context
+    // Always build the TLS context (when cert material is present) so the accept
+    // loop can serve EITHER plain RTSP or RTSPS per connection by sniffing the
+    // first byte (0x16 = TLS ClientHello), mirroring the MQTT broker / vtun.
+    // spec.tls is now only the advertised-scheme hint, not a hard gate — any
+    // client (rtsp:// or rtsps://) connects regardless.
+    d->ssl_ctx = make_device_ctx(d->spec.cert);
+    if (!d->ssl_ctx && d->spec.tls) {
+        throw std::runtime_error("RtspServer: failed to build SSL_CTX for dev_id="
+                                 + d->spec.dev_id);
+    }
     if (d->spec.source) {
         d->fanout = router::CameraFrameFanout::create(d->spec.source);
     }
@@ -1388,12 +1391,25 @@ void RtspServer::start_device(Device& d) {
                 }
             }
 
+            // Per-connection protocol sniff so one port serves BOTH RTSP and
+            // RTSPS (mirrors MqttBroker / VirtualTunnelServer). A TLS ClientHello
+            // begins with 0x16 (TLS Handshake content type); plain RTSP begins
+            // with an ASCII method ("OPTIONS"/"DESCRIBE"/...). Peek one byte and
+            // pick TLS or plain for THIS connection. The recv timeout set above
+            // bounds the peek so a silent client can't wedge the accept thread.
             SSL* ssl = nullptr;
-            if (d.spec.tls) {
-                ssl = SSL_new(d.ssl_ctx);
-                if (!ssl) { bambu_close_socket(cfd); continue; }
-                SSL_set_fd(ssl, cfd);
-            }  // else: plain RTSP — io loop uses the raw fd directly
+            if (d.ssl_ctx) {
+                unsigned char first = 0;
+                int peeked = ::recv(cfd, reinterpret_cast<char*>(&first), 1, MSG_PEEK);
+                if (peeked <= 0) { bambu_close_socket(cfd); continue; }
+                if (first == 0x16) {            // TLS ClientHello -> RTSPS
+                    ssl = SSL_new(d.ssl_ctx);
+                    if (!ssl) { bambu_close_socket(cfd); continue; }
+                    SSL_set_fd(ssl, cfd);
+                }                                // else: plain RTSP (raw fd)
+            }
+            rtsp_flog("accept proto dev=%s cfd=%d mode=%s",
+                      d.spec.dev_id.c_str(), (int)cfd, ssl ? "RTSPS" : "RTSP");
 
             auto sess = std::make_unique<RtspServer::Device::Session>();
             sess->ssl = ssl;   // nullptr in plain mode

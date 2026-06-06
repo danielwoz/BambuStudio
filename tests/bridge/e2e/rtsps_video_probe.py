@@ -26,20 +26,28 @@ SECS = int(sys.argv[4]) if len(sys.argv) > 4 else 10
 OUT  = sys.argv[5] if len(sys.argv) > 5 else os.path.join(
     tempfile.gettempdir(), "bridge_cam.h264")
 
-base = f"rtsps://{HOST}:{PORT}{PATH}"
-ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-ctx.maximum_version = ssl.TLSVersion.TLSv1_2
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
+# RTSP_PROBE_PLAIN=1 -> plain RTSP (no TLS), to exercise the server's
+# per-connection protocol sniff. Default = RTSPS (TLS).
+PLAIN = os.environ.get("RTSP_PROBE_PLAIN") == "1"
+scheme = "rtsp" if PLAIN else "rtsps"
+base = f"{scheme}://{HOST}:{PORT}{PATH}"
 
 raw = socket.create_connection((HOST, PORT), timeout=10)
 raw.settimeout(30)
-print(f"[probe] TCP connected {HOST}:{PORT}; starting TLS handshake (30s timeout)...")
-t0 = time.time()
-s = ctx.wrap_socket(raw, server_hostname=HOST)
-print(f"[probe] TLS handshake took {time.time()-t0:.1f}s")
-print(f"[probe] TLS ok: {s.version()} cipher={s.cipher()[0]}")
+if PLAIN:
+    print(f"[probe] TCP connected {HOST}:{PORT}; PLAIN RTSP (no TLS)")
+    s = raw
+else:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    print(f"[probe] TCP connected {HOST}:{PORT}; starting TLS handshake (30s timeout)...")
+    t0 = time.time()
+    s = ctx.wrap_socket(raw, server_hostname=HOST)
+    print(f"[probe] TLS handshake took {time.time()-t0:.1f}s")
+    print(f"[probe] TLS ok: {s.version()} cipher={s.cipher()[0]}")
 
 cseq = 0
 session = None
