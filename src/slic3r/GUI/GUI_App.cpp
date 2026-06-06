@@ -2950,6 +2950,16 @@ bool GUI_App::on_init_inner()
     wxImage::SetDefaultLoadFlags(0); // ignore waring in release build
 #endif
 
+    // Invisible-GUI bridge: the MainFrame is never Show()n and startup modals
+    // (software-update prompt, login, etc.) get auto-dismissed. wx's default
+    // ExitOnFrameDelete=true would then quit the whole app the instant an
+    // auto-dismissed modal momentarily leaves zero visible top-level windows —
+    // the intermittent "bridge exits ~13 s after a clean start, then crashes in
+    // ~GUI_App with std::bad_function_call". The bridge is a daemon that exits
+    // only via signal/kill, so disable frame-delete exit here.
+    if (::Slic3r::GUI::BridgeBootstrap::is_invisible_gui())
+        SetExitOnFrameDelete(false);
+
 #if defined(BAMBU_BRIDGE)
     if (::Slic3r::GUI::BridgeBootstrap::is_bridge_only())
         return ::Slic3r::GUI::BridgeBootstrap::run_headless(this);
@@ -7331,6 +7341,35 @@ wxString GUI_App::filter_string(wxString str)
 
 bool GUI_App::OnExceptionInMainLoop()
 {
+    // Invisible-GUI bridge runs as a long-lived daemon. A transient exception
+    // escaping an event handler — e.g. the intermittent std::bad_function_call
+    // from a racing plugin/agent callback during bridge bootstrap — must NOT
+    // pop a fatal wxLogError dialog (generic_exception_handle does) or tear the
+    // whole process down (the default `return false` exits the main loop).
+    // Swallow it, log it, and keep the event loop running. bad_alloc still
+    // terminates (unrecoverable).
+    if (::Slic3r::GUI::BridgeBootstrap::is_invisible_gui()) {
+        try {
+            throw;
+        } catch (const std::bad_alloc& ex) {
+            BOOST_LOG_TRIVIAL(error)
+                << "[bridge] invisible-GUI bad_alloc, terminating: " << ex.what();
+            flush_logs();
+            std::terminate();
+        } catch (const std::exception& ex) {
+            BOOST_LOG_TRIVIAL(error)
+                << "[bridge] invisible-GUI: swallowed main-loop exception, "
+                   "continuing: " << ex.what();
+            flush_logs();
+            return true;
+        } catch (...) {
+            BOOST_LOG_TRIVIAL(error)
+                << "[bridge] invisible-GUI: swallowed unknown main-loop "
+                   "exception, continuing";
+            flush_logs();
+            return true;
+        }
+    }
     generic_exception_handle();
     return false;
 }
