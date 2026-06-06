@@ -6,8 +6,10 @@
 #include "../BambuSourceHandle.hpp"
 
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <future>
 #include <thread>
 #include <utility>
@@ -79,7 +81,25 @@ void CloudCameraSource::set_camera_url_resolver(CameraUrlResolver fn) {
     m_url_resolver = std::move(fn);
 }
 
+namespace {
+// File-flushed mirror of the [cloud-camera] stderr logs (genuine GUI exe has
+// dead stderr). Enable via BAMBU_BRIDGE_GUI_LOG=<file>.
+void cam_flog(const char* fmt, ...) {
+    const char* path = std::getenv("BAMBU_BRIDGE_GUI_LOG");
+    if (!path || !*path) return;
+    char buf[1024];
+    va_list ap; va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    FILE* f = std::fopen(path, "a");
+    if (!f) return;
+    std::fprintf(f, "[cam] %s\n", buf);
+    std::fclose(f);
+}
+} // namespace
+
 bool CloudCameraSource::open() {
+    cam_flog("CloudCameraSource::open ENTER dev=%s", m_cfg.dev_id.c_str());
     std::shared_ptr<BambuNetworkingPluginHandle> plugin;
     std::shared_ptr<BambuSourceHandle>           source;
     CameraUrlResolver                            resolver;
@@ -178,7 +198,11 @@ bool CloudCameraSource::open() {
             "[cloud-camera] get_camera_url dev=%s rc=%d url=%s\n",
             m_cfg.dev_id.c_str(), rc, url.c_str());
         std::fflush(stderr);
+        cam_flog("get_camera_url dev=%s rc=%d url=%s",
+                 m_cfg.dev_id.c_str(), rc, url.c_str());
         if (rc != 0 || url.empty()) {
+            cam_flog("open dev=%s FAIL: get_camera_url rc=%d url_empty=%d",
+                     m_cfg.dev_id.c_str(), rc, int(url.empty()));
             return false;
         }
         // MediaPlayCtrl.cpp:381-385 — when the URL starts with bambu:///
@@ -209,6 +233,7 @@ bool CloudCameraSource::open() {
             "[cloud-camera] open dev=%s FAIL: bambu_create rc=%d tunnel=%p\n",
             m_cfg.dev_id.c_str(), rc, tunnel);
         std::fflush(stderr);
+        cam_flog("open dev=%s FAIL: bambu_create rc=%d", m_cfg.dev_id.c_str(), rc);
         return false;
     }
     // Mirror wxMediaCtrl3.cpp:288 — install logger BETWEEN Create and Open.
@@ -230,6 +255,7 @@ bool CloudCameraSource::open() {
             "[cloud-camera] open dev=%s FAIL: bambu_open rc=%d\n",
             m_cfg.dev_id.c_str(), rc);
         std::fflush(stderr);
+        cam_flog("open dev=%s FAIL: bambu_open rc=%d", m_cfg.dev_id.c_str(), rc);
         source->bambu_destroy(tunnel);
         return false;
     }
@@ -254,6 +280,7 @@ bool CloudCameraSource::open() {
             "[cloud-camera] open dev=%s FAIL: bambu_start_stream rc=%d\n",
             m_cfg.dev_id.c_str(), rc);
         std::fflush(stderr);
+        cam_flog("open dev=%s FAIL: bambu_start_stream rc=%d", m_cfg.dev_id.c_str(), rc);
         source->bambu_close(tunnel);
         source->bambu_destroy(tunnel);
         return false;
@@ -261,6 +288,7 @@ bool CloudCameraSource::open() {
     std::fprintf(stderr,
         "[cloud-camera] open dev=%s OK\n", m_cfg.dev_id.c_str());
     std::fflush(stderr);
+    cam_flog("open dev=%s OK (stream up)", m_cfg.dev_id.c_str());
 
     server::ICameraSource::StreamInfo si;
     si.fps = 30;

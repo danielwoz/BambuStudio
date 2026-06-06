@@ -71,6 +71,11 @@
 #  include <signal.h>
 #endif
 
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <chrono>
+
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -100,6 +105,26 @@ struct OpenSSLInit {
 void ensure_openssl_init() {
     static OpenSSLInit s_init;
     (void)s_init;
+}
+
+// File-flushed diagnostic sink. The genuine GUI exe has dead stderr, so the
+// RtspServer's existing [rtsp-server] handshake instrumentation is invisible
+// there. Mirror it to $BAMBU_BRIDGE_GUI_LOG (fopen/fwrite/fclose per call so a
+// hang leaves the last step on disk). Used to localise the RTSPS SSL_accept
+// silent-hang.
+void rtsp_flog(const char* fmt, ...) {
+    const char* path = std::getenv("BAMBU_BRIDGE_GUI_LOG");
+    if (!path || !*path) return;
+    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    char buf[512];
+    va_list ap; va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    FILE* f = std::fopen(path, "a");
+    if (!f) return;
+    std::fprintf(f, "%lld [rtsp] %s\n", ms, buf);
+    std::fclose(f);
 }
 
 void log_ssl_err(const char* where) {
@@ -962,13 +987,18 @@ void session_io_loop(RtspServer::Device* dev,
         "[rtsp-server] session_io_loop start fd=%d ssl=%p tls=%d\n",
         sess->fd, (void*)sess->ssl, int(sess->ssl != nullptr));
     std::fflush(stderr);
+    rtsp_flog("session_io_loop start fd=%d ssl=%p tls=%d",
+              sess->fd, (void*)sess->ssl, int(sess->ssl != nullptr));
 
     if (sess->ssl) {  // TLS (RTSPS); plain RTSP skips the handshake
+        rtsp_flog("SSL_accept ENTER fd=%d", sess->fd);
         const int acc = SSL_accept(sess->ssl);
         std::fprintf(stderr,
             "[rtsp-server] SSL_accept fd=%d returned %d (err=%d)\n",
             sess->fd, acc, acc <= 0 ? SSL_get_error(sess->ssl, acc) : 0);
         std::fflush(stderr);
+        rtsp_flog("SSL_accept EXIT fd=%d rc=%d err=%d", sess->fd, acc,
+                  acc <= 0 ? SSL_get_error(sess->ssl, acc) : 0);
         if (acc != 1) {
             log_ssl_err("SSL_accept(rtsp)");
             return;
@@ -977,6 +1007,7 @@ void session_io_loop(RtspServer::Device* dev,
     std::fprintf(stderr,
         "[rtsp-server] handshake ok fd=%d — entering control loop\n", sess->fd);
     std::fflush(stderr);
+    rtsp_flog("handshake ok fd=%d — entering control loop", sess->fd);
 
     // Per-session control state.
     std::vector<uint8_t> recv;
@@ -1314,6 +1345,9 @@ void RtspServer::start_device(Device& d) {
             int cfd = ::accept(d.listen_fd,
                                reinterpret_cast<sockaddr*>(&peer), &plen);
             if (cfd < 0) continue;
+            rtsp_flog("accept ok dev=%s port=%u cfd=%d tls=%d",
+                      d.spec.dev_id.c_str(), (unsigned)d.bound_port, (int)cfd,
+                      int(d.spec.tls));
 
             int one = 1;
             bambu_setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
