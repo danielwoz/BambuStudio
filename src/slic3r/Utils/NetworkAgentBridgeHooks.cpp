@@ -6,9 +6,32 @@
 
 #include <mutex>
 #include <utility>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
 
 namespace Slic3r {
 namespace bridge_hooks {
+
+namespace {
+// These wrappers are invoked by the proprietary plugin / BambuSource on its OWN
+// worker threads, through C function pointers. A C++ exception escaping a
+// wrapper unwinds INTO the plugin's C frame — which is not exception-safe — and
+// corrupts the heap/stack (the intermittent BambuSource / ucrtbase 0xc0000005 /
+// 0xc0000409 fast-fail crashes). So every wrapper body is wrapped in
+// try/catch(...) to guarantee nothing crosses the C boundary. cb_log mirrors a
+// swallow to $BAMBU_BRIDGE_GUI_LOG so the event is observable (the genuine exe
+// has dead stderr).
+void cb_log(const char* what)
+{
+    const char* path = std::getenv("BAMBU_BRIDGE_GUI_LOG");
+    if (!path || !*path) return;
+    if (FILE* f = std::fopen(path, "a")) {
+        std::fprintf(f, "[cb-guard] swallowed exception in %s\n", what);
+        std::fclose(f);
+    }
+}
+} // namespace
 
 // ----- Callback wrappers ---------------------------------------------------
 
@@ -20,14 +43,18 @@ OnMessageFn Dispatcher::make_on_message_wrapper(NetworkAgent* agent,
     // only. Tap is sampled under m_bridge_tap_mu at fire time so it
     // can be detached at runtime without recompiling the wrapper.
     return [agent, fn](std::string dev_id, std::string msg) {
-        if (fn) fn(dev_id, msg);
-        BridgeMessageTap tap;
-        {
-            std::lock_guard<std::mutex> lk(agent->m_bridge_tap_mu);
-            tap = agent->m_bridge_tap;
+        try {
+            if (fn) fn(dev_id, msg);
+            BridgeMessageTap tap;
+            {
+                std::lock_guard<std::mutex> lk(agent->m_bridge_tap_mu);
+                tap = agent->m_bridge_tap;
+            }
+            if (tap && !NetworkAgent::is_virtual_dev_id(dev_id))
+                tap(dev_id, msg, /*is_local=*/false);
+        } catch (...) {
+            cb_log("on_message");   // never let it unwind into the plugin
         }
-        if (tap && !NetworkAgent::is_virtual_dev_id(dev_id))
-            tap(dev_id, msg, /*is_local=*/false);
     };
 }
 
@@ -46,8 +73,12 @@ OnLocalConnectedFn Dispatcher::make_on_local_connect_wrapper(
     // directly for virtual sessions, with state derived from its own
     // MQTT layer (which uses verify=false and actually connects).
     return [fn](int state, std::string dev_id, std::string msg) {
-        if (NetworkAgent::is_virtual_dev_id(dev_id)) return;
-        if (fn) fn(state, dev_id, msg);
+        try {
+            if (NetworkAgent::is_virtual_dev_id(dev_id)) return;
+            if (fn) fn(state, dev_id, msg);
+        } catch (...) {
+            cb_log("on_local_connect");
+        }
     };
 }
 
@@ -59,14 +90,18 @@ OnMessageFn Dispatcher::make_on_local_message_wrapper(NetworkAgent* agent,
     // the inbound path for those. After dispatching to the slicer, fan
     // a copy out to the in-GUI bridge tap if attached.
     return [agent, fn](std::string dev_id, std::string msg) {
-        if (NetworkAgent::is_virtual_dev_id(dev_id)) return;
-        if (fn) fn(dev_id, msg);
-        BridgeMessageTap tap;
-        {
-            std::lock_guard<std::mutex> lk(agent->m_bridge_tap_mu);
-            tap = agent->m_bridge_tap;
+        try {
+            if (NetworkAgent::is_virtual_dev_id(dev_id)) return;
+            if (fn) fn(dev_id, msg);
+            BridgeMessageTap tap;
+            {
+                std::lock_guard<std::mutex> lk(agent->m_bridge_tap_mu);
+                tap = agent->m_bridge_tap;
+            }
+            if (tap) tap(dev_id, msg, /*is_local=*/true);
+        } catch (...) {
+            cb_log("on_local_message");
         }
-        if (tap) tap(dev_id, msg, /*is_local=*/true);
     };
 }
 
