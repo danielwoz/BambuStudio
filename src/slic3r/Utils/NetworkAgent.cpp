@@ -596,9 +596,8 @@ int NetworkAgent::initialize_network_module(bool using_backup, bool validate_cer
 {
     // Bridge: satisfy the plugin's "signed studio" gate for our forked DLL by
     // redirecting its Authenticode check of this DLL to the genuine official
-    // BambuStudio.dll. Default-ON (set BAMBU_BRIDGE_SIGN_REDIRECT=0 to disable);
-    // must run before the plugin is loaded below. No-op when the genuine DLL is
-    // absent / off Windows.
+    // BambuStudio.dll. Always on; must run before the plugin is loaded below.
+    // No-op when the genuine DLL is absent / off Windows.
     install_plugin_verify_redirect();
 
     //int ret = -1;
