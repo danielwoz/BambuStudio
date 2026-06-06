@@ -148,10 +148,16 @@ static void* try_open_url(BambuSourceHandle& handle,
     // The GUI (wxMediaCtrl3.cpp:288) sets a logger BETWEEN Create and
     // Open. Without it the plugin appears to fingerprint the caller as
     // unauthenticated and `Bambu_StartStream` later returns -107.
+    // Heap-allocate the logger context so it outlives BOTH the tunnel and the
+    // thread that opened it. BambuSource invokes the logger on its own camera
+    // reader thread, which keeps running after this open path's thread exits.
+    // The previous `static thread_local LogCtx` was destroyed when the opening
+    // thread ended -> the ctx pointer dangled -> use-after-free / heap
+    // corruption (same root cause cdb found in CloudCameraSource). This free
+    // function doesn't own the tunnel, so we intentionally leak a small context
+    // (camera opens are rare); it must live as long as the tunnel does.
     struct LogCtx { std::string dev_id; std::string tag; };
-    static thread_local LogCtx s_log_ctx;
-    s_log_ctx.dev_id = dev_id;
-    s_log_ctx.tag    = tag;
+    auto* log_ctx = new LogCtx{dev_id, tag};
     handle.bambu_set_logger(tunnel,
         +[](void* ctx, int level, const char* msg) {
             auto* lc = static_cast<LogCtx*>(ctx);
@@ -162,7 +168,7 @@ static void* try_open_url(BambuSourceHandle& handle,
                 level, msg ? msg : "");
             std::fflush(stderr);
         },
-        &s_log_ctx);
+        log_ctx);
 
     rc = handle.bambu_open(tunnel);
     if (rc != 0) {

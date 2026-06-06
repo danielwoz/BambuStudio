@@ -236,19 +236,26 @@ bool CloudCameraSource::open() {
         cam_flog("open dev=%s FAIL: bambu_create rc=%d", m_cfg.dev_id.c_str(), rc);
         return false;
     }
-    // Mirror wxMediaCtrl3.cpp:288 — install logger BETWEEN Create and Open.
-    struct LogCtx { std::string dev_id; };
-    static thread_local LogCtx s_cloud_log_ctx;
-    s_cloud_log_ctx.dev_id = m_cfg.dev_id;
+    // Install logger BETWEEN Create and Open. Pass `this` as the context —
+    // NOT a thread_local. bambu_set_logger's callback fires on BambuSource's
+    // camera reader thread and KEEPS firing after the RTSP session thread that
+    // called open() has exited (the fanout/reader_loop outlives the session).
+    // The previous `static thread_local LogCtx` was set on the session thread,
+    // so once that thread ended its thread-local was destroyed and the ctx
+    // pointer dangled -> use-after-free in this fprintf -> heap corruption and a
+    // crash minutes later (root-caused via cdb). The CloudCameraSource owns the
+    // tunnel and outlives it (close() tears the tunnel down), and m_cfg.dev_id
+    // is set at construction and never mutated, so `this` is a stable,
+    // thread-safe context.
     source->bambu_set_logger(tunnel,
         +[](void* ctx, int level, const char* msg) {
-            auto* lc = static_cast<LogCtx*>(ctx);
+            auto* self = static_cast<CloudCameraSource*>(ctx);
             std::fprintf(stderr,
                 "[cloud-camera] bambu-log dev=%s lvl=%d %s\n",
-                lc ? lc->dev_id.c_str() : "?", level, msg ? msg : "");
+                self ? self->m_cfg.dev_id.c_str() : "?", level, msg ? msg : "");
             std::fflush(stderr);
         },
-        &s_cloud_log_ctx);
+        this);
     rc = source->bambu_open(tunnel);
     if (rc != 0) {
         std::fprintf(stderr,
