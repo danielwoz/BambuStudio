@@ -1985,17 +1985,38 @@ void install_gui_worker(GUI_App* app)
                                             MachineObject* obj =
                                                 app->m_device_manager->get_my_machine(sel_dev);
                                             if (!obj) return;
-                                            // Pin the selected machine so the plugin's
-                                            // cloud send_message accepts this dev_id.
-                                            // Do NOT obj->connect() — cert_report lands
-                                            // over the existing CLOUD session (see the
-                                            // round body + project_plugin_enc_gate).
                                             app->m_agent->set_user_selected_machine(sel_dev);
+                                            // Establish the LAN session ONCE here. The
+                                            // LAN-only media features (PrinterFileSystem
+                                            // storage listing + the camera/TUTK tunnel)
+                                            // derive their credentials from a fully-
+                                            // connected MachineObject, so without this
+                                            // the tunnel opens but no data flows (no file
+                                            // list, no frames). We deliberately do NOT
+                                            // reconnect per round in the cert cascade
+                                            // below: the plugin holds exactly ONE global
+                                            // LAN connection and re-connecting churns it,
+                                            // dropping the printer's cert_report before
+                                            // device_pub_key_map is populated — which is
+                                            // what broke control. Single connect here +
+                                            // cloud-routed cert cascade = control AND
+                                            // storage/camera both work.
+                                            if (obj->get_dev_ip().empty()) {
+                                                if (const char* fip = std::getenv(
+                                                        "BAMBU_BRIDGE_SELECT_IP");
+                                                    fip && *fip)
+                                                    obj->set_dev_ip(fip);
+                                            }
+                                            int conn_rc =
+                                                obj->connect(obj->local_use_ssl_for_mqtt);
                                             gui_diag(
-                                                "[gate select] dev=%s ac=%s "
-                                                "login=%d server=%d\n",
+                                                "[gate connect] dev=%s ip=%s ac=%s "
+                                                "ssl=%d rc=%d login=%d server=%d\n",
                                                 obj->get_dev_id().c_str(),
+                                                obj->get_dev_ip().c_str(),
                                                 obj->get_access_code().c_str(),
+                                                int(obj->local_use_ssl_for_mqtt),
+                                                conn_rc,
                                                 int(app->m_agent->is_user_login()),
                                                 int(app->m_agent->is_server_connected()));
                                         });
