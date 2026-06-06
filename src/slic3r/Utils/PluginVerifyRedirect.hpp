@@ -10,8 +10,8 @@ namespace Slic3r {
 // plugin's Authenticode verification of our DLL resolves to the genuine official
 // BambuStudio.dll instead, satisfying the gate so control commands get signed.
 //
-// Gated by env BAMBU_BRIDGE_SIGN_REDIRECT (must be set and != "0"); the genuine
-// DLL path comes from env BAMBU_BRIDGE_GENUINE_DLL or defaults to the standard
+// Default-ON; set env BAMBU_BRIDGE_SIGN_REDIRECT=0 to disable. The genuine DLL
+// path comes from env BAMBU_BRIDGE_GENUINE_DLL or defaults to the standard
 // install path. No-op if disabled, if the genuine DLL is absent, or off Windows.
 //
 // MUST be called before the network plugin is loaded.

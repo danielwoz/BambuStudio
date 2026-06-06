@@ -93,8 +93,14 @@ void install_plugin_verify_redirect()
     if (done) return;
     done = true;
 
-    const char* en = std::getenv("BAMBU_BRIDGE_SIGN_REDIRECT");
-    if (!en || !*en || std::strcmp(en, "0") == 0) return;   // opt-in only
+    // Default-ON. The bridge's forked (unsigned) BambuStudio.dll always needs
+    // this redirect for the plugin to accept the studio as genuine, so it is no
+    // longer opt-in. Set BAMBU_BRIDGE_SIGN_REDIRECT=0 to disable (e.g. when
+    // running against a genuinely-signed DLL). If the genuine DLL isn't on disk
+    // the install no-ops below regardless.
+    if (const char* en = std::getenv("BAMBU_BRIDGE_SIGN_REDIRECT");
+        en && std::strcmp(en, "0") == 0)
+        return;   // explicit opt-out only
 
     const char* gp = std::getenv("BAMBU_BRIDGE_GENUINE_DLL");
     std::string gpath = (gp && *gp) ? gp : "C:\\Program Files\\Bambu Studio\\BambuStudio.dll";
