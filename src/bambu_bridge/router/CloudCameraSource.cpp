@@ -368,9 +368,43 @@ bool CloudCameraSource::open() {
         m_tunnel = tunnel;
         m_info   = si;
     }
+    // Reset every open: m_info was rebuilt above, so a stale "true" from a
+    // prior stream must not suppress in-band recapture for this one.
+    m_have_params.store(!si.sps.empty() && !si.pps.empty());
     m_open.store(true);
     return true;
 }
+
+namespace {
+// Scan an Annex-B buffer for SPS (NAL type 7) / PPS (type 8) and copy the raw
+// NAL bodies (no start code) into `si` where not already present. Returns true
+// once both are populated. Mirrors the Annex-B walk in open().
+bool cache_inband_params(const std::vector<uint8_t>& buf,
+                         server::ICameraSource::StreamInfo& si) {
+    const int sz = static_cast<int>(buf.size());
+    int i = 0;
+    while (i < sz) {
+        int nal_start = -1;
+        if (i + 3 < sz && !buf[i] && !buf[i+1] && !buf[i+2] && buf[i+3] == 1) nal_start = i + 4;
+        else if (i + 2 < sz && !buf[i] && !buf[i+1] && buf[i+2] == 1)         nal_start = i + 3;
+        if (nal_start < 0) { ++i; continue; }
+        int j = nal_start;
+        while (j + 2 < sz &&
+               !(buf[j]==0 && buf[j+1]==0 &&
+                 (buf[j+2]==1 || (j+3<sz && buf[j+2]==0 && buf[j+3]==1)))) ++j;
+        const int nal_end = (j + 2 < sz) ? j : sz;
+        if (nal_end > nal_start) {
+            const uint8_t type = buf[nal_start] & 0x1F;
+            if      (type == 7 && si.sps.empty())
+                si.sps.assign(buf.begin() + nal_start, buf.begin() + nal_end);
+            else if (type == 8 && si.pps.empty())
+                si.pps.assign(buf.begin() + nal_start, buf.begin() + nal_end);
+        }
+        i = nal_end;
+    }
+    return !si.sps.empty() && !si.pps.empty();
+}
+} // namespace
 
 void CloudCameraSource::close() {
     void* tunnel = nullptr;
@@ -416,6 +450,19 @@ CloudCameraSource::next_frame(int /*timeout_ms*/) {
                       sample.buffer + static_cast<std::size_t>(sample.size));
     f.pts_us      = static_cast<int64_t>(sample.decode_time) * 1000;
     f.is_keyframe = (sample.flags & 1) != 0;
+
+    // Capture in-band SPS/PPS so DESCRIBE's SDP carries sprop-parameter-sets.
+    // TUTK rarely exposes codec extradata via get_stream_info, so the parameter
+    // sets only arrive in-band ahead of each IDR. DirectShow/WMP-based clients
+    // (OrcaSlicer on Windows) need them in the SDP to initialise the decoder and
+    // otherwise hang after DESCRIBE. Fast-path out once both are cached.
+    // (SPS/PPS may arrive as their own samples rather than inside the IDR
+    // access unit, so scan every frame — not only keyframes — until cached.)
+    if (!m_have_params.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lk(m_mu);
+        if (cache_inband_params(f.nal_data, m_info))
+            m_have_params.store(true, std::memory_order_relaxed);
+    }
     return f;
 }
 

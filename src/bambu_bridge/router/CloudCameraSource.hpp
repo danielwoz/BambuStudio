@@ -111,6 +111,10 @@ protected:
     std::atomic<bool>                             m_open{false};
 
     mutable std::mutex                            m_mu;
+    // Set once SPS+PPS have been captured (from extradata at open, or in-band
+    // in next_frame). Fast-path guard so the per-frame NAL scan stops after
+    // warmup. See cache_inband_params() / next_frame().
+    std::atomic<bool>                             m_have_params{false};
     std::shared_ptr<BambuNetworkingPluginHandle>  m_handle;
     std::shared_ptr<BambuSourceHandle>            m_source;
     CameraUrlResolver                             m_url_resolver;

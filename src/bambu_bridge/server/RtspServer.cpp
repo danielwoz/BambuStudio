@@ -1087,10 +1087,24 @@ void session_io_loop(RtspServer::Device* dev,
 
     // Helper: send one access-unit's worth of RTP packets for a Frame
     // pulled from the source. Returns false on TLS write failure.
+    // RTP timestamp source (90kHz clock, RFC 6184 + RFC 2435). We DO NOT use
+    // the source's per-frame pts (TUTK's Bambu_Sample.decode_time is only
+    // "PTS-ish" — in practice coarse / non-monotonic, so consecutive frames
+    // collapsed onto a single RTP timestamp. live555 then treats a whole GOP
+    // as one access unit and the decoder presents nothing until the timestamp
+    // finally advances at the next IDR -> the classic "freeze ~2s, jump on
+    // keyframe" symptom). Instead, stamp each access unit from a per-session
+    // monotonic wall-clock: strictly increasing, tracks real arrival time, and
+    // immune to whatever the source clock does. First AU starts at 0 to match
+    // the PLAY response's `RTP-Info: ...;rtptime=0`.
+    bool ts_first = true;
+    std::chrono::steady_clock::time_point ts_base;
     auto stream_one_frame = [&](const VideoFrame& f) -> bool {
-        // 90kHz RTP clock — shared across codecs (RFC 6184 + RFC 2435).
+        const auto ts_now = std::chrono::steady_clock::now();
+        if (ts_first) { ts_base = ts_now; ts_first = false; }
         const uint32_t ts = static_cast<uint32_t>(
-            (static_cast<int64_t>(f.pts_us) * 90LL) / 1000LL);
+            std::chrono::duration_cast<std::chrono::microseconds>(ts_now - ts_base)
+                .count() * 90LL / 1000LL);
 
         if (stream_codec == ICameraSource::Codec::MotionJpeg) {
             if (f.nal_data.empty()) return true;
@@ -1201,6 +1215,14 @@ void session_io_loop(RtspServer::Device* dev,
         auto cseq_it = req.headers.find("cseq");
         std::string cseq = (cseq_it == req.headers.end()) ? "0" : cseq_it->second;
         const std::string& verb = req.verb;
+        {
+            auto tr = req.headers.find("transport");
+            auto ua = req.headers.find("user-agent");
+            rtsp_flog("REQ fd=%d verb=%s target=%s transport=[%s] ua=[%s]",
+                      sess->fd, verb.c_str(), req.target.c_str(),
+                      tr == req.headers.end() ? "" : tr->second.c_str(),
+                      ua == req.headers.end() ? "" : ua->second.c_str());
+        }
 
         if (verb == "OPTIONS") {
             write_resp_ok(cseq, {
@@ -1213,7 +1235,24 @@ void session_io_loop(RtspServer::Device* dev,
             // describe; the test source (NullCameraSource) is always
             // open after add_device wires it.
             ICameraSource::StreamInfo si;
-            if (src) si = src->info();
+            if (src) {
+                si = src->info();
+                // For H.264, SPS/PPS often only arrive in-band shortly after the
+                // stream comes up, so a freshly-opened source may not have them
+                // yet. DirectShow/WMP clients (OrcaSlicer on Windows) need them
+                // in the SDP's sprop-parameter-sets or they hang after DESCRIBE.
+                // Wait briefly for the source to capture them before replying.
+                if (si.codec == ICameraSource::Codec::H264_AnnexB &&
+                    (si.sps.empty() || si.pps.empty())) {
+                    for (int waited = 0; waited < 3000 &&
+                         (si.sps.empty() || si.pps.empty()); waited += 100) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        si = src->info();
+                    }
+                    rtsp_flog("DESCRIBE params wait done fd=%d sps=%zu pps=%zu",
+                              sess->fd, si.sps.size(), si.pps.size());
+                }
+            }
             // Optional auth check: real printers require Basic bblp:pw.
             if (cfg.require_auth) {
                 auto it = req.headers.find("authorization");
@@ -1240,6 +1279,8 @@ void session_io_loop(RtspServer::Device* dev,
             std::string lower = transport;
             for (auto& c : lower) if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
             if (lower.find("rtp/avp/tcp") == std::string::npos) {
+                rtsp_flog("SETUP REJECT 461 (not TCP-interleaved): [%s]",
+                          transport.c_str());
                 write_rtsp_response(sess->ssl, sess->fd,461, "Unsupported transport", cseq, {}, "");
                 continue;
             }
