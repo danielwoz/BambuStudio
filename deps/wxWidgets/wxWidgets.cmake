@@ -17,6 +17,23 @@ else ()
     set(_wx_edge "-DwxUSE_WEBVIEW_EDGE=OFF")
 endif ()
 
+# Force wxWidgets to build against OUR libjpeg-turbo, not whatever find_package
+# stumbles onto. Our deps install libjpeg-turbo as `jpeg-static.lib`, but
+# CMake's FindJPEG searches for `jpeg`/`libjpeg`, misses it, and falls back to
+# Strawberry Perl's libjpeg 9 (C:/Strawberry/c/lib/libjpeg.a, JPEG_LIB_VERSION
+# 90). wxJPEGHandler then compiles against the v90 jpeg_decompress_struct while
+# the app links our libjpeg-turbo (v62) -> wrong struct offsets -> wxImage JPEG
+# decode crashes on every thumbnail (see memory: wx_libjpeg_abi_mismatch).
+# Pin the include + lib explicitly so the layouts match.
+if (MSVC)
+    set(_wx_jpeg
+        "-DJPEG_INCLUDE_DIR=${DESTDIR}/usr/local/include"
+        "-DJPEG_LIBRARY_RELEASE=${DESTDIR}/usr/local/lib/jpeg-static.lib"
+        "-DJPEG_LIBRARY=${DESTDIR}/usr/local/lib/jpeg-static.lib")
+else ()
+    set(_wx_jpeg "")
+endif ()
+
 # if (MSVC)
 #     set(_patch_cmd ${PATCH_CMD} ${CMAKE_CURRENT_LIST_DIR}/0001-wxWidget-fix.patch)
 # else ()
@@ -54,6 +71,7 @@ bambustudio_add_cmake_project(wxWidgets
         -DwxUSE_LIBJPEG=sys
         -DwxUSE_LIBTIFF=sys
         -DwxUSE_EXPAT=sys
+        ${_wx_jpeg}
         ${_wx_egl}
 )
 
