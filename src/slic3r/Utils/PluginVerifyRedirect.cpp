@@ -94,8 +94,9 @@ void install_plugin_verify_redirect()
     done = true;
 
     // Always on. The bridge's forked (unsigned) BambuStudio.dll always needs
-    // this redirect for the plugin to accept the studio as genuine. If the
-    // genuine DLL isn't on disk the install no-ops below regardless.
+    // this redirect for the plugin to accept the studio as genuine (works in
+    // both the invisible-GUI bridge and a normal full GUI). If the genuine DLL
+    // isn't on disk the install no-ops below regardless.
     const char* gp = std::getenv("BAMBU_BRIDGE_GENUINE_DLL");
     std::string gpath = (gp && *gp) ? gp : "C:\\Program Files\\Bambu Studio\\BambuStudio.dll";
     MultiByteToWideChar(CP_UTF8, 0, gpath.c_str(), -1, g_genuine_w, MAX_PATH);

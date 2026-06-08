@@ -376,7 +376,11 @@ public:
         memDc.SetTextForeground(StateColor::darkModeColorFor(wxColor(134, 134, 134)));
         memDc.DrawLabel(m_constant_text.version, version_rect, wxALIGN_LEFT | wxALIGN_BOTTOM);
 
-#if BBL_INTERNAL_TESTING
+// Bridge GUI: suppress the "Internal Version" / "Beta Version" splash overlay.
+// We keep BBL_INTERNAL_TESTING=1 (it also selects the BambuStudioInternal data
+// dir that holds login/plugins/signing certs), so we drop the label here rather
+// than flipping the flag. To restore upstream behaviour, re-enable this block.
+#if 0 && BBL_INTERNAL_TESTING
         wxString versionText = BBL_INTERNAL_TESTING == 1 ? _L("Internal Version") : _L("Beta Version");
         wxSize text_rect = memDc.GetTextExtent(versionText);
         int start_x = (title_rect.GetLeft() + version_rect.GetRight()) / 2 - text_rect.GetWidth();
@@ -653,11 +657,11 @@ private:
 
             // dynamically get the version to display
             auto version_text = GUI_App::format_display_version();
-#if BBL_INTERNAL_TESTING
-            version = _L("Internal Version") + " " + std::string(version_text);
-#else
+            // Bridge GUI: always show "Version <n>" on the splash. Upstream shows
+            // "Internal Version" when BBL_INTERNAL_TESTING=1, but we keep that flag
+            // on (it selects the BambuStudioInternal data dir holding login /
+            // plugins / signing certs) and just drop the label.
             version = _L("Version") + " " + std::string(version_text);
-#endif
 
             // credits infornation
             credits =   title;
