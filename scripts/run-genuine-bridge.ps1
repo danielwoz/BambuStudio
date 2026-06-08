@@ -11,7 +11,7 @@
   genuine official BambuStudio.dll. No injector, no fake certs, no private key.
 
   REQUIREMENT: an official Bambu Studio whose version MATCHES this build
-  (SLIC3R_VERSION, currently 02.07.00.55) must be installed — it provides both
+  (SLIC3R_VERSION, currently 02.07.01.57) must be installed — it provides both
   the launcher exe and the genuine BambuStudio.dll redirect target. A version
   skew (e.g. 2.6 launcher vs 2.7 plugin) crashes the plugin's signing path.
 
@@ -43,7 +43,7 @@ $ourDll       = Join-Path $ReleaseDir 'BambuStudio.dll'
 $officialExe  = Join-Path $OfficialDir 'bambu-studio.exe'
 $officialDll  = Join-Path $OfficialDir 'BambuStudio.dll'
 $genuineLnch  = Join-Path $ReleaseDir 'bambu-studio-genuine.exe'
-$expectVer    = '02.07.00.55'   # keep in sync with version.inc
+$expectVer    = '02.07.01.57'   # keep in sync with version.inc
 
 foreach ($p in @($ourDll,$officialExe,$officialDll)) {
   if (-not (Test-Path $p)) { throw "missing required file: $p" }
